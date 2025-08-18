@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "planificacionflota",
+  "private_key_id": "1c7c020b27635d310ac0c843b601e605a26b9356",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCD53HybTHtNvZN\n1HiQuRAaCJ8834OUOIQ/0JzDpWsFWz3wrM0+xFPqwB3QFoS4kZixlVKAUOM5pkHa\nucVGnxyWQ+HJnP+sCVmQsrzU4PYVCOuXaee0XjY/WibDCCNhj2ygPplUHidtC4b0\nAbPYBxHboAeNQEothcUBnYUZkVxxSsoqFdBL2n9PXjcvJjrqJ74rKfQ7yv0XzYP4\nqkbC82USirOjrAijvh1KRtZA4I9nl1R9nvrQ91rsdJC32lwp8PA2wa8uU9+LL3Wr\n8f6wkXIoImBjaUAMdbwDAAotrebKPNISQJ+tIZcprzWf2ZNMsnEO91xYEtRhrtda\ne/GXbgM7AgMBAAECggEAJS4S71uaLBxG9w9B4MFZaY0unXD/XMNFe9topLk23m6m\nmfWLcPrUEKKQhLwkMwZPPRczBxpFwlU70NR2Z/6nhy+hMDxB0RNdnKzVD0hN9QXr\nqmVeu3em4NqffHAJ0REldFHQ1GYfhNwv8Q2dzPHJNdf46PbLMeO38UmeX+OaZBBi\nLZt0V5R5ZYRFNxY+nWa/Nu+gwXpULEmc9zeGdyto384QYqZFPbM0xunGLJg3vNiE\n/tgtgVnL4ZvzPhWBp4UWF7NmaH71S26eOCftZEJkSRo2gf0oyhAIjMqRQhNxX5Ii\nOVlcnHHAFbR2GUUkyODMhv2TC3K0LASpQ8bdhA+wMQKBgQC4EeOz1ROutgLoBS11\nHKd69+P95H/Mu8mhuoUDAmtuRAAbosFzCiV6QDSsS9A17EkCKQ55Q1vjkNN2jKSW\nug2i7oAGAc63QSb1ebEQnsH9rimAFCGtknrc54FrEJUeBOKpWDRftFC4J4l21uhw\nBmmsu638qRZdY3wOE0anK8ttcwKBgQC3cvURLtsW6jyorp1iBAcJmMIQxFBc4Hk3\narFDYdOrimp+8DVSio3Vt3SVKHxXP+ge3svXaQ80oC/+qPm2yenZJ5YRnBYaDTKQ\nl/ErUdLiXTIoMEwtFntFlxfSXZ/E+T5c1xmfm+8kxwV4+MNET9aVrpiSdYxJ/+tJ\n3/pHbZmhGQKBgC27rCJzL2e6KzCwkKHHU8lWq9vaGPKqOaeoKwIbaMvFs20qW/wU\nKkmciDnCwGGVanJR9xmj5cG9qvyKZx5X7alsrnxPmKepVV+qM5cYisRXsFH1LoTs\nnwAhuOL8BMCnoBVJKAIbT+7hS+Mt9CRZQ4o6OzlKXZcob5sjqOtCE1IHAoGANmm7\ntRgP1jEuQt5gQkVtjPQpg+2m5JWUftJ/t7vZnAUXZ4V6W3xLa7vZsbBriTmkcRum\nnMNFxldJRSD7yLMFUOsEAT8p8xo9CFR5LV88zPXVvcPtpGYJtG+Hmlc436UKUWFf\n8U7AVUlPHz2yNZ30yTsbeD2zmfN159iulOc2bWkCgYBGM7uPkGtDB8gD1VpbL6hL\n9sP+G1fhAREA1FSXLaGUvXC6g9Qfh5JI3GBrNVW/QxuROtUC58zz+z2zPDvB4tlw\n+iC7kLYc164p6j3hXD7vbLiznkYR5ACA0PbXXQKUlSuajtp/oxS3yMJXupTMA+hc\n+Y1QGhwLRcN2KM1LB9arBg==\n-----END PRIVATE KEY-----\n",
+  "client_email": "planificaci-n@planificacionflota.iam.gserviceaccount.com",
+  "client_id": "104624918532293978627",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/planificaci-n%40planificacionflota.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
