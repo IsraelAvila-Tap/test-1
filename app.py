@@ -568,8 +568,8 @@ def _nl_answer(question: str) -> str:
             return "Activa la API para respuestas de lenguaje natural, o pide métricas específicas (SVC, fechas, totales)."
 
 
-if q:
-    st.session_state.chat.append(("user", q))
-    ans = _nl_answer(q)
-    st.session_state.chat.append(("assistant", ans))
-    st.rerun()
+        if q:
+            st.session_state.chat.append(("user", q))
+            ans = _nl_answer(q)
+            st.session_state.chat.append(("assistant", ans))
+            st.rerun()
