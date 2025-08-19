@@ -507,29 +507,35 @@ def _nl_answer(question: str) -> str:
     plan_res = st.session_state.plan_res
     plan_det = st.session_state.plan_det
     try:
+        # Preguntas rápidas sin IA
         if "max" in txt or "mayor dif" in txt:
             row = plan_res.loc[plan_res["Dif_vs_FCST"].abs().idxmax()]
             return (f"El máximo |Dif_vs_FCST| es **{abs(row['Dif_vs_FCST']):,.0f}** en "
                     f"**{row['SVC']}** el **{pd.to_datetime(row['Fecha']).date()}**.")
+
         if "resumen" in txt and "svc" in txt:
             svcs = sorted(plan_res["SVC"].dropna().unique().tolist(), key=len, reverse=True)
             svc = next((s for s in svcs if s.lower() in txt), None)
             if svc:
                 df = (plan_res[plan_res["SVC"]==svc]
-                      .sort_values("Fecha")[["Fecha","Rutas_MLP","Rutas_Rentals","Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]]
+                      .sort_values("Fecha")[["Fecha","Rutas_MLP","Rutas_Rentals",
+                                             "Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]]
                       .tail(10))
                 st.dataframe(df, use_container_width=True)
                 return f"Te mostré las últimas 10 fechas de **{svc}**."
             return "Dime el SVC exacto (ej. SPB1, SPB2…)."
+
         if "totales por modelo" in txt:
             df = (plan_det.groupby("Modelo")["Rutas"].sum().reset_index())
             st.dataframe(df, use_container_width=True)
             return "Estos son los totales de rutas por modelo."
+
         if "para fecha" in txt or "el día" in txt:
             m = re.search(r"(20\d{2}-\d{2}-\d{2})", txt)
             if m:
                 fecha = pd.to_datetime(m.group(1))
-                df = plan_res[plan_res["Fecha"]==fecha][["SVC","Rutas_MLP","Rutas_Rentals","Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]]
+                df = plan_res[plan_res["Fecha"]==fecha][["SVC","Rutas_MLP","Rutas_Rentals",
+                                                          "Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]]
                 if not df.empty:
                     st.dataframe(df.sort_values("SVC"), use_container_width=True)
                     return f"Mostré el resumen para **{fecha.date()}**."
@@ -551,14 +557,15 @@ def _nl_answer(question: str) -> str:
                 "ejemplo_plan_det": _safe_preview(plan_det, 5),
             }
 
-        if _HAS_OPENAI:
             try:
                 client = OpenAI()
                 resp = client.responses.create(
                     model="gpt-4o-mini",
                     input=[
-                        {"role": "system", "content": "Eres analista de planeación. Responde conciso y pide SVC/fecha si falta."},
-                        {"role": "user", "content": f"Pregunta: {question}\nContexto:\n{json.dumps(schema, default=str)[:8000]}"},
+                        {"role": "system",
+                         "content": "Eres analista de planeación. Responde conciso y pide SVC/fecha si falta."},
+                        {"role": "user",
+                         "content": f"Pregunta: {question}\nContexto:\n{json.dumps(schema, default=str)[:8000]}"},
                     ],
                 )
                 return resp.output_text
@@ -567,9 +574,10 @@ def _nl_answer(question: str) -> str:
         else:
             return "Activa la API para respuestas de lenguaje natural, o pide métricas específicas (SVC, fechas, totales)."
 
-
-        if q:
-            st.session_state.chat.append(("user", q))
-            ans = _nl_answer(q)
-            st.session_state.chat.append(("assistant", ans))
-            st.rerun()
+    except Exception as e:
+        return f"Ocurrió un error respondiendo: {e}"
+if q:
+    st.session_state.chat.append(("user", q))
+    ans = _nl_answer(q)
+    st.session_state.chat.append(("assistant", ans))
+    st.rerun()
