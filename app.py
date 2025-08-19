@@ -552,15 +552,14 @@ def _nl_answer(question: str) -> str:
             }
 
             client = OpenAI()
-            resp = client.responses.create(
-                model="gpt-4o-mini",
-                input=[
-                    {"role":"system","content":"Eres analista de planeación. Responde conciso y pide SVC/fecha si falta."},
-                    {"role":"user","content": f"Pregunta: {question}
-Contexto:
-{json.dumps(schema, default=str)[:8000]}"},
-                ],
-            )
+           resp = client.responses.create(
+    model="gpt-4o-mini",
+    input=[
+        {"role":"system","content":"Eres analista de planeación. Responde conciso y pide SVC/fecha si falta."},
+        {"role":"user","content": f"Pregunta: {question}\nContexto:\n{json.dumps(schema, default=str)[:8000]}"},
+    ],
+)
+
             return resp.output_text
         else:
             return "Activa la API para respuestas de lenguaje natural, o pide métricas específicas (SVC, fechas, totales)."
