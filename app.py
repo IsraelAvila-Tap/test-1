@@ -508,6 +508,192 @@ if st.button("Escribir 'Plan_14_resumen' y 'Plan_14_detalle'"):
     except Exception as e:
         st.error(f"No se pudo escribir: {e}")
 
+# ========= Agente: parseo y ejecución de instrucciones desde el chat =========
+
+def _agent_parse_instruction(txt: str) -> dict:
+    """
+    Devuelve un dict con:
+      {
+        "acciones": [
+            {"tipo":"update_params","cambios":[{"nombre":"factor_escalado_mlp","valor":0.9}]},
+            {"tipo":"recalcular"},
+            {"tipo":"escribir_sheet"},
+            {"tipo":"mostrar_resumen_svc","svc":"SPB1","n":10},
+            {"tipo":"mostrar_fecha","fecha":"2025-08-10"},
+        ]
+      }
+    """
+    txt = (txt or "").strip()
+    out = {"acciones": []}
+    if not txt:
+        return out
+
+    # --- Con IA (si disponible) ---
+    if _HAS_OPENAI:
+        try:
+            system = (
+                "Eres un agente de planeación. Devuelve SOLO JSON con la forma:\n"
+                "{'acciones':[...]} donde cada acción es de tipos: "
+                "update_params(cambios:[{nombre,valor}]), recalcular(), escribir_sheet(), "
+                "mostrar_resumen_svc(svc, n opcional), mostrar_fecha(fecha 'YYYY-MM-DD'). "
+                f"Parámetros válidos: {list(st.session_state['params'].keys())}.\n"
+                "Si el usuario pide 'sube/baja X %', calcula el nuevo valor en [0,1]. "
+                "Si pide 'apaga/prende escalar...', mapea a booleano."
+            )
+            resp = _client.responses.create(
+                model="gpt-4o-mini",
+                input=[
+                    {"role":"system","content":system},
+                    {"role":"user","content":f"Instrucción: {txt}"},
+                ],
+            )
+            data = _extract_json(resp.output_text)
+            if isinstance(data, dict) and "acciones" in data:
+                return data
+        except Exception as e:
+            st.info(f"Agente (IA) no disponible, usando reglas locales. Detalle: {e}")
+
+    # --- Fallback sin IA (reglas locales) ---
+    acciones = []
+    low = txt.lower()
+
+    # update_params (reutiliza tu parser del sidebar)
+    cambios = []
+    alias = {"mlp":"factor_escalado_mlp","rentals":"factor_escalado_rentals"}
+    for m in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([0-9\.,]+)", low):
+        nombre, valor_str = m.group(1), m.group(2).replace(",", ".")
+        nombre = alias.get(nombre, nombre)
+        if nombre in st.session_state["params"]:
+            cambios.append({"nombre": nombre, "valor": float(valor_str)})
+
+    m = re.search(r"(sube|incrementa|baja|reduce|ajusta)\s+(mlp|rentals|factor_escalado_mlp|factor_escalado_rentals)\s+a\s*([0-9\.,]+)", low)
+    if m:
+        _, nombre, valor = m.groups()
+        nombre = alias.get(nombre, nombre)
+        try:
+            v = float(valor.replace(",", "."))
+            cambios.append({"nombre": nombre, "valor": v})
+        except:
+            pass
+
+    m = re.search(r"(sube|incrementa|baja|reduce)\s+(mlp|rentals|factor_escalado_mlp|factor_escalado_rentals)\s+([0-9]{1,3})\s*%", low)
+    if m:
+        verbo, nombre, p = m.groups()
+        nombre = alias.get(nombre, nombre)
+        base = float(st.session_state["params"].get(nombre, 1.0))
+        factor = (1 + int(p)/100.0) if verbo in ("sube","incrementa") else (1 - int(p)/100.0)
+        cambios.append({"nombre": nombre, "valor": max(0.0, min(1.0, base * factor))})
+
+    m = re.search(r"(sube|incrementa|baja|reduce)\s+(mlp|rentals|factor_escalado_mlp|factor_escalado_rentals)\b", low)
+    if m and not cambios:
+        _, nombre = m.groups()
+        nombre = alias.get(nombre, nombre)
+        base = float(st.session_state["params"].get(nombre, 1.0))
+        delta = 0.05 if m.group(1) in ("sube","incrementa") else -0.05
+        cambios.append({"nombre": nombre, "valor": max(0.0, min(1.0, base + delta))})
+
+    for m in re.finditer(r"(apaga|desactiva|prende|activa)\s+(escalar_si_excede_fcst)", low):
+        accion, nombre = m.groups()
+        cambios.append({"nombre": nombre, "valor": accion in ("prende","activa")})
+
+    if cambios:
+        acciones.append({"tipo":"update_params","cambios":cambios})
+
+    # recalcular explícito
+    if re.search(r"\b(recalcula|recalcular|recalc)\b", low):
+        acciones.append({"tipo":"recalcular"})
+
+    # escribir al sheet
+    if re.search(r"\b(escribe|escribir)\b.*\b(sheet|hoja|google)\b", low):
+        acciones.append({"tipo":"escribir_sheet"})
+
+    # mostrar_resumen_svc
+    m = re.search(r"\bresumen\b.*\bsvc\b\s*([A-Z0-9]+)", low)
+    if m:
+        acciones.append({"tipo":"mostrar_resumen_svc","svc":m.group(1).upper(),"n":10})
+
+    # mostrar_fecha
+    m = re.search(r"(20\d{2}-\d{2}-\d{2})", low)
+    if m:
+        acciones.append({"tipo":"mostrar_fecha","fecha":m.group(1)})
+
+    out["acciones"] = acciones
+    return out
+
+
+def _agent_execute(parsed: dict) -> str:
+    """
+    Ejecuta las acciones y devuelve un mensaje para el chat.
+    Puede mostrar dataframes/metricas en pantalla (side-effects).
+    """
+    acciones = parsed.get("acciones", [])
+    mensajes = []
+
+    for a in acciones:
+        t = a.get("tipo")
+
+        if t == "update_params":
+            res = _apply_changes(a.get("cambios", []))
+            st.write("Resultados:", res)
+            mensajes.append("Actualicé parámetros.")
+
+        elif t == "recalcular":
+            st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
+            st.success("Plan recalculado.")
+            mensajes.append("Recalculé el plan.")
+
+        elif t == "escribir_sheet":
+            try:
+                cli = get_client()
+                write_ws(cli.open_by_key(SHEET_ID), TABS["OUT_RES"],
+                         st.session_state.plan_res.sort_values(["SVC","Fecha"]))
+                write_ws(cli.open_by_key(SHEET_ID), TABS["OUT_DET"],
+                         st.session_state.plan_det.sort_values(["SVC","Fecha","Modelo","HOMOLOGACION_VEHICULO"]))
+                st.success("¡Listo! Se actualizaron las pestañas en Google Sheet.")
+                mensajes.append("Escribí 'Plan_14_resumen' y 'Plan_14_detalle'.")
+            except Exception as e:
+                st.error(f"No se pudo escribir: {e}")
+                mensajes.append(f"No pude escribir: {e}")
+
+        elif t == "mostrar_resumen_svc":
+            svc = a.get("svc")
+            n = int(a.get("n", 10))
+            pr = st.session_state.plan_res
+            if svc and "SVC" in pr.columns:
+                df = (pr[pr["SVC"]==svc]
+                      .sort_values("Fecha")[["Fecha","Rutas_MLP","Rutas_Rentals",
+                                             "Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]]
+                      .tail(n))
+                if not df.empty:
+                    st.dataframe(df, use_container_width=True)
+                    mensajes.append(f"Mostré resumen de **{svc}** (últimos {n}).")
+                else:
+                    mensajes.append(f"No encontré filas para {svc}.")
+            else:
+                mensajes.append("Pásame el SVC para el resumen.")
+
+        elif t == "mostrar_fecha":
+            fecha = a.get("fecha")
+            if fecha:
+                try:
+                    f = pd.to_datetime(fecha)
+                    df = st.session_state.plan_res[st.session_state.plan_res["Fecha"]==f][
+                        ["SVC","Rutas_MLP","Rutas_Rentals","Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]
+                    ]
+                    if not df.empty:
+                        st.dataframe(df.sort_values("SVC"), use_container_width=True)
+                        mensajes.append(f"Mostré el resumen para **{f.date()}**.")
+                    else:
+                        mensajes.append("No encontré esa fecha en el plan.")
+                except Exception:
+                    mensajes.append("Fecha inválida; usa YYYY-MM-DD.")
+
+    if not mensajes:
+        return "Listo. Si quieres, dime: 'sube mlp a 0.9 y recalcula', 'escribe al sheet', 'resumen svc SPB1', 'para fecha 2025-08-10', etc."
+    return " ".join(mensajes)
+
+
+
 # ========= Chat con Copiloto (Q&A sobre los datos) =========
 st.subheader("💬 Chat con Copiloto (pregúntame de tus datos)")
 if "chat" not in st.session_state:
@@ -517,86 +703,25 @@ for role, msg in st.session_state.chat:
     with st.chat_message(role):
         st.markdown(msg)
 
-q = st.chat_input("Ej: ¿Cuál es el SVC con mayor Dif_vs_FCST esta semana?")
+q = st.chat_input("Ej: 'sube mlp a 0.9 y recalcula' · 'resumen svc SPB1' · 'para fecha 2025-08-10' · o pregúntame algo de los datos")
 
 def _nl_answer(question: str) -> str:
-    txt = question.lower()
-    plan_res = st.session_state.plan_res
-    plan_det = st.session_state.plan_det
-    try:
-        # Preguntas rápidas sin IA
-        if "max" in txt or "mayor dif" in txt:
-            row = plan_res.loc[plan_res["Dif_vs_FCST"].abs().idxmax()]
-            return (f"El máximo |Dif_vs_FCST| es **{abs(row['Dif_vs_FCST']):,.0f}** en "
-                    f"**{row['SVC']}** el **{pd.to_datetime(row['Fecha']).date()}**.")
-
-        if "resumen" in txt and "svc" in txt:
-            svcs = sorted(plan_res["SVC"].dropna().unique().tolist(), key=len, reverse=True)
-            svc = next((s for s in svcs if s.lower() in txt), None)
-            if svc:
-                df = (plan_res[plan_res["SVC"]==svc]
-                      .sort_values("Fecha")[["Fecha","Rutas_MLP","Rutas_Rentals",
-                                             "Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]]
-                      .tail(10))
-                st.dataframe(df, use_container_width=True)
-                return f"Te mostré las últimas 10 fechas de **{svc}**."
-            return "Dime el SVC exacto (ej. SPB1, SPB2…)."
-
-        if "totales por modelo" in txt:
-            df = (plan_det.groupby("Modelo")["Rutas"].sum().reset_index())
-            st.dataframe(df, use_container_width=True)
-            return "Estos son los totales de rutas por modelo."
-
-        if "para fecha" in txt or "el día" in txt:
-            m = re.search(r"(20\d{2}-\d{2}-\d{2})", txt)
-            if m:
-                fecha = pd.to_datetime(m.group(1))
-                df = plan_res[plan_res["Fecha"]==fecha][["SVC","Rutas_MLP","Rutas_Rentals",
-                                                          "Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]]
-                if not df.empty:
-                    st.dataframe(df.sort_values("SVC"), use_container_width=True)
-                    return f"Mostré el resumen para **{fecha.date()}**."
-                return "No encontré esa fecha en el plan."
-
-        # ---------- IA (con serialización segura) ----------
-        if _HAS_OPENAI:
-            def _safe_preview(df, n=5):
-                d = df.head(n).copy()
-                for c in d.columns:
-                    if str(d[c].dtype).startswith("datetime") or "datetime64" in str(d[c].dtype):
-                        d[c] = pd.to_datetime(d[c], errors="coerce").dt.strftime("%Y-%m-%d")
-                return d.astype(object).where(pd.notnull(d), None).to_dict(orient="records")
-
-            schema = {
-                "plan_res_columns": list(plan_res.columns),
-                "plan_det_columns": list(plan_det.columns),
-                "ejemplo_plan_res": _safe_preview(plan_res, 5),
-                "ejemplo_plan_det": _safe_preview(plan_det, 5),
-            }
-
-            try:
-                client = OpenAI()
-                resp = client.responses.create(
-                    model="gpt-4o-mini",
-                    input=[
-                        {"role": "system",
-                         "content": "Eres analista de planeación. Responde conciso y pide SVC/fecha si falta."},
-                        {"role": "user",
-                         "content": f"Pregunta: {question}\nContexto:\n{json.dumps(schema, default=str)[:8000]}"},
-                    ],
-                )
-                return resp.output_text
-            except Exception as e:
-                return f"Ocurrió un error respondiendo: {e}"
-        else:
-            return "Activa la API para respuestas de lenguaje natural, o pide métricas específicas (SVC, fechas, totales)."
-
-    except Exception as e:
-        return f"Ocurrió un error respondiendo: {e}"
+    # ... (deja tu función _nl_answer tal como la tienes ahora) ...
+    # (no la repito para ahorrar espacio)
+    # Importante: esta se usa solo si el agente no detecta acciones relevantes
+    return "No entendí la pregunta."
 
 if q:
     st.session_state.chat.append(("user", q))
+
+    # 1) Intentar como instrucción/acción
+    parsed = _agent_parse_instruction(q)
+    if parsed.get("acciones"):
+        msg = _agent_execute(parsed)
+        st.session_state.chat.append(("assistant", msg))
+        st.rerun()
+
+    # 2) Si no hubo acciones -> Q&A sobre los datos
     ans = _nl_answer(q)
     st.session_state.chat.append(("assistant", ans))
     st.rerun()
-
