@@ -551,21 +551,21 @@ def _nl_answer(question: str) -> str:
                 "ejemplo_plan_det": _safe_preview(plan_det, 5),
             }
 
-    if _HAS_OPENAI:
-        try:
-            client = OpenAI()
-            resp = client.responses.create(
-                model="gpt-4o-mini",
-                input=[
-                    {"role": "system", "content": "Eres analista de planeación. Responde conciso y pide SVC/fecha si falta."},
-                    {"role": "user", "content": f"Pregunta: {question}\nContexto:\n{json.dumps(schema, default=str)[:8000]}"},
-                ],
-            )
-            return resp.output_text
-        except Exception as e:
-            return f"Ocurrió un error respondiendo: {e}"
-    else:
-        return "Activa la API para respuestas de lenguaje natural, o pide métricas específicas (SVC, fechas, totales)."
+        if _HAS_OPENAI:
+            try:
+                client = OpenAI()
+                resp = client.responses.create(
+                    model="gpt-4o-mini",
+                    input=[
+                        {"role": "system", "content": "Eres analista de planeación. Responde conciso y pide SVC/fecha si falta."},
+                        {"role": "user", "content": f"Pregunta: {question}\nContexto:\n{json.dumps(schema, default=str)[:8000]}"},
+                    ],
+                )
+                return resp.output_text
+            except Exception as e:
+                return f"Ocurrió un error respondiendo: {e}"
+        else:
+            return "Activa la API para respuestas de lenguaje natural, o pide métricas específicas (SVC, fechas, totales)."
 
 
 if q:
