@@ -3,14 +3,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from datetime import datetime
 
 # ========= Configuración de página (primero) =========
 st.set_page_config(page_title="Copiloto Flota — Mel-IA Ops", layout="wide")
 
 # ========= Config general =========
-CRED_FILE = "planificacionflota-76b4821edef5.json"        # tu JSON local
 SHEET_ID  = "1UBjU3-ftGCow3EzTD0NB6UaYwMUYUARbn9QjD7SlxtY"  # tu Google Sheet
 
 TABS = dict(
@@ -43,13 +42,25 @@ if "params" not in st.session_state:
         "factor_escalado_rentals": 0.75,  # float [0..1]
     }
 
-# ========= Auth Google Sheets =========
+# ========= Auth Google Sheets con Secrets (sin archivo) =========
 @st.cache_resource
 def get_client():
-    scope = ["https://spreadsheets.google.com/feeds",
-             "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(CRED_FILE, scope)
-    return gspread.authorize(creds)
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    # Toma credenciales de Streamlit Secrets
+    if "gcp_service_account" in st.secrets:
+        info = dict(st.secrets["gcp_service_account"])
+        if "private_key" in info and "\\n" in info["private_key"]:
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        creds = Credentials.from_service_account_info(info, scopes=scope)
+        return gspread.authorize(creds)
+
+    st.error(
+        "No se encontraron credenciales. En Streamlit Cloud configura **Settings → Secrets** con la sección [gcp_service_account]."
+    )
+    st.stop()
 
 def _unique_headers(headers):
     out, seen = [], set()
@@ -115,10 +126,10 @@ def load_all():
     client = get_client()
     sheet  = client.open_by_key(SHEET_ID)
     df_ej  = read_ws(sheet, TABS["EJ"],
-                     expected=["DELIVERY_MODEL","HOMOLOGACION_VEHICULO","Shps Dispatched","TOTAL_RUTAS"],
-                     any_keys=["SVC","Fecha","Año de DATE","DELIVERY_MODEL"])
-    df_srm = read_ws(sheet, TABS["SRM"], expected=["MLP","Region","SVC"], any_keys=["MLP","SVC"])
-    df_fc  = read_ws(sheet, TABS["FCST"], expected=["SVC"], any_keys=["SVC"])
+                     expected=["delivery_model","homologacion_vehiculo","shps dispatched","total_rutas"],
+                     any_keys=["svc","fecha","año de date","delivery_model"])
+    df_srm = read_ws(sheet, TABS["SRM"], expected=["mlp","region","svc"], any_keys=["mlp","svc"])
+    df_fc  = read_ws(sheet, TABS["FCST"], expected=["svc"], any_keys=["svc"])
     return sheet, df_ej, df_srm, df_fc
 
 sheet, df_exec, df_srm, df_fcst_raw = load_all()
@@ -235,8 +246,14 @@ def run(params: dict):
     fcst = df_fcst.copy()
 
     # --- Detalle base ---
-    det_mlp = mlp.rename(columns={"Rutas_MLP_int":"Rutas","SPR_final":"SPR","Shipments_MLP":"Shipments"})                  .assign(Modelo="MLP")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]]
-    det_rent= rent.rename(columns={"Rutas_Rentals_int":"Rutas","SPR_final":"SPR","Shipments_Rentals":"Shipments"})                  .assign(Modelo="Rentals")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]]
+    det_mlp = (
+        mlp.rename(columns={"Rutas_MLP_int":"Rutas","SPR_final":"SPR","Shipments_MLP":"Shipments"})
+           .assign(Modelo="MLP")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]]
+    )
+    det_rent = (
+        rent.rename(columns={"Rutas_Rentals_int":"Rutas","SPR_final":"SPR","Shipments_Rentals":"Shipments"})
+            .assign(Modelo="Rentals")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]]
+    )
     det_crowd = fcst[["SVC","Fecha"]].drop_duplicates().merge(crowd[["Fecha","SPR_Crowd"]], on="Fecha", how="left")
     det_crowd["HOMOLOGACION_VEHICULO"] = f"Crowd ({CROWD_VT})"
     det_crowd["Modelo"] = "Crowd"
@@ -356,7 +373,7 @@ with col_title:
 # ========= Sidebar: Agente de ajustes =========
 with st.sidebar.expander("🛠️ Ajustes por lenguaje natural", expanded=True):
     st.caption("Pídeme cambios y que recalcule. Ejemplos:")
-    st.code("factor_escalado_mlp=0.9 y recalcula apaga escalar_si_excede_fcst baja rentals 10%", language="text")
+    st.code("factor_escalado_mlp=0.9 y recalcula\napaga escalar_si_excede_fcst\nbaja rentals 10%", language="text")
     instruccion = st.text_input("Instrucción", placeholder="Ej: sube mlp a 0.9 y recalcula")
     if st.checkbox("Ver params", value=False):
         st.json(st.session_state["params"])
@@ -413,7 +430,7 @@ with st.sidebar.expander("🛠️ Ajustes por lenguaje natural", expanded=True):
                 cambios.append({"nombre": nombre, "valor": max(0.0, min(1.0, base * factor))})
 
             # “sube/baja X” sin número -> ±0.05
-            m = re.search(r"(sube|incrementa|baja|reduce)\s+(mlp|rentals|factor_escalado_mlp|factor_escalado_rentals)", txt)
+            m = re.search(r"(sube|incrementa|baja|reduce)\s+(mlp|rentals|factor_escalado_mlp|factor_escalado_rentals)\b", txt)
             if m and not cambios:
                 verbo, nombre = m.groups()
                 nombre = alias.get(nombre, nombre)
@@ -427,9 +444,9 @@ with st.sidebar.expander("🛠️ Ajustes por lenguaje natural", expanded=True):
                 cambios.append({"nombre": nombre, "valor": accion in ("prende","activa")})
 
             # Recalcular si se pide explícitamente (por defecto sí)
-            if re.search(r"no\s+recalc", txt):
+            if re.search(r"\bno\s+recalc", txt):
                 hacer_recalculo = False
-            elif re.search(r"recalc", txt):
+            elif re.search(r"\brecalc", txt):
                 hacer_recalculo = True
 
         if cambios:
@@ -576,8 +593,10 @@ def _nl_answer(question: str) -> str:
 
     except Exception as e:
         return f"Ocurrió un error respondiendo: {e}"
+
 if q:
     st.session_state.chat.append(("user", q))
     ans = _nl_answer(q)
     st.session_state.chat.append(("assistant", ans))
     st.rerun()
+
