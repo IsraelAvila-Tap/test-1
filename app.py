@@ -1,4 +1,4 @@
-# app.py  —  Mel-IA Ops (Jarvis libre)
+# app.py — Mel-IA Ops (Jarvis libre + Chat de consultas)
 import os, re, json, glob
 import numpy as np
 import pandas as pd
@@ -34,21 +34,20 @@ try:
     from openai import OpenAI
     _client = OpenAI()
     _HAS_OPENAI = True
-except Exception as _e:
+except Exception:
     _client = None
-    st.sidebar.warning("OpenAI no configurado; el modo Jarvis usará un parser básico.")
 
 # =========================
-# Estado global
+# Estado global en sesión
 # =========================
 if "params" not in st.session_state:
     st.session_state["params"] = {
-        "escalar_si_excede_fcst": True,
-        "factor_escalado_mlp": 0.85,
-        "factor_escalado_rentals": 0.75,
+        "escalar_si_excede_fcst": True,   # Si True, recorta MLP/Rentals cuando exceden FCST
+        "factor_escalado_mlp": 0.85,      # Se usa solo si NO hay override fijo
+        "factor_escalado_rentals": 0.75,  # Se usa solo si NO hay override fijo
     }
 
-# Overrides de rutas (por modelo/SVC)
+# Overrides de rutas por modelo y SVC (GLOBAL o por SVC)
 # Estructura: {"mlp": {"GLOBAL": int, "SPB1": int, ...}, "rentals": {...}}
 if "overrides" not in st.session_state:
     st.session_state["overrides"] = {"mlp": {}, "rentals": {}}
@@ -191,7 +190,7 @@ cal = pd.DataFrame({"Fecha": fechas})
 cal["_dow"] = cal["Fecha"].dt.weekday
 
 # =========================
-# SPRs
+# SPRs y capacidades
 # =========================
 df_exec["SPR_raw"] = df_exec["Shps Dispatched"] / df_exec["TOTAL_RUTAS"]
 df_exec["SPR_w"]   = df_exec["SPR_raw"]
@@ -208,9 +207,6 @@ spr_dow_global = (spr_dow.groupby(["_dow"])["SPR_dow"]
                   .mean().reset_index().rename(columns={"SPR_dow":"SPR_dow_global"}))
 spr_global = float(df_exec["SPR_w"].mean()) if not df_exec.empty else 0.0
 
-# =========================
-# Capacidades base
-# =========================
 veh_cols = [c for c in ["Extra Large Van","Large Van","Small Van","Car"] if c in df_srm.columns]
 df_srm_long = df_srm.melt(id_vars=["MLP","Region","SVC"], value_vars=veh_cols,
                           var_name="HOMOLOGACION_VEHICULO", value_name="Rutas_MLP").fillna(0)
@@ -229,7 +225,7 @@ if "SVC" not in rent_rutas.columns:
 rentals_capacity = rent_rutas[["SVC","HOMOLOGACION_VEHICULO","Rutas_Rentals_avg"]].copy()
 
 # =========================
-# Motor con overrides
+# Motor: aplica overrides y recalcula (Crowd cierra gap)
 # =========================
 def run(params: dict):
     scale_if_exceed = bool(params.get("escalar_si_excede_fcst", True))
@@ -344,7 +340,7 @@ if "plan_res" not in st.session_state or "plan_det" not in st.session_state or "
     st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
 
 # =========================
-# Utilidades
+# Utilidades de Jarvis
 # =========================
 def _set_override(modelo: str, rutas: int, svc: str|None):
     modelo = (modelo or "").lower()
@@ -389,7 +385,7 @@ def _crowd_need_view(svc=None, fecha=None):
     return f"Rutas Crowd necesarias totales: **{int(need['Rutas_Crowd_Need'].sum())}**."
 
 # =========================
-# Encabezado & Sidebar
+# Header & Sidebar (Jarvis)
 # =========================
 def _pick_logo():
     prefer = [
@@ -413,7 +409,7 @@ with col_title:
     st.markdown("## **Mel-IA Ops — Copiloto de Planeación de Flota (Jarvis libre)**")
 
 with st.sidebar.expander("🧠 Jarvis — Instrucciones en español", expanded=True):
-    st.caption("Ejemplos: ‘rentals=100’, ‘pon mlp 80 en SPB1’, ‘apaga escalar_si_excede_fcst’, ‘crowd needed’, ‘quita override de rentals en SPB2’.")
+    st.caption("Usa esta caja para CAMBIAR el plan. Ej.: ‘rentals=100’, ‘pon mlp 80 en SPB1’, ‘apaga escalar_si_excede_fcst’, ‘crowd needed’, ‘quita override de rentals en SPB2’.")
     instruccion = st.text_input("Instrucción", placeholder="Ej: pon rentals 120 en SPB1 y recalcula")
     if st.checkbox("Ver params", value=False):
         st.json(st.session_state["params"])
@@ -429,13 +425,12 @@ with st.sidebar.expander("🧠 Jarvis — Instrucciones en español", expanded=T
             try:
                 system_msg = (
                     "Eres un planificador. Convierte la instrucción del usuario en JSON con 'acciones' (lista). "
-                    "Tipos de acción: \n"
-                    "1) set_routes {modelo:'mlp|rentals', rutas:int, svc?:string}  # fija rutas global o por SVC\n"
-                    "2) clear_override {modelo:'mlp|rentals', svc?:string}\n"
-                    "3) set_param {nombre:'escalar_si_excede_fcst|factor_escalado_mlp|factor_escalado_rentals', valor}\n"
-                    "4) recalc {}\n"
-                    "5) crowd_need {svc?:string, fecha?:'YYYY-MM-DD'}\n"
-                    "Responde SOLO el JSON. No agregues texto fuera del JSON."
+                    "Tipos: "
+                    "set_routes{modelo:'mlp|rentals', rutas:int, svc?:string}; "
+                    "clear_override{modelo:'mlp|rentals', svc?:string}; "
+                    "set_param{nombre:'escalar_si_excede_fcst|factor_escalado_mlp|factor_escalado_rentals', valor}; "
+                    "recalc{}; crowd_need{svc?:string, fecha?:'YYYY-MM-DD'}. "
+                    "Responde SOLO el JSON."
                 )
                 user_msg = f"Instrucción: {instruccion}"
                 resp = _client.responses.create(
@@ -455,7 +450,7 @@ with st.sidebar.expander("🧠 Jarvis — Instrucciones en español", expanded=T
             except Exception as e:
                 st.warning(f"No se pudo usar OpenAI: {e}")
 
-        # ===== 2) Fallback robusto sin IA =====
+        # ===== 2) Fallback regex sin IA =====
         if not acciones and instruccion.strip():
             txt = instruccion.strip().lower()
 
@@ -515,7 +510,7 @@ with st.sidebar.expander("🧠 Jarvis — Instrucciones en español", expanded=T
                 else:
                     mensajes.append(f"(Ignorado) Acción no soportada: {t}")
 
-            # Siempre recalc si hubo cambios en rutas/params/overrides
+            # Recalcular si hubo cambios en rutas/params/overrides
             if any((a.get("tipo") in ("set_routes","clear_override","set_param","recalc")) for a in acciones):
                 st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
                 st.success(" | ".join(mensajes))
@@ -533,7 +528,7 @@ with st.sidebar:
     st.caption(f"Sheet ID: {SHEET_ID}")
 
 # =========================
-# UI principal
+# UI principal (tablas)
 # =========================
 st.subheader("Resumen (incluye Shipments_FCST)")
 cols_pref = [
@@ -575,7 +570,7 @@ if st.button("Escribir 'Plan_14_resumen' y 'Plan_14_detalle'"):
         st.error(f"No se pudo escribir: {e}")
 
 # =========================
-# Chat (Q&A)
+# Chat de consultas (no modifica plan)
 # =========================
 st.subheader("💬 Chat con Copiloto (pregúntame de tus datos)")
 if "chat" not in st.session_state:
@@ -585,12 +580,13 @@ for role, msg in st.session_state.chat:
     with st.chat_message(role):
         st.markdown(msg)
 
-q = st.chat_input("Ej: 'crowd needed' · 'rentals=100' · 'pon mlp 80 en SPB1' · 'resumen svc SPB1' · 'para fecha 2025-08-10'")
+q = st.chat_input("Consulta: 'resumen svc SPB1' · 'para fecha 2025-08-10' · 'totales por modelo' · '¿mayor Dif_vs_FCST?'")
 def _nl_answer(question: str) -> str:
     txt = (question or "").lower()
     plan_res = st.session_state.plan_res
     plan_det = st.session_state.plan_det
     try:
+        # Q&A de datos (no cambia el plan)
         if "max" in txt or "mayor dif" in txt:
             row = plan_res.loc[plan_res["Dif_vs_FCST"].abs().idxmax()]
             return (f"El máximo |Dif_vs_FCST| es **{abs(row['Dif_vs_FCST']):,.0f}** en "
@@ -620,27 +616,25 @@ def _nl_answer(question: str) -> str:
                     st.dataframe(df.sort_values("SVC"), use_container_width=True)
                     return f"Mostré el resumen para **{fecha.date()}**."
                 return "No encontré esa fecha en el plan."
-        # Fallback
-        return "Pídeme un SVC/fecha, o usa Jarvis en el panel izquierdo para cambiar rutas."
+        # Ayuda/guía
+        return "Este chat es para CONSULTAS. Para CAMBIOS usa el panel Jarvis a la izquierda."
     except Exception as e:
         return f"Ocurrió un error respondiendo: {e}"
 
 if q:
     st.session_state.chat.append(("user", q))
-    # Atajos: permitir órdenes también desde el chat (set_routes / crowd_need / recalc)
+    # (Opcional) Atajos mínimos desde chat; si no los quieres, borra este bloque:
     acciones = []
     low = q.strip().lower()
-    m = re.search(r"\b(mlp|rentals)\s*=\s*(\d+)\b", low) or re.search(r"\b(mlp|rentals)\s+(\d+)\b", low)
-    if m: acciones.append({"tipo":"set_routes","modelo":m.group(1),"rutas":int(m.group(2))})
-    m = re.search(r"(mlp|rentals).{0,10}?(\d+).{0,10}?\ben\s+([A-Za-z0-9]+)", low)
-    if m: acciones.append({"tipo":"set_routes","modelo":m.group(1),"rutas":int(m.group(2)),"svc":m.group(3).upper()})
+    if re.search(r"\brecalc|recalcula|recalcular\b", low):
+        acciones.append({"tipo":"recalc"})
     if re.search(r"crowd|needed|necesit", low):
         msvc = re.search(r"\bsvc\s*([A-Za-z0-9]+)", low)
         mfecha = re.search(r"(20\d{2}-\d{2}-\d{2})", low)
         acciones.append({"tipo":"crowd_need","svc": (msvc.group(1).upper() if msvc else None),
                          "fecha": (mfecha.group(1) if mfecha else None)})
-    if re.search(r"\brecalc|recalcula|recalcular\b", low):
-        acciones.append({"tipo":"recalc"})
+    m = re.search(r"\b(mlp|rentals)\s*=\s*(\d+)\b", low) or re.search(r"\b(mlp|rentals)\s+(\d+)\b", low)
+    if m: acciones.append({"tipo":"set_routes","modelo":m.group(1),"rutas":int(m.group(2))})
 
     msgs=[]
     for a in acciones:
