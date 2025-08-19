@@ -356,9 +356,7 @@ with col_title:
 # ========= Sidebar: Agente de ajustes =========
 with st.sidebar.expander("🛠️ Ajustes por lenguaje natural", expanded=True):
     st.caption("Pídeme cambios y que recalcule. Ejemplos:")
-    st.code("factor_escalado_mlp=0.9 y recalcula
-apaga escalar_si_excede_fcst
-baja rentals 10%", language="text")
+    st.code("factor_escalado_mlp=0.9 y recalcula apaga escalar_si_excede_fcst baja rentals 10%", language="text")
     instruccion = st.text_input("Instrucción", placeholder="Ej: sube mlp a 0.9 y recalcula")
     if st.checkbox("Ver params", value=False):
         st.json(st.session_state["params"])
