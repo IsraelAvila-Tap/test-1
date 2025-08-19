@@ -2,5 +2,6 @@ streamlit
 pandas
 numpy
 gspread
+oauth2client
 google-auth
 openai
