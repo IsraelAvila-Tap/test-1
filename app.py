@@ -7,11 +7,11 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 
-# ========= Configuración de página (primero) =========
+# ========= Config de página =========
 st.set_page_config(page_title="Copiloto Flota — Mel-IA Ops", layout="wide")
 
-# ========= Config general =========
-SHEET_ID = "1UBjU3-ftGCow3EzTD0NB6UaYwMUYUARbn9QjD7SlxtY"  # tu Google Sheet
+# ========= IDs =========
+SHEET_ID = "1UBjU3-ftGCow3EzTD0NB6UaYwMUYUARbn9QjD7SlxtY"
 
 TABS = dict(
     EJ="Ejecución",
@@ -21,11 +21,12 @@ TABS = dict(
     OUT_DET="Plan_14_detalle",
 )
 
+# ========= Constantes del modelo =========
 RUTAS_SRM_IS_DAILY = True
 FACTOR_SRM_SEM_A_DIA = 1/6
 CROWD_VT = "Car"
 
-# ========= Cliente OpenAI (opcional) =========
+# ========= OpenAI (opcional) =========
 try:
     from openai import OpenAI
     _client = OpenAI()
@@ -35,15 +36,20 @@ except Exception:
     _HAS_OPENAI = False
     st.sidebar.warning("No se detectó OpenAI o la API key. El agente y chat funcionan en modo manual.")
 
-# ========= Estado de parámetros controlados por agente =========
+# ========= Estado global =========
 if "params" not in st.session_state:
     st.session_state["params"] = {
-        "escalar_si_excede_fcst": True,   # bool
-        "factor_escalado_mlp": 0.85,      # float [0..1]
-        "factor_escalado_rentals": 0.75,  # float [0..1]
+        "escalar_si_excede_fcst": True,
+        "factor_escalado_mlp": 0.85,
+        "factor_escalado_rentals": 0.75,
     }
 
-# ========= Auth Google Sheets con Secrets (sin archivo) =========
+# Overrides de rutas (por modelo/SVC)
+# Estructura: {"mlp": {"GLOBAL": int, "SPB1": int, ...}, "rentals": {...}}
+if "overrides" not in st.session_state:
+    st.session_state["overrides"] = {"mlp": {}, "rentals": {}}
+
+# ========= Auth Google Sheets (Secrets) =========
 @st.cache_resource
 def get_client():
     scope = [
@@ -56,8 +62,7 @@ def get_client():
             info["private_key"] = info["private_key"].replace("\\n", "\n")
         creds = Credentials.from_service_account_info(info, scopes=scope)
         return gspread.authorize(creds)
-
-    st.error("No se encontraron credenciales. Configura **Settings → Secrets** con [gcp_service_account].")
+    st.error("No se encontraron credenciales. En Streamlit Cloud configura Settings → Secrets con [gcp_service_account].")
     st.stop()
 
 def _unique_headers(headers):
@@ -123,7 +128,6 @@ def winsor(s, low=0.05, high=0.95, min_n=10):
 def load_all():
     client = get_client()
     sheet  = client.open_by_key(SHEET_ID)
-    # expected en minúsculas para ser robustos
     df_ej  = read_ws(sheet, TABS["EJ"],
                      expected=["delivery_model","homologacion_vehiculo","shps dispatched","total_rutas"],
                      any_keys=["svc","fecha","año de date","delivery_model"])
@@ -201,7 +205,7 @@ if not RUTAS_SRM_IS_DAILY:
     df_srm_long["Rutas_MLP"] *= FACTOR_SRM_SEM_A_DIA
 mlp_capacity = df_srm_long.groupby(["SVC","HOMOLOGACION_VEHICULO"], as_index=False).agg(Rutas_MLP=("Rutas_MLP","sum"))
 
-# ========= Capacidad Rentals (promedio de rutas) =========
+# ========= Capacidad Rentals =========
 is_rent = df_exec["DELIVERY_MODEL"].astype(str).str.upper().str.contains("RENT")
 df_rent = df_exec[is_rent].copy()
 grp = ["SVC","HOMOLOGACION_VEHICULO"] if "SVC" in df_rent.columns else ["HOMOLOGACION_VEHICULO"]
@@ -211,13 +215,13 @@ if "SVC" not in rent_rutas.columns:
     rent_rutas = rent_rutas.assign(_k=1).merge(pd.DataFrame({"SVC":svcs,"_k":[1]*len(svcs)}), on="_k").drop(columns="_k")
 rentals_capacity = rent_rutas[["SVC","HOMOLOGACION_VEHICULO","Rutas_Rentals_avg"]].copy()
 
-# ========= Motor principal que USA params =========
+# ========= Motor principal con overrides =========
 def run(params: dict):
     scale_if_exceed = bool(params.get("escalar_si_excede_fcst", True))
     f_mlp   = float(params.get("factor_escalado_mlp", 1.0))
     f_rent  = float(params.get("factor_escalado_rentals", 1.0))
 
-    # --- MLP ---
+    # --- MLP base ---
     spr_mlp = spr_dow[spr_dow["DELIVERY_MODEL"]=="MLP"][["HOMOLOGACION_VEHICULO","_dow","SPR_dow"]]
     mlp = mlp_capacity.assign(_k=1).merge(cal.assign(_k=1), on="_k").drop(columns="_k")
     mlp = (mlp.merge(spr_mlp, on=["HOMOLOGACION_VEHICULO","_dow"], how="left")
@@ -225,17 +229,37 @@ def run(params: dict):
                .merge(spr_dow_global, on=["_dow"], how="left"))
     mlp["SPR_final"] = mlp["SPR_dow"].fillna(mlp["SPR_dow_vt"]).fillna(mlp["SPR_dow_global"]).fillna(spr_global)
     mlp["Rutas_MLP_int"] = np.round(mlp["Rutas_MLP"] * f_mlp).clip(lower=0).astype(int)
+
+    # Overrides MLP
+    ov_mlp = st.session_state["overrides"].get("mlp", {})
+    if ov_mlp:
+        if "GLOBAL" in ov_mlp:
+            mlp["Rutas_MLP_int"] = int(ov_mlp["GLOBAL"])
+        if "SVC" in mlp.columns:
+            for svc, rutas_fijas in ov_mlp.items():
+                if svc != "GLOBAL":
+                    mlp.loc[mlp["SVC"]==svc, "Rutas_MLP_int"] = int(rutas_fijas)
     mlp["Shipments_MLP"] = mlp["Rutas_MLP_int"] * mlp["SPR_final"]
 
-    # --- Rentals ---
+    # --- Rentals base ---
     rent = rentals_capacity.assign(_k=1).merge(cal.assign(_k=1), on="_k").drop(columns="_k")
     rent = (rent.merge(spr_dow_vt, on=["HOMOLOGACION_VEHICULO","_dow"], how="left")
                .merge(spr_dow_global, on=["_dow"], how="left"))
     rent["SPR_final"] = rent["SPR_dow_vt"].fillna(rent["SPR_dow_global"]).fillna(spr_global)
     rent["Rutas_Rentals_int"] = np.round(rent["Rutas_Rentals_avg"] * f_rent).clip(lower=0).astype(int)
+
+    # Overrides Rentals
+    ov_rent = st.session_state["overrides"].get("rentals", {})
+    if ov_rent:
+        if "GLOBAL" in ov_rent:
+            rent["Rutas_Rentals_int"] = int(ov_rent["GLOBAL"])
+        if "SVC" in rent.columns:
+            for svc, rutas_fijas in ov_rent.items():
+                if svc != "GLOBAL":
+                    rent.loc[rent["SVC"]==svc, "Rutas_Rentals_int"] = int(rutas_fijas)
     rent["Shipments_Rentals"] = rent["Rutas_Rentals_int"] * rent["SPR_final"]
 
-    # --- Crowd ---
+    # --- Crowd SPR por fecha ---
     crowd = cal.merge(
         spr_dow_vt[spr_dow_vt["HOMOLOGACION_VEHICULO"]==CROWD_VT][["_dow","SPR_dow_vt"]],
         on="_dow", how="left"
@@ -245,14 +269,11 @@ def run(params: dict):
     fcst = df_fcst.copy()
 
     # --- Detalle base ---
-    det_mlp = (
-        mlp.rename(columns={"Rutas_MLP_int":"Rutas","SPR_final":"SPR","Shipments_MLP":"Shipments"})
-           .assign(Modelo="MLP")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]]
-    )
-    det_rent = (
-        rent.rename(columns={"Rutas_Rentals_int":"Rutas","SPR_final":"SPR","Shipments_Rentals":"Shipments"})
-            .assign(Modelo="Rentals")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]]
-    )
+    det_mlp = (mlp.rename(columns={"Rutas_MLP_int":"Rutas","SPR_final":"SPR","Shipments_MLP":"Shipments"})
+                  .assign(Modelo="MLP")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]])
+    det_rent= (rent.rename(columns={"Rutas_Rentals_int":"Rutas","SPR_final":"SPR","Shipments_Rentals":"Shipments"})
+                  .assign(Modelo="Rentals")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]])
+
     det_crowd = fcst[["SVC","Fecha"]].drop_duplicates().merge(crowd[["Fecha","SPR_Crowd"]], on="Fecha", how="left")
     det_crowd["HOMOLOGACION_VEHICULO"] = f"Crowd ({CROWD_VT})"
     det_crowd["Modelo"] = "Crowd"
@@ -263,12 +284,13 @@ def run(params: dict):
 
     det = pd.concat([det_mlp, det_rent, det_crowd], ignore_index=True)
 
-    # --- Ajuste vs FCST ---
+    # --- Ajuste: recorte o cierre con Crowd ---
     def ajustar(gr):
         svc, fecha = gr.name
         fc = float(fcst[(fcst.SVC==svc)&(fcst.Fecha==fecha)]["Shipments_FCST"].sum())
         m = gr["Modelo"].eq("MLP"); r = gr["Modelo"].eq("Rentals"); c = gr["Modelo"].eq("Crowd")
         base = gr.loc[m|r,"Shipments"].sum()
+
         if scale_if_exceed and base > fc and base > 0:
             f = fc/base
             for mask in [m,r]:
@@ -276,6 +298,7 @@ def run(params: dict):
                 gr.loc[mask,"Shipments"] = gr.loc[mask,"Rutas"]*gr.loc[mask,"SPR"]
             gr.loc[c,["Rutas","Shipments"]] = (0,0.0)
             return gr
+
         gap = max(fc-base, 0.0)
         if gap>0:
             spr_c = float(gr.loc[c,"SPR"].iloc[0]) if gr.loc[c,"SPR"].notna().any() else 0.0
@@ -283,6 +306,8 @@ def run(params: dict):
                 rr = int(np.round(gap/spr_c))
                 gr.loc[c,"Rutas"] = rr
                 gr.loc[c,"Shipments"] = rr*spr_c
+        else:
+            gr.loc[c,["Rutas","Shipments"]] = (0,0.0)
         return gr
 
     det = det.groupby(["SVC","Fecha"], group_keys=False).apply(ajustar)
@@ -298,13 +323,13 @@ def run(params: dict):
     res = res.merge(df_fcst, on=["SVC","Fecha"], how="left")
     res["Shipments_Totales"] = res["Shipments_MLP"]+res["Shipments_Rentals"]+res["Shipments_Crowd"]
     res["Dif_vs_FCST"] = res["Shipments_Totales"] - res["Shipments_FCST"]
-    return res, det
+    return res, det, crowd[["Fecha","SPR_Crowd"]].copy()
 
-# === Resultados cacheados en estado (primer cálculo) ===
-if "plan_res" not in st.session_state or "plan_det" not in st.session_state:
-    st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
+# === Primer cálculo ===
+if "plan_res" not in st.session_state or "plan_det" not in st.session_state or "crowd_spr" not in st.session_state:
+    st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
 
-# ========= Utilidades del agente =========
+# ========= Utilidades agente =========
 _NUMERIC_TRUE = {"true","t","1","yes","y","si","sí","on"}
 _NUMERIC_FALSE = {"false","f","0","no","n","off"}
 
@@ -346,7 +371,27 @@ def _extract_json(texto: str):
     except:
         return None
 
-# ========= Encabezado con imagen =========
+def _set_override(modelo: str, rutas: int, svc: str|None):
+    modelo = modelo.lower()
+    if modelo not in ("mlp","rentals"):
+        return f"Modelo inválido: {modelo}"
+    rutas = int(max(0, rutas))
+    if svc:
+        st.session_state["overrides"][modelo][svc.upper()] = rutas
+        return f"Fijé {modelo.upper()}={rutas} rutas para {svc.upper()}."
+    else:
+        st.session_state["overrides"][modelo]["GLOBAL"] = rutas
+        return f"Fijé {modelo.upper()}={rutas} rutas GLOBAL."
+
+def _clear_override(modelo: str, svc: str|None):
+    modelo = modelo.lower()
+    if modelo not in ("mlp","rentals"): return
+    if svc:
+        st.session_state["overrides"][modelo].pop(svc.upper(), None)
+    else:
+        st.session_state["overrides"][modelo].pop("GLOBAL", None)
+
+# ========= Encabezado =========
 def _pick_logo():
     prefer = [
         "20250813_1028_Camión Futurista Amarillo_remix_01k2j400zxfp0te4vpq1kq1wnv.png",
@@ -362,7 +407,7 @@ def _pick_logo():
     return None
 
 logo_path = _pick_logo()
-col_logo, col_title = st.columns([1,4])  # compatible con versiones antiguas de Streamlit
+col_logo, col_title = st.columns([1,4])
 with col_logo:
     if logo_path:
         st.image(logo_path, use_container_width=True)
@@ -372,85 +417,118 @@ with col_title:
 # ========= Sidebar: Agente de ajustes =========
 with st.sidebar.expander("🛠️ Ajustes por lenguaje natural", expanded=True):
     st.caption("Pídeme cambios y que recalcule. Ejemplos:")
-    st.code("factor_escalado_mlp=0.9 y recalcula\napaga escalar_si_excede_fcst\nbaja rentals 10%", language="text")
-    instruccion = st.text_input("Instrucción", placeholder="Ej: sube mlp a 0.9 y recalcula")
+    st.code("rentals=100\npon mlp 80 en SPB1\napaga escalar_si_excede_fcst\ncrowd needed", language="text")
+    instruccion = st.text_input("Instrucción", placeholder="Ej: pon rentals 120 en SPB1 y recalcula")
     if st.checkbox("Ver params", value=False):
         st.json(st.session_state["params"])
+    if st.checkbox("Ver overrides", value=False):
+        st.json(st.session_state["overrides"])
 
     if st.button("Ejecutar instrucción"):
         cambios = []; hacer_recalculo = True
         if _HAS_OPENAI and instruccion.strip():
             try:
-                system_msg = ("Devuelve SOLO JSON con keys: cambios (lista de {nombre, valor}) y recalcular (bool). "
-                              f"Parámetros válidos: {list(st.session_state['params'].keys())}. "
-                              "Si dice 'apaga/desactiva' → false; 'prende/activa' → true.")
+                system_msg = (
+                    "Devuelve SOLO JSON con keys: acciones (lista). "
+                    "Acciones válidas: "
+                    "update_params(cambios:[{nombre,valor}]), recalcular(), "
+                    "override(modelo:'mlp|rentals', rutas:int, svc?:'SPB1' opcional), "
+                    "clear_override(modelo:'mlp|rentals', svc?:'SPB1' opcional), "
+                    "crowd_need(svc?:'SPB1', fecha?:'YYYY-MM-DD')."
+                )
                 resp = _client.responses.create(
                     model="gpt-4o-mini",
                     input=[{"role":"system","content":system_msg},
                            {"role":"user","content":f"Instrucción: {instruccion}"}],
                 )
-                data = _extract_json(resp.output_text)
-                if data:
-                    cambios = data.get("cambios", [])
-                    hacer_recalculo = bool(data.get("recalcular", True))
+                data = _extract_json(resp.output_text) or {}
+                acciones = data.get("acciones", [])
             except Exception as e:
                 st.warning(f"No se pudo usar OpenAI: {e}")
+                acciones = []
+        else:
+            acciones = []
 
-        # Fallback robusto (sin IA)
-        if not cambios and instruccion.strip():
+        # Fallback simple a partir del texto si no hubo IA
+        if not acciones and instruccion.strip():
             txt = instruccion.strip().lower()
-            alias = {"mlp": "factor_escalado_mlp", "rentals": "factor_escalado_rentals"}
-
-            for m in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([0-9\.,]+)", txt):
-                nombre, valor_str = m.group(1), m.group(2).replace(",", ".")
-                nombre = alias.get(nombre, nombre)
-                if nombre in st.session_state["params"]:
-                    cambios.append({"nombre": nombre, "valor": float(valor_str)})
-
-            m = re.search(r"(sube|incrementa|baja|reduce|ajusta)\s+(mlp|rentals|factor_escalado_mlp|factor_escalado_rentals)\s+a\s*([0-9\.,]+)", txt)
+            # override global: "rentals = 100" | "mlp 80"
+            m = re.search(r"\b(mlp|rentals)\s*=\s*(\d+)\b", txt) or re.search(r"\b(mlp|rentals)\s+(\d+)\b", txt)
             if m:
-                _, nombre, valor = m.groups()
-                nombre = alias.get(nombre, nombre)
-                try:
-                    v = float(valor.replace(",", "."))
-                    cambios.append({"nombre": nombre, "valor": v})
-                except:
-                    pass
+                acciones.append({"tipo":"override","modelo":m.group(1),"rutas":int(m.group(2))})
 
-            m = re.search(r"(sube|incrementa|baja|reduce)\s+(mlp|rentals|factor_escalado_mlp|factor_escalado_rentals)\s+([0-9]{1,3})\s*%", txt)
+            # override por SVC: "pon rentals 120 en SPB1" / "mlp 60 en spb2"
+            m = re.search(r"(mlp|rentals).{0,10}?(\d+).{0,10}?\ben\s+([A-Za-z0-9]+)", txt)
             if m:
-                verbo, nombre, p = m.groups()
-                nombre = alias.get(nombre, nombre)
-                base = float(st.session_state["params"].get(nombre, 1.0))
-                factor = (1 + int(p)/100.0) if verbo in ("sube","incrementa") else (1 - int(p)/100.0)
-                cambios.append({"nombre": nombre, "valor": max(0.0, min(1.0, base * factor))})
+                acciones.append({"tipo":"override","modelo":m.group(1),"rutas":int(m.group(2)),"svc":m.group(3).upper()})
 
-            m = re.search(r"(sube|incrementa|baja|reduce)\s+(mlp|rentals|factor_escalado_mlp|factor_escalado_rentals)\b", txt)
-            if m and not cambios:
-                verbo, nombre = m.groups()
-                nombre = alias.get(nombre, nombre)
-                base = float(st.session_state["params"].get(nombre, 1.0))
-                delta = 0.05 if verbo in ("sube","incrementa") else -0.05
-                cambios.append({"nombre": nombre, "valor": max(0.0, min(1.0, base + delta))})
+            # on/off flag
+            m = re.search(r"(apaga|desactiva|prende|activa)\s+(escalar_si_excede_fcst)", txt)
+            if m:
+                val = m.group(1) in ("prende","activa")
+                acciones.append({"tipo":"update_params","cambios":[{"nombre":"escalar_si_excede_fcst","valor":val}]})
 
-            for m in re.finditer(r"(apaga|desactiva|prende|activa)\s+(escalar_si_excede_fcst)", txt):
-                accion, nombre = m.groups()
-                cambios.append({"nombre": nombre, "valor": accion in ("prende","activa")})
+            # crowd need
+            if re.search(r"crowd|needed|necesit", txt):
+                msvc = re.search(r"\bsvc\s*([A-Za-z0-9]+)", txt)
+                mfecha = re.search(r"(20\d{2}-\d{2}-\d{2})", txt)
+                acciones.append({"tipo":"crowd_need","svc": (msvc.group(1).upper() if msvc else None),
+                                 "fecha": (mfecha.group(1) if mfecha else None)})
 
-            if re.search(r"\bno\s+recalc", txt):
-                hacer_recalculo = False
-            elif re.search(r"\brecalc", txt):
-                hacer_recalculo = True
+            # recalcula explícito
+            if re.search(r"\brecalc|recalcula|recalcular\b", txt):
+                acciones.append({"tipo":"recalcular"})
 
-        if cambios:
-            resultados = _apply_changes(cambios)
-            st.write("Resultados:", resultados)
-            if hacer_recalculo:
-                st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
-                st.success("Plan recalculado con parámetros actualizados.")
+        # Ejecutar acciones
+        mensajes = []
+        for a in acciones:
+            t = a.get("tipo")
+            if t == "update_params":
+                res = _apply_changes(a.get("cambios", []))
+                mensajes.append(f"Params: {res}")
+            elif t == "override":
+                msg = _set_override(a.get("modelo",""), a.get("rutas",0), a.get("svc"))
+                mensajes.append(msg)
+            elif t == "clear_override":
+                _clear_override(a.get("modelo",""), a.get("svc"))
+                mensajes.append("Override eliminado.")
+            elif t == "recalcular":
+                st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
+                mensajes.append("Plan recalculado.")
+            elif t == "crowd_need":
+                msg = ""
+                svc = a.get("svc")
+                fecha = a.get("fecha")
+                msg = None
+                pr = st.session_state.plan_res.copy()
+                if fecha:
+                    f = pd.to_datetime(fecha, errors="coerce")
+                    if pd.notna(f):
+                        pr = pr[pr["Fecha"]==f]
+                if svc:
+                    pr = pr[pr["SVC"]==svc]
+                if pr.empty:
+                    msg = "No encontré filas para ese filtro."
+                else:
+                    # rutas crowd necesarias = max((FCST - (MLP+Rentals)), 0) / SPR_Crowd
+                    cs = st.session_state.crowd_spr.rename(columns={"SPR_Crowd":"SPR"})
+                    need = (pr.merge(cs, on="Fecha", how="left")
+                              .assign(Base = pr["Shipments_MLP"]+pr["Shipments_Rentals"],
+                                      Gap = lambda d: (d["Shipments_FCST"]-d["Base"]).clip(lower=0),
+                                      Rutas_Crowd_Need = lambda d: np.floor((d["Gap"]/d["SPR"]).fillna(0)+0.5).astype(int))
+                              [["SVC","Fecha","Shipments_FCST","Shipments_MLP","Shipments_Rentals","SPR","Rutas_Crowd_Need"]]
+                              .sort_values(["SVC","Fecha"]))
+                    st.dataframe(need, use_container_width=True)
+                    total_need = int(need["Rutas_Crowd_Need"].sum())
+                    msg = f"Rutas Crowd necesarias totales: **{total_need}** en el rango mostrado."
+                mensajes.append(msg or "")
+        if mensajes:
+            st.success(" | ".join(mensajes))
+            if any(a.get("tipo") in ("update_params","override","clear_override","recalcular") for a in acciones):
+                st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
                 st.rerun()
         else:
-            st.info("No se detectaron cambios.")
+            st.info("No detecté acciones.")
 
 # ========= Sidebar: Parámetros rápidos =========
 with st.sidebar:
@@ -481,7 +559,7 @@ with col1:
 with col2:
     st.metric("Max |Dif_vs_FCST|", f"{st.session_state.plan_res['Dif_vs_FCST'].abs().max():,.0f}")
     if st.button("🔁 Recalcular"):
-        st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
+        st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
         st.rerun()
 
 st.subheader("Detalle")
@@ -501,174 +579,8 @@ if st.button("Escribir 'Plan_14_resumen' y 'Plan_14_detalle'"):
     except Exception as e:
         st.error(f"No se pudo escribir: {e}")
 
-# ========= Agente para chat (Jarvis) =========
-def _agent_parse_instruction(txt: str) -> dict:
-    txt = (txt or "").strip()
-    out = {"acciones": []}
-    if not txt:
-        return out
-
-    acciones = []
-
-    # Intento con IA
-    if _HAS_OPENAI:
-        try:
-            system = (
-                "Devuelve SOLO JSON como {'acciones':[...]} "
-                "Acciones: update_params(cambios:[{nombre,valor}]), recalcular(), escribir_sheet(), "
-                "mostrar_resumen_svc(svc, n), mostrar_fecha(fecha 'YYYY-MM-DD'). "
-                f"Parámetros válidos: {list(st.session_state['params'].keys())}. "
-                "Si dice 'apaga/prende escalar...' mapea a booleano."
-            )
-            resp = _client.responses.create(
-                model="gpt-4o-mini",
-                input=[
-                    {"role":"system","content":system},
-                    {"role":"user","content":f"Instrucción: {txt}"},
-                ],
-            )
-            data = _extract_json(resp.output_text)
-            if isinstance(data, dict) and isinstance(data.get("acciones"), list) and data["acciones"]:
-                return data
-        except Exception:
-            pass
-
-    # Fallback sin IA
-    low = txt.lower()
-    alias = {"mlp":"factor_escalado_mlp", "rentals":"factor_escalado_rentals"}
-    def _param_name(name): return alias.get(name, name)
-
-    cambios = []
-
-    for m in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([0-9\.,]+)", low):
-        nombre, valor_str = m.group(1), m.group(2).replace(",", ".")
-        nombre = _param_name(nombre)
-        if nombre in st.session_state["params"]:
-            cambios.append({"nombre": nombre, "valor": float(valor_str)})
-
-    m = re.search(r"(sube|incrementa|baja|reduce|ajusta)\s+(mlp|rentals|factor_escalado_mlp|factor_escalado_rentals)\s+a\s*([0-9\.,]+)", low)
-    if m:
-        _, nombre, valor = m.groups()
-        nombre = _param_name(nombre)
-        try:
-            v = float(valor.replace(",", "."))
-            cambios.append({"nombre": nombre, "valor": v})
-        except:
-            pass
-
-    m = re.search(r"(sube|incrementa|baja|reduce)\s+(mlp|rentals|factor_escalado_mlp|factor_escalado_rentals)\s+([0-9]{1,3})\s*%", low)
-    if m:
-        verbo, nombre, p = m.groups()
-        nombre = _param_name(nombre)
-        base = float(st.session_state["params"].get(nombre, 1.0))
-        factor = (1 + int(p)/100.0) if verbo in ("sube","incrementa") else (1 - int(p)/100.0)
-        cambios.append({"nombre": nombre, "valor": max(0.0, min(1.0, base * factor))})
-
-    m = re.search(r"(sube|incrementa|baja|reduce)\s+(mlp|rentals|factor_escalado_mlp|factor_escalado_rentals)\b", low)
-    if m and not cambios:
-        verbo, nombre = m.groups()
-        nombre = _param_name(nombre)
-        base = float(st.session_state["params"].get(nombre, 1.0))
-        delta = 0.05 if verbo in ("sube","incrementa") else -0.05
-        cambios.append({"nombre": nombre, "valor": max(0.0, min(1.0, base + delta))})
-
-    for m in re.finditer(r"(apaga|desactiva|prende|activa)\s+(escalar_si_excede_fcst)", low):
-        accion, nombre = m.groups()
-        cambios.append({"nombre": nombre, "valor": accion in ("prende","activa")})
-
-    if cambios:
-        acciones.append({"tipo":"update_params","cambios":cambios})
-        acciones.append({"tipo":"recalcular"})  # auto-recalc
-
-    if re.search(r"\b(escribe|escribir)\b.*\b(sheet|hoja|google)\b", low):
-        acciones.append({"tipo":"escribir_sheet"})
-
-    m = re.search(r"\bresumen\b.*\bsvc\b\s*([A-Z0-9]+)", low)
-    if m:
-        acciones.append({"tipo":"mostrar_resumen_svc","svc":m.group(1).upper(),"n":10})
-
-    m = re.search(r"(20\d{2}-\d{2}-\d{2})", low)
-    if m:
-        acciones.append({"tipo":"mostrar_fecha","fecha":m.group(1)})
-
-    out["acciones"] = acciones
-    return out
-
-def _agent_execute(parsed: dict) -> str:
-    acciones = parsed.get("acciones", [])
-    mensajes = []
-    hizo_recalc = False
-
-    for a in acciones:
-        t = a.get("tipo")
-
-        if t == "update_params":
-            antes = st.session_state["params"].copy()
-            res = _apply_changes(a.get("cambios", []))
-            st.write("Resultados:", res)
-            despues = st.session_state["params"]
-            mensajes.append(f"Actualicé parámetros: {antes} → {despues}")
-
-        elif t == "recalcular":
-            st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
-            st.success("Plan recalculado.")
-            hizo_recalc = True
-            mensajes.append("Recalculé el plan.")
-
-        elif t == "escribir_sheet":
-            try:
-                cli = get_client()
-                write_ws(cli.open_by_key(SHEET_ID), TABS["OUT_RES"],
-                         st.session_state.plan_res.sort_values(["SVC","Fecha"]))
-                write_ws(cli.open_by_key(SHEET_ID), TABS["OUT_DET"],
-                         st.session_state.plan_det.sort_values(["SVC","Fecha","Modelo","HOMOLOGACION_VEHICULO"]))
-                st.success("¡Listo! Se actualizaron las pestañas.")
-                mensajes.append("Escribí 'Plan_14_resumen' y 'Plan_14_detalle'.")
-            except Exception as e:
-                st.error(f"No se pudo escribir: {e}")
-                mensajes.append(f"No pude escribir: {e}")
-
-        elif t == "mostrar_resumen_svc":
-            svc = a.get("svc"); n = int(a.get("n",10))
-            pr = st.session_state.plan_res
-            if svc and "SVC" in pr.columns:
-                df = (pr[pr["SVC"]==svc]
-                      .sort_values("Fecha")[["Fecha","Rutas_MLP","Rutas_Rentals",
-                                             "Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]]
-                      .tail(n))
-                if not df.empty:
-                    st.dataframe(df, use_container_width=True)
-                    mensajes.append(f"Mostré resumen de **{svc}** (últimos {n}).")
-                else:
-                    mensajes.append(f"No encontré filas para {svc}.")
-            else:
-                mensajes.append("Pásame el SVC para el resumen.")
-
-        elif t == "mostrar_fecha":
-            fecha = a.get("fecha")
-            if fecha:
-                try:
-                    f = pd.to_datetime(fecha)
-                    df = st.session_state.plan_res[st.session_state.plan_res["Fecha"]==f][
-                        ["SVC","Rutas_MLP","Rutas_Rentals","Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]
-                    ]
-                    if not df.empty:
-                        st.dataframe(df.sort_values("SVC"), use_container_width=True)
-                        mensajes.append(f"Mostré el resumen para **{f.date()}**.")
-                    else:
-                        mensajes.append("No encontré esa fecha en el plan.")
-                except Exception:
-                    mensajes.append("Fecha inválida; usa YYYY-MM-DD.")
-
-    if hizo_recalc and st.session_state["params"].get("escalar_si_excede_fcst", True):
-        mensajes.append("Nota: si MLP+Rentals superan el FCST, se recortan automáticamente (bandera 'escalar_si_excede_fcst').")
-
-    if not mensajes:
-        return "Listo. Ejemplos: 'sube rentals 20%', 'apaga escalar_si_excede_fcst', 'escribe al sheet', 'resumen svc SPB1'."
-    return " ".join(mensajes)
-
-# ========= Chat con Copiloto (Q&A + Acciones) =========
-st.subheader("💬 Chat con Copiloto (pregúntame o píde ajustes)")
+# ========= Chat (Q&A) =========
+st.subheader("💬 Chat con Copiloto (pregúntame de tus datos)")
 if "chat" not in st.session_state:
     st.session_state.chat = []
 
@@ -676,7 +588,7 @@ for role, msg in st.session_state.chat:
     with st.chat_message(role):
         st.markdown(msg)
 
-q = st.chat_input("Ej: 'sube rentals 20%' · 'apaga escalar...' · 'resumen svc SPB1' · 'para fecha 2025-08-10' · o pregúntame algo de los datos")
+q = st.chat_input("Ej: 'crowd needed' · 'rentals=100' · 'pon mlp 80 en SPB1' · 'resumen svc SPB1' · 'para fecha 2025-08-10'")
 
 def _nl_answer(question: str) -> str:
     txt = (question or "").lower()
@@ -716,7 +628,7 @@ def _nl_answer(question: str) -> str:
                     return f"Mostré el resumen para **{fecha.date()}**."
                 return "No encontré esa fecha en el plan."
 
-        # IA para preguntas abiertas (si disponible)
+        # IA (opcional) para preguntas abiertas
         if _HAS_OPENAI:
             def _safe_preview(df, n=5):
                 d = df.head(n).copy()
@@ -731,7 +643,6 @@ def _nl_answer(question: str) -> str:
                 "ejemplo_plan_res": _safe_preview(plan_res, 5),
                 "ejemplo_plan_det": _safe_preview(plan_det, 5),
             }
-
             try:
                 client = OpenAI()
                 resp = client.responses.create(
@@ -751,10 +662,60 @@ def _nl_answer(question: str) -> str:
 
 if q:
     st.session_state.chat.append(("user", q))
-    parsed = _agent_parse_instruction(q)
-    if parsed.get("acciones"):
-        msg = _agent_execute(parsed)
-        st.session_state.chat.append(("assistant", msg))
+    # Acciones rápidas desde chat (reusar lógica del sidebar fallback)
+    acciones_chat = []
+    low = q.strip().lower()
+
+    m = re.search(r"\b(mlp|rentals)\s*=\s*(\d+)\b", low) or re.search(r"\b(mlp|rentals)\s+(\d+)\b", low)
+    if m:
+        acciones_chat.append({"tipo":"override","modelo":m.group(1),"rutas":int(m.group(2))})
+    m = re.search(r"(mlp|rentals).{0,10}?(\d+).{0,10}?\ben\s+([A-Za-z0-9]+)", low)
+    if m:
+        acciones_chat.append({"tipo":"override","modelo":m.group(1),"rutas":int(m.group(2)),"svc":m.group(3).upper()})
+    m = re.search(r"(apaga|desactiva|prende|activa)\s+(escalar_si_excede_fcst)", low)
+    if m:
+        val = m.group(1) in ("prende","activa")
+        acciones_chat.append({"tipo":"update_params","cambios":[{"nombre":"escalar_si_excede_fcst","valor":val}]})
+    if re.search(r"crowd|needed|necesit", low):
+        msvc = re.search(r"\bsvc\s*([A-Za-z0-9]+)", low)
+        mfecha = re.search(r"(20\d{2}-\d{2}-\d{2})", low)
+        acciones_chat.append({"tipo":"crowd_need","svc": (msvc.group(1).upper() if msvc else None),
+                              "fecha": (mfecha.group(1) if mfecha else None)})
+    if re.search(r"\brecalc|recalcula|recalcular\b", low):
+        acciones_chat.append({"tipo":"recalcular"})
+
+    if acciones_chat:
+        msgs=[]
+        for a in acciones_chat:
+            t=a.get("tipo")
+            if t=="override":
+                msgs.append(_set_override(a.get("modelo",""), a.get("rutas",0), a.get("svc")))
+            elif t=="update_params":
+                msgs.append(str(_apply_changes(a.get("cambios", []))))
+            elif t=="recalcular":
+                st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
+                msgs.append("Plan recalculado.")
+            elif t=="crowd_need":
+                svc=a.get("svc"); fecha=a.get("fecha")
+                pr = st.session_state.plan_res.copy()
+                if fecha:
+                    f = pd.to_datetime(fecha, errors="coerce")
+                    if pd.notna(f): pr = pr[pr["Fecha"]==f]
+                if svc: pr = pr[pr["SVC"]==svc]
+                if pr.empty:
+                    msgs.append("No encontré filas para ese filtro.")
+                else:
+                    cs = st.session_state.crowd_spr.rename(columns={"SPR_Crowd":"SPR"})
+                    need = (pr.merge(cs, on="Fecha", how="left")
+                              .assign(Base = pr["Shipments_MLP"]+pr["Shipments_Rentals"],
+                                      Gap = lambda d: (d["Shipments_FCST"]-d["Base"]).clip(lower=0),
+                                      Rutas_Crowd_Need = lambda d: np.floor((d["Gap"]/d["SPR"]).fillna(0)+0.5).astype(int))
+                              [["SVC","Fecha","Shipments_FCST","Shipments_MLP","Shipments_Rentals","SPR","Rutas_Crowd_Need"]]
+                              .sort_values(["SVC","Fecha"]))
+                    st.dataframe(need, use_container_width=True)
+                    msgs.append(f"Rutas Crowd necesarias totales: **{int(need['Rutas_Crowd_Need'].sum())}**.")
+        st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
+        st.session_state.chat.append(("assistant", " | ".join(msgs)))
         st.rerun()
 
     ans = _nl_answer(q)
