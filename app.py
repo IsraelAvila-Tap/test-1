@@ -1,4 +1,4 @@
-# app.py — Mel-IA Ops (Jarvis libre + Chat de consultas)
+# app.py — Mel-IA Ops (Jarvis + Chat unificados)
 import os, re, json, glob
 import numpy as np
 import pandas as pd
@@ -7,26 +7,15 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 
-# =========================
-# Configuración base
-# =========================
 st.set_page_config(page_title="Copiloto Flota — Mel-IA Ops (Jarvis)", layout="wide")
 
 SHEET_ID = "1UBjU3-ftGCow3EzTD0NB6UaYwMUYUARbn9QjD7SlxtY"
-TABS = dict(
-    EJ="Ejecución",
-    SRM="SRM",
-    FCST="FCST",
-    OUT_RES="Plan_14_resumen",
-    OUT_DET="Plan_14_detalle",
-)
+TABS = dict(EJ="Ejecución", SRM="SRM", FCST="FCST", OUT_RES="Plan_14_resumen", OUT_DET="Plan_14_detalle")
 RUTAS_SRM_IS_DAILY = True
 FACTOR_SRM_SEM_A_DIA = 1/6
 CROWD_VT = "Car"
 
-# =========================
-# OpenAI (Jarvis)
-# =========================
+# -------- OpenAI opcional --------
 _HAS_OPENAI = False
 try:
     if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
@@ -37,28 +26,21 @@ try:
 except Exception:
     _client = None
 
-# =========================
-# Estado global en sesión
-# =========================
+# -------- Estado global --------
 if "params" not in st.session_state:
     st.session_state["params"] = {
-        "escalar_si_excede_fcst": True,   # Si True, recorta MLP/Rentals cuando exceden FCST
-        "factor_escalado_mlp": 0.85,      # Se usa solo si NO hay override fijo
-        "factor_escalado_rentals": 0.75,  # Se usa solo si NO hay override fijo
+        "escalar_si_excede_fcst": True,
+        "factor_escalado_mlp": 0.85,
+        "factor_escalado_rentals": 0.75,
     }
-
-# Overrides de rutas por modelo y SVC (GLOBAL o por SVC)
-# Estructura: {"mlp": {"GLOBAL": int, "SPB1": int, ...}, "rentals": {...}}
+# Overrides de rutas por modelo/SVC (fijos). {"mlp": {"GLOBAL": int, "SPB1": int, ...}, "rentals": {...}}
 if "overrides" not in st.session_state:
     st.session_state["overrides"] = {"mlp": {}, "rentals": {}}
 
-# =========================
-# Google Sheets auth
-# =========================
+# -------- Google Sheets --------
 @st.cache_resource
 def get_client():
-    scope = ["https://spreadsheets.google.com/feeds",
-             "https://www.googleapis.com/auth/drive"]
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     if "gcp_service_account" in st.secrets:
         info = dict(st.secrets["gcp_service_account"])
         if "private_key" in info and "\\n" in info["private_key"]:
@@ -101,10 +83,8 @@ def read_ws(sheet, title, expected=None, any_keys=None, header_probe=10):
 
 def write_ws(sheet, title, df):
     try:
-        ws = sheet.worksheet(title)
-        sheet.del_worksheet(ws)
-    except:
-        pass
+        ws = sheet.worksheet(title); sheet.del_worksheet(ws)
+    except: pass
     rows = len(df) + 10
     cols = max(10, len(df.columns)+2)
     ws = sheet.add_worksheet(title=title, rows=str(rows), cols=str(cols))
@@ -123,12 +103,9 @@ def clean_num(s):
 def winsor(s, low=0.05, high=0.95, min_n=10):
     s = pd.Series(s).dropna()
     if len(s) < min_n: return s
-    ql,qh = s.quantile([low,high])
-    return s.clip(ql,qh)
+    ql,qh = s.quantile([low,high]); return s.clip(ql,qh)
 
-# =========================
-# Carga de datos
-# =========================
+# -------- Carga --------
 @st.cache_data(ttl=300)
 def load_all():
     client = get_client()
@@ -142,9 +119,7 @@ def load_all():
 
 sheet, df_exec, df_srm, df_fcst_raw = load_all()
 
-# =========================
-# Normalización ejecución
-# =========================
+# -------- Normalización --------
 if "DELIVERY_MODEL" not in df_exec.columns:
     for alt in ["DELIVERY_MODEL 1","Delivery Model","DELIVERY MODEL"]:
         if alt in df_exec.columns: df_exec["DELIVERY_MODEL"]=df_exec[alt]; break
@@ -172,31 +147,22 @@ df_exec["_fecha"] = _fecha
 df_exec = df_exec[df_exec["_fecha"].notna()].copy()
 df_exec["_dow"]   = df_exec["_fecha"].dt.weekday
 
-# =========================
-# FCST tidy
-# =========================
+# -------- FCST tidy --------
 date_cols = [c for c in df_fcst_raw.columns if re.match(r"\d{1,2}\-\w{3}", str(c))]
 for c in date_cols: df_fcst_raw[c]=clean_num(df_fcst_raw[c])
 YEAR = int(df_exec["_fecha"].dt.year.max()) if not df_exec.empty else datetime.now().year
 
-df_fcst = df_fcst_raw.melt(
-    id_vars=["SVC"], value_vars=date_cols,
-    var_name="Fecha_txt", value_name="Shipments_FCST"
-).dropna(subset=["SVC"])
+df_fcst = df_fcst_raw.melt(id_vars=["SVC"], value_vars=date_cols, var_name="Fecha_txt", value_name="Shipments_FCST").dropna(subset=["SVC"])
 df_fcst["Fecha"] = pd.to_datetime(df_fcst["Fecha_txt"] + f"-{YEAR}", format="%d-%b-%Y", errors="coerce")
 df_fcst = df_fcst[["SVC","Fecha","Shipments_FCST"]]
 fechas = sorted(df_fcst["Fecha"].dropna().unique())
 cal = pd.DataFrame({"Fecha": fechas})
 cal["_dow"] = cal["Fecha"].dt.weekday
 
-# =========================
-# SPRs y capacidades
-# =========================
+# -------- SPRs / capacidades --------
 df_exec["SPR_raw"] = df_exec["Shps Dispatched"] / df_exec["TOTAL_RUTAS"]
 df_exec["SPR_w"]   = df_exec["SPR_raw"]
-_w = df_exec.groupby(["DELIVERY_MODEL","HOMOLOGACION_VEHICULO","_dow"])["SPR_raw"].transform(
-    lambda s: winsor(s,0.05,0.95,10)
-)
+_w = df_exec.groupby(["DELIVERY_MODEL","HOMOLOGACION_VEHICULO","_dow"])["SPR_raw"].transform(lambda s: winsor(s,0.05,0.95,10))
 df_exec.loc[_w.notna(),"SPR_w"] = _w
 
 spr_dow = (df_exec.groupby(["DELIVERY_MODEL","HOMOLOGACION_VEHICULO","_dow"])["SPR_w"]
@@ -211,8 +177,7 @@ veh_cols = [c for c in ["Extra Large Van","Large Van","Small Van","Car"] if c in
 df_srm_long = df_srm.melt(id_vars=["MLP","Region","SVC"], value_vars=veh_cols,
                           var_name="HOMOLOGACION_VEHICULO", value_name="Rutas_MLP").fillna(0)
 df_srm_long["Rutas_MLP"] = pd.to_numeric(df_srm_long["Rutas_MLP"], errors="coerce").fillna(0)
-if not RUTAS_SRM_IS_DAILY:
-    df_srm_long["Rutas_MLP"] *= FACTOR_SRM_SEM_A_DIA
+if not RUTAS_SRM_IS_DAILY: df_srm_long["Rutas_MLP"] *= FACTOR_SRM_SEM_A_DIA
 mlp_capacity = df_srm_long.groupby(["SVC","HOMOLOGACION_VEHICULO"], as_index=False).agg(Rutas_MLP=("Rutas_MLP","sum"))
 
 is_rent = df_exec["DELIVERY_MODEL"].astype(str).str.upper().str.contains("RENT")
@@ -224,15 +189,13 @@ if "SVC" not in rent_rutas.columns:
     rent_rutas = rent_rutas.assign(_k=1).merge(pd.DataFrame({"SVC":svcs,"_k":[1]*len(svcs)}), on="_k").drop(columns="_k")
 rentals_capacity = rent_rutas[["SVC","HOMOLOGACION_VEHICULO","Rutas_Rentals_avg"]].copy()
 
-# =========================
-# Motor: aplica overrides y recalcula (Crowd cierra gap)
-# =========================
+# -------- Motor principal --------
 def run(params: dict):
     scale_if_exceed = bool(params.get("escalar_si_excede_fcst", True))
     f_mlp   = float(params.get("factor_escalado_mlp", 1.0))
     f_rent  = float(params.get("factor_escalado_rentals", 1.0))
 
-    # --- MLP base ---
+    # MLP
     spr_mlp = spr_dow[spr_dow["DELIVERY_MODEL"]=="MLP"][["HOMOLOGACION_VEHICULO","_dow","SPR_dow"]]
     mlp = mlp_capacity.assign(_k=1).merge(cal.assign(_k=1), on="_k").drop(columns="_k")
     mlp = (mlp.merge(spr_mlp, on=["HOMOLOGACION_VEHICULO","_dow"], how="left")
@@ -240,36 +203,31 @@ def run(params: dict):
                .merge(spr_dow_global, on=["_dow"], how="left"))
     mlp["SPR_final"] = mlp["SPR_dow"].fillna(mlp["SPR_dow_vt"]).fillna(mlp["SPR_dow_global"]).fillna(spr_global)
     mlp["Rutas_MLP_int"] = np.round(mlp["Rutas_MLP"] * f_mlp).clip(lower=0).astype(int)
-
-    # Overrides MLP (GLOBAL o por SVC)
     ov_mlp = st.session_state["overrides"].get("mlp", {})
     if ov_mlp:
-        if "GLOBAL" in ov_mlp:
-            mlp["Rutas_MLP_int"] = int(ov_mlp["GLOBAL"])
+        if "GLOBAL" in ov_mlp: mlp["Rutas_MLP_int"] = int(ov_mlp["GLOBAL"])
         if "SVC" in mlp.columns:
             for svc, rutas_fijas in ov_mlp.items():
                 if svc != "GLOBAL":
                     mlp.loc[mlp["SVC"]==svc, "Rutas_MLP_int"] = int(rutas_fijas)
     mlp["Shipments_MLP"] = mlp["Rutas_MLP_int"] * mlp["SPR_final"]
 
-    # --- Rentals base ---
+    # Rentals
     rent = rentals_capacity.assign(_k=1).merge(cal.assign(_k=1), on="_k").drop(columns="_k")
     rent = (rent.merge(spr_dow_vt, on=["HOMOLOGACION_VEHICULO","_dow"], how="left")
                .merge(spr_dow_global, on=["_dow"], how="left"))
     rent["SPR_final"] = rent["SPR_dow_vt"].fillna(rent["SPR_dow_global"]).fillna(spr_global)
     rent["Rutas_Rentals_int"] = np.round(rent["Rutas_Rentals_avg"] * f_rent).clip(lower=0).astype(int)
-
     ov_rent = st.session_state["overrides"].get("rentals", {})
     if ov_rent:
-        if "GLOBAL" in ov_rent:
-            rent["Rutas_Rentals_int"] = int(ov_rent["GLOBAL"])
+        if "GLOBAL" in ov_rent: rent["Rutas_Rentals_int"] = int(ov_rent["GLOBAL"])
         if "SVC" in rent.columns:
             for svc, rutas_fijas in ov_rent.items():
                 if svc != "GLOBAL":
                     rent.loc[rent["SVC"]==svc, "Rutas_Rentals_int"] = int(rutas_fijas)
     rent["Shipments_Rentals"] = rent["Rutas_Rentals_int"] * rent["SPR_final"]
 
-    # --- Crowd SPR por fecha ---
+    # Crowd SPR por fecha
     crowd = cal.merge(
         spr_dow_vt[spr_dow_vt["HOMOLOGACION_VEHICULO"]==CROWD_VT][["_dow","SPR_dow_vt"]],
         on="_dow", how="left"
@@ -278,29 +236,24 @@ def run(params: dict):
 
     fcst = df_fcst.copy()
 
-    # --- Detalle base ---
+    # Detalle
     det_mlp = (mlp.rename(columns={"Rutas_MLP_int":"Rutas","SPR_final":"SPR","Shipments_MLP":"Shipments"})
                   .assign(Modelo="MLP")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]])
     det_rent= (rent.rename(columns={"Rutas_Rentals_int":"Rutas","SPR_final":"SPR","Shipments_Rentals":"Shipments"})
                   .assign(Modelo="Rentals")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]])
-
-    det_crowd = fcst[["SVC","Fecha"]].drop_duplicates().merge(crowd[["Fecha","SPR_Crowd"]], on="Fecha", how="left")
+    det_crowd = (fcst[["SVC","Fecha"]].drop_duplicates()
+                 .merge(crowd[["Fecha","SPR_Crowd"]], on="Fecha", how="left"))
     det_crowd["HOMOLOGACION_VEHICULO"] = f"Crowd ({CROWD_VT})"
-    det_crowd["Modelo"] = "Crowd"
-    det_crowd["Rutas"] = 0
-    det_crowd["SPR"] = det_crowd["SPR_Crowd"]
-    det_crowd["Shipments"] = 0.0
+    det_crowd["Modelo"] = "Crowd"; det_crowd["Rutas"]=0; det_crowd["SPR"]=det_crowd["SPR_Crowd"]; det_crowd["Shipments"]=0.0
     det_crowd = det_crowd[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]]
-
     det = pd.concat([det_mlp, det_rent, det_crowd], ignore_index=True)
 
-    # --- Ajuste: recorte o cierre con Crowd ---
+    # Ajuste
     def ajustar(gr):
         svc, fecha = gr.name
         fc = float(fcst[(fcst.SVC==svc)&(fcst.Fecha==fecha)]["Shipments_FCST"].sum())
         m = gr["Modelo"].eq("MLP"); r = gr["Modelo"].eq("Rentals"); c = gr["Modelo"].eq("Crowd")
         base = gr.loc[m|r,"Shipments"].sum()
-
         if scale_if_exceed and base > fc and base > 0:
             f = fc/base
             for mask in [m,r]:
@@ -308,7 +261,6 @@ def run(params: dict):
                 gr.loc[mask,"Shipments"] = gr.loc[mask,"Rutas"]*gr.loc[mask,"SPR"]
             gr.loc[c,["Rutas","Shipments"]] = (0,0.0)
             return gr
-
         gap = max(fc-base, 0.0)
         if gap>0:
             spr_c = float(gr.loc[c,"SPR"].iloc[0]) if gr.loc[c,"SPR"].notna().any() else 0.0
@@ -322,14 +274,12 @@ def run(params: dict):
 
     det = det.groupby(["SVC","Fecha"], group_keys=False).apply(ajustar)
 
-    # --- Resumen ---
-    g = det.groupby(["SVC","Fecha","Modelo"], as_index=False).agg(Rutas=("Rutas","sum"),
-                                                                  Shipments=("Shipments","sum"))
+    # Resumen
+    g = det.groupby(["SVC","Fecha","Modelo"], as_index=False).agg(Rutas=("Rutas","sum"), Shipments=("Shipments","sum"))
     mlp_s = g[g["Modelo"]=="MLP"][["SVC","Fecha","Rutas","Shipments"]].rename(columns={"Rutas":"Rutas_MLP","Shipments":"Shipments_MLP"})
     ren_s = g[g["Modelo"]=="Rentals"][["SVC","Fecha","Rutas","Shipments"]].rename(columns={"Rutas":"Rutas_Rentals","Shipments":"Shipments_Rentals"})
     crw_s = g[g["Modelo"]=="Crowd"][["SVC","Fecha","Rutas","Shipments"]].rename(columns={"Rutas":"Rutas_Crowd","Shipments":"Shipments_Crowd"})
-    res = (mlp_s.merge(ren_s,on=["SVC","Fecha"],how="outer")
-               .merge(crw_s,on=["SVC","Fecha"],how="outer")).fillna(0)
+    res = (mlp_s.merge(ren_s,on=["SVC","Fecha"],how="outer").merge(crw_s,on=["SVC","Fecha"],how="outer")).fillna(0)
     res = res.merge(df_fcst, on=["SVC","Fecha"], how="left")
     res["Shipments_Totales"] = res["Shipments_MLP"]+res["Shipments_Rentals"]+res["Shipments_Crowd"]
     res["Dif_vs_FCST"] = res["Shipments_Totales"] - res["Shipments_FCST"]
@@ -339,20 +289,16 @@ def run(params: dict):
 if "plan_res" not in st.session_state or "plan_det" not in st.session_state or "crowd_spr" not in st.session_state:
     st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
 
-# =========================
-# Utilidades de Jarvis
-# =========================
+# -------- Utilidades Jarvis --------
 def _set_override(modelo: str, rutas: int, svc: str|None):
     modelo = (modelo or "").lower()
-    if modelo not in ("mlp","rentals"):
-        return f"Modelo inválido: {modelo}"
+    if modelo not in ("mlp","rentals"): return f"Modelo inválido: {modelo}"
     rutas = int(max(0, rutas))
     if svc:
         st.session_state["overrides"][modelo][svc.upper()] = rutas
         return f"Fijé {modelo.upper()}={rutas} rutas para {svc.upper()}."
-    else:
-        st.session_state["overrides"][modelo]["GLOBAL"] = rutas
-        return f"Fijé {modelo.upper()}={rutas} rutas GLOBAL."
+    st.session_state["overrides"][modelo]["GLOBAL"] = rutas
+    return f"Fijé {modelo.upper()}={rutas} rutas GLOBAL."
 
 def _clear_override(modelo: str, svc: str|None):
     modelo = (modelo or "").lower()
@@ -360,20 +306,17 @@ def _clear_override(modelo: str, svc: str|None):
     if svc:
         st.session_state["overrides"][modelo].pop(svc.upper(), None)
         return f"Override {modelo.upper()} en {svc.upper()} eliminado."
-    else:
-        st.session_state["overrides"][modelo].pop("GLOBAL", None)
-        return f"Override GLOBAL {modelo.upper()} eliminado."
+    st.session_state["overrides"][modelo].pop("GLOBAL", None)
+    return f"Override GLOBAL {modelo.upper()} eliminado."
 
 def _crowd_need_view(svc=None, fecha=None):
     pr = st.session_state.plan_res.copy()
     if fecha:
         f = pd.to_datetime(fecha, errors="coerce")
         if pd.notna(f): pr = pr[pr["Fecha"]==f]
-    if svc:
-        pr = pr[pr["SVC"]==svc]
+    if svc: pr = pr[pr["SVC"]==svc]
     if pr.empty:
-        st.info("No encontré filas para ese filtro.")
-        return "Sin filas."
+        st.info("No encontré filas para ese filtro."); return "Sin filas."
     cs = st.session_state.crowd_spr.rename(columns={"SPR_Crowd":"SPR"})
     need = (pr.merge(cs, on="Fecha", how="left")
               .assign(Base = pr["Shipments_MLP"]+pr["Shipments_Rentals"],
@@ -384,14 +327,89 @@ def _crowd_need_view(svc=None, fecha=None):
     st.dataframe(need, use_container_width=True)
     return f"Rutas Crowd necesarias totales: **{int(need['Rutas_Crowd_Need'].sum())}**."
 
-# =========================
-# Header & Sidebar (Jarvis)
-# =========================
+# ====== Parser COMÚN de acciones (Jarvis/Chat) ======
+def parse_actions(instruccion: str) -> list[dict]:
+    acciones: list[dict] = []
+    txt = (instruccion or "").strip()
+    if not txt: return acciones
+
+    # 1) IA → JSON
+    if _HAS_OPENAI:
+        try:
+            system_msg = (
+                "Convierte la instrucción del usuario en JSON con 'acciones' (lista). "
+                "Tipos: set_routes{modelo:'mlp|rentals', rutas:int, svc?:string}; "
+                "clear_override{modelo:'mlp|rentals', svc?:string}; "
+                "set_param{nombre:'escalar_si_excede_fcst|factor_escalado_mlp|factor_escalado_rentals', valor}; "
+                "recalc{}; crowd_need{svc?:string, fecha?:'YYYY-MM-DD'}. Responde SOLO el JSON."
+            )
+            resp = _client.responses.create(
+                model="gpt-4o-mini",
+                input=[{"role":"system","content":system_msg},
+                       {"role":"user","content":f"Instrucción: {txt}"}],
+            )
+            m = re.search(r"\{[\s\S]*\}", (resp.output_text or ""))
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                    if isinstance(data.get("acciones"), list): return data["acciones"]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 2) Fallback regex
+    low = txt.lower()
+    m = re.search(r"\b(mlp|rentals)\s*=\s*(\d+)\b", low) or re.search(r"\b(mlp|rentals)\s+(\d+)\b", low)
+    if m: acciones.append({"tipo":"set_routes","modelo":m.group(1),"rutas":int(m.group(2))})
+    m = re.search(r"(mlp|rentals).{0,12}?(\d+).{0,12}?\ben\s+([A-Za-z0-9]+)", low)
+    if m: acciones.append({"tipo":"set_routes","modelo":m.group(1),"rutas":int(m.group(2)),"svc":m.group(3).upper()})
+    m = re.search(r"quita.*override.*(mlp|rentals)(?:.*en\s+([A-Za-z0-9]+))?", low)
+    if m: acciones.append({"tipo":"clear_override","modelo":m.group(1),"svc": (m.group(2).upper() if m.group(2) else None)})
+    m = re.search(r"(apaga|desactiva|prende|activa)\s+(escalar_si_excede_fcst)", low)
+    if m:
+        val = m.group(1) in ("prende","activa")
+        acciones.append({"tipo":"set_param","nombre":"escalar_si_excede_fcst","valor":val})
+    if re.search(r"crowd|needed|necesit", low):
+        msvc  = re.search(r"\bsvc\s*([A-Za-z0-9]+)", low)
+        mfecha= re.search(r"(20\d{2}-\d{2}-\d{2})", low)
+        acciones.append({"tipo":"crowd_need","svc": (msvc.group(1).upper() if msvc else None),
+                         "fecha": (mfecha.group(1) if mfecha else None)})
+    if re.search(r"\brecalc|recalcula|recalcular\b", low):
+        acciones.append({"tipo":"recalc"})
+    return acciones
+
+# ====== Ejecutor COMÚN de acciones ======
+def execute_actions(acciones: list[dict], *, recalc_auto: bool=True) -> str:
+    mensajes = []; did_change = False
+    for a in acciones:
+        t = (a.get("tipo") or a.get("action") or a.get("type") or "").lower()
+        if t == "set_routes":
+            mensajes.append(_set_override(a.get("modelo",""), int(a.get("rutas",0)), a.get("svc"))); did_change = True
+        elif t == "clear_override":
+            mensajes.append(_clear_override(a.get("modelo",""), a.get("svc"))); did_change = True
+        elif t == "set_param":
+            nombre, valor = a.get("nombre"), a.get("valor")
+            if nombre in st.session_state["params"]:
+                st.session_state["params"][nombre] = valor; did_change = True
+                mensajes.append(f"Parámetro {nombre} → {valor}")
+            else:
+                mensajes.append(f"Parámetro desconocido: {nombre}")
+        elif t == "recalc":
+            st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
+            mensajes.append("Plan recalculado.")
+        elif t == "crowd_need":
+            mensajes.append(_crowd_need_view(a.get("svc"), a.get("fecha")))
+        else:
+            mensajes.append(f"(Ignorado) Acción no soportada: {t}")
+    if recalc_auto and did_change:
+        st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
+    return " | ".join(mensajes) if mensajes else "Listo."
+
+# -------- Header / Sidebar --------
 def _pick_logo():
-    prefer = [
-        "20250813_1028_Camión Futurista Amarillo_remix_01k2j400zxfp0te4vpq1kq1wnv.png",
-        "mel-ia-ops.png", "mel_ia_ops.png", "Mel-IA Ops.png", "Mel-IA Ops.jpg", "mel-ia-ops.jpg",
-    ]
+    prefer = ["20250813_1028_Camión Futurista Amarillo_remix_01k2j400zxfp0te4vpq1kq1wnv.png",
+              "mel-ia-ops.png", "mel_ia_ops.png", "Mel-IA Ops.png", "Mel-IA Ops.jpg", "mel-ia-ops.jpg"]
     for p in prefer:
         if os.path.exists(p): return p
     pngs = glob.glob("*.png") + glob.glob("assets/*.png")
@@ -403,120 +421,20 @@ def _pick_logo():
 logo_path = _pick_logo()
 col_logo, col_title = st.columns([1,4])
 with col_logo:
-    if logo_path:
-        st.image(logo_path, use_container_width=True)
+    if logo_path: st.image(logo_path, use_container_width=True)
 with col_title:
-    st.markdown("## **Mel-IA Ops — Copiloto de Planeación de Flota (Jarvis libre)**")
+    st.markdown("## **Mel-IA Ops — Copiloto de Planeación de Flota (Jarvis unificado)**")
 
 with st.sidebar.expander("🧠 Jarvis — Instrucciones en español", expanded=True):
-    st.caption("Usa esta caja para CAMBIAR el plan. Ej.: ‘rentals=100’, ‘pon mlp 80 en SPB1’, ‘apaga escalar_si_excede_fcst’, ‘crowd needed’, ‘quita override de rentals en SPB2’.")
+    st.caption("CAMBIA el plan: ‘rentals=100’, ‘pon mlp 80 en SPB1’, ‘quita override de rentals en SPB2’, ‘apaga escalar_si_excede_fcst’, ‘crowd needed’…")
     instruccion = st.text_input("Instrucción", placeholder="Ej: pon rentals 120 en SPB1 y recalcula")
-    if st.checkbox("Ver params", value=False):
-        st.json(st.session_state["params"])
-    if st.checkbox("Ver overrides", value=False):
-        st.json(st.session_state["overrides"])
-
+    if st.checkbox("Ver params", value=False): st.json(st.session_state["params"])
+    if st.checkbox("Ver overrides", value=False): st.json(st.session_state["overrides"])
     if st.button("Ejecutar instrucción"):
-        mensajes = []
-        acciones = []
-
-        # ===== 1) JARVIS con OpenAI → JSON de acciones =====
-        if _HAS_OPENAI and instruccion.strip():
-            try:
-                system_msg = (
-                    "Eres un planificador. Convierte la instrucción del usuario en JSON con 'acciones' (lista). "
-                    "Tipos: "
-                    "set_routes{modelo:'mlp|rentals', rutas:int, svc?:string}; "
-                    "clear_override{modelo:'mlp|rentals', svc?:string}; "
-                    "set_param{nombre:'escalar_si_excede_fcst|factor_escalado_mlp|factor_escalado_rentals', valor}; "
-                    "recalc{}; crowd_need{svc?:string, fecha?:'YYYY-MM-DD'}. "
-                    "Responde SOLO el JSON."
-                )
-                user_msg = f"Instrucción: {instruccion}"
-                resp = _client.responses.create(
-                    model="gpt-4o-mini",
-                    input=[{"role":"system","content":system_msg},
-                           {"role":"user","content":user_msg}],
-                )
-                data = None
-                try:
-                    m = re.search(r"\{[\s\S]*\}", resp.output_text or "")
-                    if m:
-                        data = json.loads(m.group(0))
-                except Exception:
-                    data = None
-                if data and isinstance(data.get("acciones", None), list):
-                    acciones = data["acciones"]
-            except Exception as e:
-                st.warning(f"No se pudo usar OpenAI: {e}")
-
-        # ===== 2) Fallback regex sin IA =====
-        if not acciones and instruccion.strip():
-            txt = instruccion.strip().lower()
-
-            # set_routes global: "rentals = 100" | "mlp 80"
-            m = re.search(r"\b(mlp|rentals)\s*=\s*(\d+)\b", txt) or re.search(r"\b(mlp|rentals)\s+(\d+)\b", txt)
-            if m:
-                acciones.append({"tipo":"set_routes","modelo":m.group(1),"rutas":int(m.group(2))})
-
-            # set_routes por SVC: "pon rentals 120 en SPB1" / "mlp 60 en spb2"
-            m = re.search(r"(mlp|rentals).{0,10}?(\d+).{0,10}?\ben\s+([A-Za-z0-9]+)", txt)
-            if m:
-                acciones.append({"tipo":"set_routes","modelo":m.group(1),"rutas":int(m.group(2)),"svc":m.group(3).upper()})
-
-            # clear_override
-            m = re.search(r"quita.*override.*(mlp|rentals)(?:.*en\s+([A-Za-z0-9]+))?", txt)
-            if m:
-                acciones.append({"tipo":"clear_override","modelo":m.group(1),"svc": (m.group(2).upper() if m.group(2) else None)})
-
-            # set_param on/off
-            m = re.search(r"(apaga|desactiva|prende|activa)\s+(escalar_si_excede_fcst)", txt)
-            if m:
-                val = m.group(1) in ("prende","activa")
-                acciones.append({"tipo":"set_param","nombre":"escalar_si_excede_fcst","valor":val})
-
-            # crowd need
-            if re.search(r"crowd|needed|necesit", txt):
-                msvc = re.search(r"\bsvc\s*([A-Za-z0-9]+)", txt)
-                mfecha = re.search(r"(20\d{2}-\d{2}-\d{2})", txt)
-                acciones.append({"tipo":"crowd_need","svc": (msvc.group(1).upper() if msvc else None),
-                                 "fecha": (mfecha.group(1) if mfecha else None)})
-
-            # recalc
-            if re.search(r"\brecalc|recalcula|recalcular\b", txt):
-                acciones.append({"tipo":"recalc"})
-
-        # ===== 3) Ejecutar acciones =====
+        acciones = parse_actions(instruccion)
         if acciones:
-            for a in acciones:
-                t = a.get("tipo") or a.get("action") or a.get("type")
-                if t == "set_routes":
-                    mensajes.append(_set_override(a.get("modelo",""), int(a.get("rutas",0)), a.get("svc")))
-                elif t == "clear_override":
-                    mensajes.append(_clear_override(a.get("modelo",""), a.get("svc")))
-                elif t == "set_param":
-                    nombre, valor = a.get("nombre"), a.get("valor")
-                    if nombre in st.session_state["params"]:
-                        st.session_state["params"][nombre] = valor
-                        mensajes.append(f"Parámetro {nombre} → {valor}")
-                    else:
-                        mensajes.append(f"Parámetro desconocido: {nombre}")
-                elif t == "recalc":
-                    st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
-                    mensajes.append("Plan recalculado.")
-                elif t == "crowd_need":
-                    msg = _crowd_need_view(a.get("svc"), a.get("fecha"))
-                    mensajes.append(msg)
-                else:
-                    mensajes.append(f"(Ignorado) Acción no soportada: {t}")
-
-            # Recalcular si hubo cambios en rutas/params/overrides
-            if any((a.get("tipo") in ("set_routes","clear_override","set_param","recalc")) for a in acciones):
-                st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
-                st.success(" | ".join(mensajes))
-                st.rerun()
-            else:
-                st.success(" | ".join(mensajes))
+            msg = execute_actions(acciones, recalc_auto=True)
+            st.success(msg); st.rerun()
         else:
             st.info("No detecté acciones en la instrucción.")
 
@@ -527,25 +445,17 @@ with st.sidebar:
     st.session_state["params"]["escalar_si_excede_fcst"] = bool(scale_if_exceed)
     st.caption(f"Sheet ID: {SHEET_ID}")
 
-# =========================
-# UI principal (tablas)
-# =========================
+# -------- UI principal --------
 st.subheader("Resumen (incluye Shipments_FCST)")
-cols_pref = [
-    "SVC","Fecha",
-    "Rutas_MLP","Rutas_Rentals","Rutas_Crowd",
-    "Shipments_MLP","Shipments_Rentals","Shipments_Crowd",
-    "Shipments_Totales","Shipments_FCST","Dif_vs_FCST"
-]
+cols_pref = ["SVC","Fecha","Rutas_MLP","Rutas_Rentals","Rutas_Crowd",
+             "Shipments_MLP","Shipments_Rentals","Shipments_Crowd",
+             "Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]
 res_view = st.session_state.plan_res.copy()
 res_view = res_view[[c for c in cols_pref if c in res_view.columns]]
 
 col1, col2 = st.columns([2,1])
 with col1:
-    st.dataframe(
-        res_view.sort_values(["SVC","Fecha"]).reset_index(drop=True),
-        use_container_width=True
-    )
+    st.dataframe(res_view.sort_values(["SVC","Fecha"]).reset_index(drop=True), use_container_width=True)
 with col2:
     st.metric("Max |Dif_vs_FCST|", f"{st.session_state.plan_res['Dif_vs_FCST'].abs().max():,.0f}")
     if st.button("🔁 Recalcular"):
@@ -553,10 +463,8 @@ with col2:
         st.rerun()
 
 st.subheader("Detalle")
-st.dataframe(
-    st.session_state.plan_det.sort_values(["SVC","Fecha","Modelo","HOMOLOGACION_VEHICULO"]).reset_index(drop=True),
-    use_container_width=True, height=380
-)
+st.dataframe(st.session_state.plan_det.sort_values(["SVC","Fecha","Modelo","HOMOLOGACION_VEHICULO"]).reset_index(drop=True),
+             use_container_width=True, height=380)
 
 st.subheader("📝 Escribir al Google Sheet")
 if st.button("Escribir 'Plan_14_resumen' y 'Plan_14_detalle'"):
@@ -569,24 +477,17 @@ if st.button("Escribir 'Plan_14_resumen' y 'Plan_14_detalle'"):
     except Exception as e:
         st.error(f"No se pudo escribir: {e}")
 
-# =========================
-# Chat de consultas (no modifica plan)
-# =========================
-st.subheader("💬 Chat con Copiloto (pregúntame de tus datos)")
-if "chat" not in st.session_state:
-    st.session_state.chat = []
-
+# -------- Chat (consulta + acciones) --------
+st.subheader("💬 Chat con Copiloto (consulta o da órdenes)")
+if "chat" not in st.session_state: st.session_state.chat = []
 for role, msg in st.session_state.chat:
-    with st.chat_message(role):
-        st.markdown(msg)
+    with st.chat_message(role): st.markdown(msg)
 
-q = st.chat_input("Consulta: 'resumen svc SPB1' · 'para fecha 2025-08-10' · 'totales por modelo' · '¿mayor Dif_vs_FCST?'")
+q = st.chat_input("Ej: ‘resumen svc SPB1’ · ‘para fecha 2025-08-10’ · ‘totales por modelo’ · ‘rentals=120 en SPB1’ · ‘crowd needed svc SPB1’")
 def _nl_answer(question: str) -> str:
     txt = (question or "").lower()
-    plan_res = st.session_state.plan_res
-    plan_det = st.session_state.plan_det
+    plan_res = st.session_state.plan_res; plan_det = st.session_state.plan_det
     try:
-        # Q&A de datos (no cambia el plan)
         if "max" in txt or "mayor dif" in txt:
             row = plan_res.loc[plan_res["Dif_vs_FCST"].abs().idxmax()]
             return (f"El máximo |Dif_vs_FCST| es **{abs(row['Dif_vs_FCST']):,.0f}** en "
@@ -616,41 +517,16 @@ def _nl_answer(question: str) -> str:
                     st.dataframe(df.sort_values("SVC"), use_container_width=True)
                     return f"Mostré el resumen para **{fecha.date()}**."
                 return "No encontré esa fecha en el plan."
-        # Ayuda/guía
-        return "Este chat es para CONSULTAS. Para CAMBIOS usa el panel Jarvis a la izquierda."
+        return "Consulta recibida. Para CAMBIOS, también puedes escribir órdenes aquí (ej. ‘rentals=120 en SPB1’, ‘crowd needed svc SPB1’)."
     except Exception as e:
         return f"Ocurrió un error respondiendo: {e}"
 
 if q:
     st.session_state.chat.append(("user", q))
-    # (Opcional) Atajos mínimos desde chat; si no los quieres, borra este bloque:
-    acciones = []
-    low = q.strip().lower()
-    if re.search(r"\brecalc|recalcula|recalcular\b", low):
-        acciones.append({"tipo":"recalc"})
-    if re.search(r"crowd|needed|necesit", low):
-        msvc = re.search(r"\bsvc\s*([A-Za-z0-9]+)", low)
-        mfecha = re.search(r"(20\d{2}-\d{2}-\d{2})", low)
-        acciones.append({"tipo":"crowd_need","svc": (msvc.group(1).upper() if msvc else None),
-                         "fecha": (mfecha.group(1) if mfecha else None)})
-    m = re.search(r"\b(mlp|rentals)\s*=\s*(\d+)\b", low) or re.search(r"\b(mlp|rentals)\s+(\d+)\b", low)
-    if m: acciones.append({"tipo":"set_routes","modelo":m.group(1),"rutas":int(m.group(2))})
-
-    msgs=[]
-    for a in acciones:
-        t=a.get("tipo")
-        if t=="set_routes":
-            msgs.append(_set_override(a.get("modelo",""), a.get("rutas",0), a.get("svc")))
-        elif t=="crowd_need":
-            msgs.append(_crowd_need_view(a.get("svc"), a.get("fecha")))
-        elif t=="recalc":
-            st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
-            msgs.append("Plan recalculado.")
-    if acciones:
-        st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
-        st.session_state.chat.append(("assistant", " | ".join(msgs) if msgs else "Listo."))
-        st.rerun()
-
+    acciones = parse_actions(q)
+    if acciones:  # ejecuta órdenes EN el chat
+        msg = execute_actions(acciones, recalc_auto=True)
+        st.session_state.chat.append(("assistant", msg)); st.rerun()
     ans = _nl_answer(q)
     st.session_state.chat.append(("assistant", ans))
     st.rerun()
