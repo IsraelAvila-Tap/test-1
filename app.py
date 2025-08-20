@@ -293,14 +293,41 @@ def run(params: dict):
         svc, fecha = gr.name
         fc = float(fcst[(fcst.SVC==svc)&(fcst.Fecha==fecha)]["Shipments_FCST"].sum())
         m = gr["Modelo"].eq("MLP"); r = gr["Modelo"].eq("Rentals"); c = gr["Modelo"].eq("Crowd")
+
+            ov = st.session_state.get("overrides", {"mlp":{},"rentals":{}})
+        svc_key = str(svc).upper() if svc is not None else ""
+        has_mlp_ov = ("GLOBAL" in ov["mlp"]) or (svc_key in ov["mlp"])
+        has_rent_ov = ("GLOBAL" in ov["rentals"]) or (svc_key in ov["rentals"])
         base = gr.loc[m|r,"Shipments"].sum()
+        fixed = 0.0
+        if has_mlp_ov:
+            fixed += gr.loc[m, "Shipments"].sum()
+        if has_rent_ov:
+            fixed += gr.loc[r, "Shipments"].sum()
+        free = base - fixed
         if scale_if_exceed and base > fc and base > 0:
             f = fc/base
             for mask in [m,r]:
                 gr.loc[mask,"Rutas"] = np.round(gr.loc[mask,"Rutas"]*f).clip(lower=0).astype(int)
                 gr.loc[mask,"Shipments"] = gr.loc[mask,"Rutas"]*gr.loc[mask,"SPR"]
+            if fixed >= fc:
+                gr.loc[(m & ~has_mlp_ov) | (r & ~has_rent_ov), ["Rutas","Shipments"]] = (0,0.0)
+                gr.loc[c,["Rutas","Shipments"]] = (0,0.0)
+                return gr
+            remain = fc - fixed
+            f = remain/free if free>0 else 0.0
+            if not has_mlp_ov:
+                gr.loc[m,"Rutas"] = np.round(gr.loc[m,"Rutas"]*f).clip(lower=0).astype(int)
+                gr.loc[m,"Shipments"] = gr.loc[m,"Rutas"]*gr.loc[m,"SPR"]
+            if not has_rent_ov:
+                gr.loc[r,"Rutas"] = np.round(gr.loc[r,"Rutas"]*f).clip(lower=0).astype(int)
+                gr.loc[r,"Shipments"] = gr.loc[r,"Rutas"]*gr.loc[r,"SPR"]
             gr.loc[c,["Rutas","Shipments"]] = (0,0.0)
             return gr
+        base = gr.loc[m|r,"Shipments"].sum()
+
+
+                
         gap = max(fc-base, 0.0)
         if gap>0:
             spr_c = float(gr.loc[c,"SPR"].iloc[0]) if gr.loc[c,"SPR"].notna().any() else 0.0
