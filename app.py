@@ -1,4 +1,4 @@
-# app.py — Mel-IA Ops (Jarvis + Chat unificados)
+# ====== SEGMENTO 1: imports, config, OpenAI, estado, Google Sheets ======
 import os, re, json, glob
 import numpy as np
 import pandas as pd
@@ -9,35 +9,37 @@ from datetime import datetime
 
 st.set_page_config(page_title="Copiloto Flota — Mel-IA Ops (Jarvis)", layout="wide")
 
+# --- IDs / opciones base ---
 SHEET_ID = "1UBjU3-ftGCow3EzTD0NB6UaYwMUYUARbn9QjD7SlxtY"
 TABS = dict(EJ="Ejecución", SRM="SRM", FCST="FCST", OUT_RES="Plan_14_resumen", OUT_DET="Plan_14_detalle")
 RUTAS_SRM_IS_DAILY = True
 FACTOR_SRM_SEM_A_DIA = 1/6
 CROWD_VT = "Car"
 
-# -------- OpenAI opcional --------
+# --- OpenAI opcional ---
 _HAS_OPENAI = False
 try:
+    from openai import OpenAI
     if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
         os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
-    from openai import OpenAI
     _client = OpenAI()
-    _HAS_OPENAI = True
+    _HAS_OPENAI = bool(os.environ.get("OPENAI_API_KEY"))
 except Exception:
     _client = None
+    _HAS_OPENAI = False
 
-# -------- Estado global --------
+# --- Estado global ---
 if "params" not in st.session_state:
     st.session_state["params"] = {
         "escalar_si_excede_fcst": True,
         "factor_escalado_mlp": 0.85,
         "factor_escalado_rentals": 0.75,
     }
-# Overrides de rutas por modelo/SVC (fijos). {"mlp": {"GLOBAL": int, "SPB1": int, ...}, "rentals": {...}}
+# overrides: {"mlp":{"GLOBAL":x,"SPB1":y}, "rentals":{...}}
 if "overrides" not in st.session_state:
     st.session_state["overrides"] = {"mlp": {}, "rentals": {}}
 
-# -------- Google Sheets --------
+# --- Google Sheets client ---
 @st.cache_resource
 def get_client():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -47,14 +49,13 @@ def get_client():
             info["private_key"] = info["private_key"].replace("\\n", "\n")
         creds = Credentials.from_service_account_info(info, scopes=scope)
         return gspread.authorize(creds)
-    st.error("No se encontraron credenciales. Agrega [gcp_service_account] en Settings → Secrets.")
+    st.error("No se encontraron credenciales. Configura [gcp_service_account] en Settings → Secrets.")
     st.stop()
 
 def _unique_headers(headers):
     out, seen = [], set()
     for i, h in enumerate(headers):
-        h = (h or "").strip()
-        if not h: h = f"col_{i+1}"
+        h = (h or "").strip() or f"col_{i+1}"
         h = re.sub(r"\s+", " ", h)
         base, k, name = h, 1, h
         while name in seen:
@@ -94,18 +95,11 @@ def write_ws(sheet, title, df):
             out[c] = out[c].dt.strftime("%Y-%m-%d")
     ws.update([out.columns.tolist()] + out.astype(object).values.tolist())
 
-def clean_num(s):
-    return (pd.Series(s).astype(str)
-            .str.replace(r"[^\d\-\.\,]", "", regex=True)
-            .str.replace(",", "", regex=False)
-            .replace({"": "0"}).astype(float))
 
-def winsor(s, low=0.05, high=0.95, min_n=10):
-    s = pd.Series(s).dropna()
-    if len(s) < min_n: return s
-    ql,qh = s.quantile([low,high]); return s.clip(ql,qh)
 
-# -------- Carga --------
+
+
+# ====== SEGMENTO 2: carga de datos y normalización ======
 @st.cache_data(ttl=300)
 def load_all():
     client = get_client()
@@ -119,7 +113,7 @@ def load_all():
 
 sheet, df_exec, df_srm, df_fcst_raw = load_all()
 
-# -------- Normalización --------
+# Normalización columnas clave
 if "DELIVERY_MODEL" not in df_exec.columns:
     for alt in ["DELIVERY_MODEL 1","Delivery Model","DELIVERY MODEL"]:
         if alt in df_exec.columns: df_exec["DELIVERY_MODEL"]=df_exec[alt]; break
@@ -129,6 +123,7 @@ if "SVC" not in df_exec.columns:
 for c in ["Shps Dispatched","TOTAL_RUTAS"]:
     if c in df_exec.columns: df_exec[c]=pd.to_numeric(df_exec[c], errors="coerce")
 
+# Normalización fecha
 _fecha = None
 for cand in ["DATE","Fecha","FECHA","Date"]:
     if cand in df_exec.columns:
@@ -147,19 +142,36 @@ df_exec["_fecha"] = _fecha
 df_exec = df_exec[df_exec["_fecha"].notna()].copy()
 df_exec["_dow"]   = df_exec["_fecha"].dt.weekday
 
-# -------- FCST tidy --------
+# Helpers numéricos
+def clean_num(s):
+    return (pd.Series(s).astype(str)
+            .str.replace(r"[^\d\-\.\,]", "", regex=True)
+            .str.replace(",", "", regex=False)
+            .replace({"": "0"}).astype(float))
+
+def winsor(s, low=0.05, high=0.95, min_n=10):
+    s = pd.Series(s).dropna()
+    if len(s) < min_n: return s
+    ql,qh = s.quantile([low,high]); return s.clip(ql,qh)
+
+# FCST tidy
 date_cols = [c for c in df_fcst_raw.columns if re.match(r"\d{1,2}\-\w{3}", str(c))]
 for c in date_cols: df_fcst_raw[c]=clean_num(df_fcst_raw[c])
 YEAR = int(df_exec["_fecha"].dt.year.max()) if not df_exec.empty else datetime.now().year
 
-df_fcst = df_fcst_raw.melt(id_vars=["SVC"], value_vars=date_cols, var_name="Fecha_txt", value_name="Shipments_FCST").dropna(subset=["SVC"])
+df_fcst = df_fcst_raw.melt(id_vars=["SVC"], value_vars=date_cols,
+                           var_name="Fecha_txt", value_name="Shipments_FCST").dropna(subset=["SVC"])
 df_fcst["Fecha"] = pd.to_datetime(df_fcst["Fecha_txt"] + f"-{YEAR}", format="%d-%b-%Y", errors="coerce")
 df_fcst = df_fcst[["SVC","Fecha","Shipments_FCST"]]
 fechas = sorted(df_fcst["Fecha"].dropna().unique())
 cal = pd.DataFrame({"Fecha": fechas})
 cal["_dow"] = cal["Fecha"].dt.weekday
 
-# -------- SPRs / capacidades --------
+
+
+
+# ====== SEGMENTO 3: SPRs, capacidades y motor run() ======
+# SPRs por DOW
 df_exec["SPR_raw"] = df_exec["Shps Dispatched"] / df_exec["TOTAL_RUTAS"]
 df_exec["SPR_w"]   = df_exec["SPR_raw"]
 _w = df_exec.groupby(["DELIVERY_MODEL","HOMOLOGACION_VEHICULO","_dow"])["SPR_raw"].transform(lambda s: winsor(s,0.05,0.95,10))
@@ -173,6 +185,7 @@ spr_dow_global = (spr_dow.groupby(["_dow"])["SPR_dow"]
                   .mean().reset_index().rename(columns={"SPR_dow":"SPR_dow_global"}))
 spr_global = float(df_exec["SPR_w"].mean()) if not df_exec.empty else 0.0
 
+# Capacidades
 veh_cols = [c for c in ["Extra Large Van","Large Van","Small Van","Car"] if c in df_srm.columns]
 df_srm_long = df_srm.melt(id_vars=["MLP","Region","SVC"], value_vars=veh_cols,
                           var_name="HOMOLOGACION_VEHICULO", value_name="Rutas_MLP").fillna(0)
@@ -189,13 +202,12 @@ if "SVC" not in rent_rutas.columns:
     rent_rutas = rent_rutas.assign(_k=1).merge(pd.DataFrame({"SVC":svcs,"_k":[1]*len(svcs)}), on="_k").drop(columns="_k")
 rentals_capacity = rent_rutas[["SVC","HOMOLOGACION_VEHICULO","Rutas_Rentals_avg"]].copy()
 
-# -------- Motor principal --------
 def run(params: dict):
     scale_if_exceed = bool(params.get("escalar_si_excede_fcst", True))
     f_mlp   = float(params.get("factor_escalado_mlp", 1.0))
     f_rent  = float(params.get("factor_escalado_rentals", 1.0))
 
-    # MLP
+    # --- MLP ---
     spr_mlp = spr_dow[spr_dow["DELIVERY_MODEL"]=="MLP"][["HOMOLOGACION_VEHICULO","_dow","SPR_dow"]]
     mlp = mlp_capacity.assign(_k=1).merge(cal.assign(_k=1), on="_k").drop(columns="_k")
     mlp = (mlp.merge(spr_mlp, on=["HOMOLOGACION_VEHICULO","_dow"], how="left")
@@ -212,7 +224,7 @@ def run(params: dict):
                     mlp.loc[mlp["SVC"]==svc, "Rutas_MLP_int"] = int(rutas_fijas)
     mlp["Shipments_MLP"] = mlp["Rutas_MLP_int"] * mlp["SPR_final"]
 
-    # Rentals
+    # --- Rentals ---
     rent = rentals_capacity.assign(_k=1).merge(cal.assign(_k=1), on="_k").drop(columns="_k")
     rent = (rent.merge(spr_dow_vt, on=["HOMOLOGACION_VEHICULO","_dow"], how="left")
                .merge(spr_dow_global, on=["_dow"], how="left"))
@@ -227,7 +239,7 @@ def run(params: dict):
                     rent.loc[rent["SVC"]==svc, "Rutas_Rentals_int"] = int(rutas_fijas)
     rent["Shipments_Rentals"] = rent["Rutas_Rentals_int"] * rent["SPR_final"]
 
-    # Crowd SPR por fecha
+    # --- Crowd SPR por fecha ---
     crowd = cal.merge(
         spr_dow_vt[spr_dow_vt["HOMOLOGACION_VEHICULO"]==CROWD_VT][["_dow","SPR_dow_vt"]],
         on="_dow", how="left"
@@ -236,7 +248,7 @@ def run(params: dict):
 
     fcst = df_fcst.copy()
 
-    # Detalle
+    # --- Detalle base ---
     det_mlp = (mlp.rename(columns={"Rutas_MLP_int":"Rutas","SPR_final":"SPR","Shipments_MLP":"Shipments"})
                   .assign(Modelo="MLP")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]])
     det_rent= (rent.rename(columns={"Rutas_Rentals_int":"Rutas","SPR_final":"SPR","Shipments_Rentals":"Shipments"})
@@ -248,7 +260,7 @@ def run(params: dict):
     det_crowd = det_crowd[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments"]]
     det = pd.concat([det_mlp, det_rent, det_crowd], ignore_index=True)
 
-    # Ajuste
+    # --- Ajuste vs FCST ---
     def ajustar(gr):
         svc, fecha = gr.name
         fc = float(fcst[(fcst.SVC==svc)&(fcst.Fecha==fecha)]["Shipments_FCST"].sum())
@@ -274,7 +286,7 @@ def run(params: dict):
 
     det = det.groupby(["SVC","Fecha"], group_keys=False).apply(ajustar)
 
-    # Resumen
+    # --- Resumen ---
     g = det.groupby(["SVC","Fecha","Modelo"], as_index=False).agg(Rutas=("Rutas","sum"), Shipments=("Shipments","sum"))
     mlp_s = g[g["Modelo"]=="MLP"][["SVC","Fecha","Rutas","Shipments"]].rename(columns={"Rutas":"Rutas_MLP","Shipments":"Shipments_MLP"})
     ren_s = g[g["Modelo"]=="Rentals"][["SVC","Fecha","Rutas","Shipments"]].rename(columns={"Rutas":"Rutas_Rentals","Shipments":"Shipments_Rentals"})
@@ -289,7 +301,11 @@ def run(params: dict):
 if "plan_res" not in st.session_state or "plan_det" not in st.session_state or "crowd_spr" not in st.session_state:
     st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
 
-# -------- Utilidades Jarvis --------
+
+
+
+
+# ====== SEGMENTO 4: overrides, crowd need y encabezado ======
 def _set_override(modelo: str, rutas: int, svc: str|None):
     modelo = (modelo or "").lower()
     if modelo not in ("mlp","rentals"): return f"Modelo inválido: {modelo}"
@@ -327,7 +343,29 @@ def _crowd_need_view(svc=None, fecha=None):
     st.dataframe(need, use_container_width=True)
     return f"Rutas Crowd necesarias totales: **{int(need['Rutas_Crowd_Need'].sum())}**."
 
-# ====== Parser COMÚN de acciones (Jarvis/Chat) ======
+def _pick_logo():
+    prefer = ["20250813_1028_Camión Futurista Amarillo_remix_01k2j400zxfp0te4vpq1kq1wnv.png",
+              "mel-ia-ops.png", "mel_ia_ops.png", "Mel-IA Ops.png", "Mel-IA Ops.jpg", "mel-ia-ops.jpg"]
+    for p in prefer:
+        if os.path.exists(p): return p
+    pngs = glob.glob("*.png") + glob.glob("assets/*.png")
+    if pngs:
+        pngs.sort(key=lambda p: os.path.getsize(p), reverse=True)
+        return pngs[0]
+    return None
+
+logo_path = _pick_logo()
+col_logo, col_title = st.columns([1,4])
+with col_logo:
+    if logo_path: st.image(logo_path, use_container_width=True)
+with col_title:
+    st.markdown("## **Mel-IA Ops — Copiloto de Planeación de Flota (Jarvis unificado)**")
+
+
+
+
+
+# ====== SEGMENTO 5: parser de órdenes y ejecutor ======
 def parse_actions(instruccion: str) -> list[dict]:
     acciones: list[dict] = []
     txt = (instruccion or "").strip()
@@ -358,7 +396,7 @@ def parse_actions(instruccion: str) -> list[dict]:
         except Exception:
             pass
 
-    # 2) Fallback regex
+    # 2) Fallback regex (sin IA)
     low = txt.lower()
     m = re.search(r"\b(mlp|rentals)\s*=\s*(\d+)\b", low) or re.search(r"\b(mlp|rentals)\s+(\d+)\b", low)
     if m: acciones.append({"tipo":"set_routes","modelo":m.group(1),"rutas":int(m.group(2))})
@@ -379,7 +417,6 @@ def parse_actions(instruccion: str) -> list[dict]:
         acciones.append({"tipo":"recalc"})
     return acciones
 
-# ====== Ejecutor COMÚN de acciones ======
 def execute_actions(acciones: list[dict], *, recalc_auto: bool=True) -> str:
     mensajes = []; did_change = False
     for a in acciones:
@@ -406,28 +443,14 @@ def execute_actions(acciones: list[dict], *, recalc_auto: bool=True) -> str:
         st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
     return " | ".join(mensajes) if mensajes else "Listo."
 
-# -------- Header / Sidebar --------
-def _pick_logo():
-    prefer = ["20250813_1028_Camión Futurista Amarillo_remix_01k2j400zxfp0te4vpq1kq1wnv.png",
-              "mel-ia-ops.png", "mel_ia_ops.png", "Mel-IA Ops.png", "Mel-IA Ops.jpg", "mel-ia-ops.jpg"]
-    for p in prefer:
-        if os.path.exists(p): return p
-    pngs = glob.glob("*.png") + glob.glob("assets/*.png")
-    if pngs:
-        pngs.sort(key=lambda p: os.path.getsize(p), reverse=True)
-        return pngs[0]
-    return None
 
-logo_path = _pick_logo()
-col_logo, col_title = st.columns([1,4])
-with col_logo:
-    if logo_path: st.image(logo_path, use_container_width=True)
-with col_title:
-    st.markdown("## **Mel-IA Ops — Copiloto de Planeación de Flota (Jarvis unificado)**")
 
+
+# ====== SEGMENTO 6: Sidebar (Jarvis) y parámetros rápidos ======
 with st.sidebar.expander("🧠 Jarvis — Instrucciones en español", expanded=True):
     st.caption("CAMBIA el plan: ‘rentals=100’, ‘pon mlp 80 en SPB1’, ‘quita override de rentals en SPB2’, ‘apaga escalar_si_excede_fcst’, ‘crowd needed’…")
     instruccion = st.text_input("Instrucción", placeholder="Ej: pon rentals 120 en SPB1 y recalcula")
+    st.markdown(f"**OpenAI:** {'🟢 conectado' if _HAS_OPENAI else '🔴 sin key'}")
     if st.checkbox("Ver params", value=False): st.json(st.session_state["params"])
     if st.checkbox("Ver overrides", value=False): st.json(st.session_state["overrides"])
     if st.button("Ejecutar instrucción"):
@@ -445,7 +468,11 @@ with st.sidebar:
     st.session_state["params"]["escalar_si_excede_fcst"] = bool(scale_if_exceed)
     st.caption(f"Sheet ID: {SHEET_ID}")
 
-# -------- UI principal --------
+
+
+
+# ====== SEGMENTO 7: UI principal + chat (consultas y órdenes) ======
+# Resumen
 st.subheader("Resumen (incluye Shipments_FCST)")
 cols_pref = ["SVC","Fecha","Rutas_MLP","Rutas_Rentals","Rutas_Crowd",
              "Shipments_MLP","Shipments_Rentals","Shipments_Crowd",
@@ -462,10 +489,12 @@ with col2:
         st.session_state.plan_res, st.session_state.plan_det, st.session_state.crowd_spr = run(st.session_state["params"])
         st.rerun()
 
+# Detalle
 st.subheader("Detalle")
 st.dataframe(st.session_state.plan_det.sort_values(["SVC","Fecha","Modelo","HOMOLOGACION_VEHICULO"]).reset_index(drop=True),
              use_container_width=True, height=380)
 
+# Escribir a Google Sheet
 st.subheader("📝 Escribir al Google Sheet")
 if st.button("Escribir 'Plan_14_resumen' y 'Plan_14_detalle'"):
     try:
@@ -477,24 +506,28 @@ if st.button("Escribir 'Plan_14_resumen' y 'Plan_14_detalle'"):
     except Exception as e:
         st.error(f"No se pudo escribir: {e}")
 
-# -------- Chat (consulta + acciones) --------
+# --- Chat ---
 st.subheader("💬 Chat con Copiloto (consulta o da órdenes)")
 if "chat" not in st.session_state: st.session_state.chat = []
 for role, msg in st.session_state.chat:
     with st.chat_message(role): st.markdown(msg)
 
-q = st.chat_input("Ej: ‘resumen svc SPB1’ · ‘para fecha 2025-08-10’ · ‘totales por modelo’ · ‘rentals=120 en SPB1’ · ‘crowd needed svc SPB1’")
 def _nl_answer(question: str) -> str:
-    txt = (question or "").lower()
-    plan_res = st.session_state.plan_res; plan_det = st.session_state.plan_det
+    """Consultas con IA en contexto de los datos; cae a rápidas si no hay IA."""
+    txt = (question or "").strip()
+    plan_res = st.session_state.plan_res
+    plan_det = st.session_state.plan_det
+
+    # rápidas sin IA
+    low = txt.lower()
     try:
-        if "max" in txt or "mayor dif" in txt:
+        if "max" in low or "mayor dif" in low:
             row = plan_res.loc[plan_res["Dif_vs_FCST"].abs().idxmax()]
             return (f"El máximo |Dif_vs_FCST| es **{abs(row['Dif_vs_FCST']):,.0f}** en "
                     f"**{row['SVC']}** el **{pd.to_datetime(row['Fecha']).date()}**.")
-        if "resumen" in txt and "svc" in txt:
+        if "resumen" in low and "svc" in low:
             svcs = sorted(plan_res["SVC"].dropna().unique().tolist(), key=len, reverse=True)
-            svc = next((s for s in svcs if s.lower() in txt), None)
+            svc = next((s for s in svcs if s.lower() in low), None)
             if svc:
                 df = (plan_res[plan_res["SVC"]==svc]
                       .sort_values("Fecha")[["Fecha","Rutas_MLP","Rutas_Rentals",
@@ -503,12 +536,12 @@ def _nl_answer(question: str) -> str:
                 st.dataframe(df, use_container_width=True)
                 return f"Te mostré las últimas 10 fechas de **{svc}**."
             return "Dime el SVC exacto (ej. SPB1, SPB2…)."
-        if "totales por modelo" in txt:
+        if "totales por modelo" in low:
             df = (plan_det.groupby("Modelo")["Rutas"].sum().reset_index())
             st.dataframe(df, use_container_width=True)
             return "Estos son los totales de rutas por modelo."
-        if "para fecha" in txt or "el día" in txt:
-            m = re.search(r"(20\d{2}-\d{2}-\d{2})", txt)
+        if "para fecha" in low or "el día" in low:
+            m = re.search(r"(20\d{2}-\d{2}-\d{2})", low)
             if m:
                 fecha = pd.to_datetime(m.group(1))
                 df = plan_res[plan_res["Fecha"]==fecha][["SVC","Rutas_MLP","Rutas_Rentals",
@@ -517,17 +550,62 @@ def _nl_answer(question: str) -> str:
                     st.dataframe(df.sort_values("SVC"), use_container_width=True)
                     return f"Mostré el resumen para **{fecha.date()}**."
                 return "No encontré esa fecha en el plan."
-        return "Consulta recibida. Para CAMBIOS, también puedes escribir órdenes aquí (ej. ‘rentals=120 en SPB1’, ‘crowd needed svc SPB1’)."
-    except Exception as e:
-        return f"Ocurrió un error respondiendo: {e}"
+    except Exception:
+        pass
 
+    # IA con contexto
+    if _HAS_OPENAI:
+        try:
+            def _safe_preview(df: pd.DataFrame, n=250):
+                d = df.head(n).copy()
+                for c in d.columns:
+                    if str(d[c].dtype).startswith("datetime") or "datetime64" in str(d[c].dtype):
+                        d[c] = pd.to_datetime(d[c], errors="coerce").dt.strftime("%Y-%m-%d")
+                d = d.astype(object).where(pd.notnull(d), None)
+                return d.to_dict(orient="records")
+
+            schema = {
+                "plan_res_columns": list(plan_res.columns),
+                "plan_det_columns": list(plan_det.columns),
+                "preview_plan_res": _safe_preview(plan_res, n=250),
+                "preview_plan_det": _safe_preview(plan_det, n=150),
+            }
+            system_msg = (
+                "Eres analista de planeación de última milla. Responde conciso y accionable. "
+                "Si falta SVC/fecha, pídelos. Propón ajustes en MLP/Rentals/Crowd cuando tenga sentido."
+            )
+            resp = _client.responses.create(
+                model="gpt-4o-mini",
+                input=[
+                    {"role":"system","content": system_msg},
+                    {"role":"user",
+                     "content": f"Pregunta: {question}\nContexto:\n{json.dumps(schema, ensure_ascii=False)[:12000]}"}
+                ],
+                temperature=0.2
+            )
+            return resp.output_text or "No obtuve respuesta de IA."
+        except Exception as e:
+            return f"(IA) Ocurrió un error: {e}"
+
+    return "Listo para consultas. Si agregas tu API key de OpenAI, haré análisis con IA."
+
+q = st.chat_input(
+    "Consulta u orden: ‘resumen svc SPB1’ · ‘para fecha 2025-08-10’ · ‘totales por modelo’ · "
+    "‘rentals=120 en SPB1’ · ‘crowd needed svc SPB1’"
+)
 if q:
     st.session_state.chat.append(("user", q))
+
+    # 1) ejecutar ÓRDENES si las hay
     acciones = parse_actions(q)
-    if acciones:  # ejecuta órdenes EN el chat
+    if acciones:
         msg = execute_actions(acciones, recalc_auto=True)
-        st.session_state.chat.append(("assistant", msg)); st.rerun()
+        st.session_state.chat.append(("assistant", msg))
+        st.rerun()
+
+    # 2) si no eran órdenes → CONSULTA (IA/rápidas)
     ans = _nl_answer(q)
     st.session_state.chat.append(("assistant", ans))
     st.rerun()
+
 
