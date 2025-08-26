@@ -1,3 +1,4 @@
+from functools import lru_cache
 import os, json, gspread
 from typing import Optional
 from google.oauth2.service_account import Credentials
