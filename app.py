@@ -27,6 +27,14 @@ def _to_num(s: pd.Series) -> pd.Series:
         errors="coerce"
     )
 
+def _to_float0(s: pd.Series) -> pd.Series:
+    x = _to_num(s)
+    return x.replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+
+def _to_int0(s: pd.Series) -> pd.Series:
+    x = _to_num(s)
+    return x.replace([np.inf, -np.inf], np.nan).fillna(0).astype(int)
+
 
 import numpy as np
 from math import ceil
@@ -108,7 +116,7 @@ def load_capacity() -> pd.DataFrame:
     miss = need - set(df.columns)
     if miss:
         raise ValueError(f"Capacity: faltan columnas {miss}")
-    df["cantidad"] = _to_num(df["cantidad"]).fillna(0).astype(float)
+    df["cantidad"] = _to_float0(df["cantidad"])
     return df
 
 def load_srm() -> pd.DataFrame:
@@ -200,7 +208,7 @@ def load_srm() -> pd.DataFrame:
     # 6) A número
     for c in out.columns:
         if c != "svc":
-            out[c] = _to_num(out[c]).fillna(0)
+            out[c] = _to_float0(out[c])
 
     out["sdd_routes_max"]  = out[[c for c in out.columns if c != "svc" and "sdd"  in c]].sum(axis=1)
     out["spot_routes_max"] = out[[c for c in out.columns if c != "svc" and "spot" in c]].sum(axis=1)
@@ -252,7 +260,7 @@ def load_rentals() -> pd.DataFrame:
         raise ValueError(f"Rentals: no se encontró columna de cantidad. Encabezados: {list(df.columns)}")
 
     # 3) A número y agregamos por SVC
-    df[qty_col] = _to_num(df[qty_col]).fillna(0).astype(int)
+    df[qty_col] = _to_int0(df[qty_col])
     out = (df.groupby(svc_col, as_index=False)[qty_col].sum()
              .rename(columns={svc_col: "svc", qty_col: "rentals_routes_max"}))
 
@@ -310,7 +318,7 @@ def load_crowd_caps() -> pd.DataFrame:
     if all([c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]):
         # --- Formato DETALLADO ---
         for c in [c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]:
-            df[c] = _to_num(df[c]).fillna(0).astype(int)
+            df[c] = _to_int0(df[c])
         out = df[[svc_col, c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]].copy()
         out = out.rename(columns={
             svc_col: "svc",
@@ -344,9 +352,9 @@ def load_crowd_caps() -> pd.DataFrame:
         )
 
     # A número
-    df[c_base] = _to_num(df[c_base]).fillna(0).astype(int)
+    df[c_base] = _to_int0(df[c_base])
     if c_e1 and c_e1 in df.columns:
-        df[c_e1] = _to_num(df[c_e1]).fillna(0).astype(int)
+        df[c_e1] = _to_int0(df[c_e1])
     else:
         # Si no hay E1, asumimos 0 (no escalable)
         df["__e1_tmp__"] = 0
