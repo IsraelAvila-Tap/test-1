@@ -14,6 +14,13 @@ if "PROJECT_KEY" in st.secrets:
     os.environ["PROJECT_KEY"] = st.secrets["PROJECT_KEY"]
 
 
+def _to_num(s: pd.Series) -> pd.Series:
+    # limpia comas, %, espacios y convierte a número
+    return pd.to_numeric(
+        s.astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False).str.strip(),
+        errors="coerce"
+    )
+
 import os, yaml
 import pandas as pd
 import numpy as np
@@ -69,18 +76,25 @@ def load_fcst() -> pd.DataFrame:
 
 def load_spr_real() -> pd.DataFrame:
     df = _read_sheet("SPR")
-    # admite encabezados: FECHA, SVC, SPR (+vehículo se promedia por día/SVC)
     need = {"fecha","svc","spr"}
     miss = need - set(df.columns)
     if miss:
         raise ValueError(f"SPR: faltan columnas {miss}")
-    day = (df.groupby(["fecha","svc"], as_index=False)["spr"].mean()
+
+    # 🔧 clave: forzar SPR a numérico
+    df["spr"] = _to_num(df["spr"])
+    df = df.dropna(subset=["spr"])  # quita filas sin valor numérico
+
+    day = (df.groupby(["fecha","svc"], as_index=False)["spr"]
+             .mean()
              .rename(columns={"spr":"spr_exec"}))
+
     day["dow"] = day["fecha"].apply(_weekday)
     iso = day["fecha"].apply(lambda d: pd.Timestamp(d).isocalendar())
     day["iso_year"] = [int(x.year) for x in iso]
     day["iso_week"] = [int(x.week) for x in iso]
     return day
+
 
 def load_capacity() -> pd.DataFrame:
     df = _read_sheet("Capacity")
@@ -89,7 +103,7 @@ def load_capacity() -> pd.DataFrame:
     miss = need - set(df.columns)
     if miss:
         raise ValueError(f"Capacity: faltan columnas {miss}")
-    df["cantidad"] = pd.to_numeric(df["cantidad"], errors="coerce").fillna(0).astype(float)
+    df["cantidad"] = _to_num(df["cantidad"]).fillna(0).astype(float)
     return df
 
 def load_srm() -> pd.DataFrame:
