@@ -1,3 +1,10 @@
+import os, streamlit as st
+if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
+    os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
+if "PROJECT_KEY" in st.secrets:
+    os.environ["PROJECT_KEY"] = st.secrets["PROJECT_KEY"]
+
+
 import os, yaml
 import pandas as pd
 import numpy as np
