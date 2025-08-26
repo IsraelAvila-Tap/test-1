@@ -262,37 +262,91 @@ def load_rentals() -> pd.DataFrame:
 
 
 def load_crowd_caps() -> pd.DataFrame:
-    df = _read_sheet("Crowd")
-    # columnas parecidas a: 'svc', 'base entre sem', 'base sabado', 'base domingo',
-    # 'holgura entre sem', 'holgura sabado', 'holgura domingo'
-    if "svc" not in df.columns:
-        raise ValueError("Crowd: falta columna 'SVC'.")
-    def _pick(name_opts):
-        for n in df.columns:
-            for opt in name_opts:
-                if opt in n:
-                    return n
+    df = _read_sheet("Crowd")  # ya normaliza headers a minúsculas y strip
+    if df.empty:
+        raise ValueError("Crowd: hoja vacía.")
+
+    # --- 1) Detectar columna SVC por nombre aproximado o por patrón de valores ---
+    cand_svc = [c for c in df.columns if any(k in c.replace(" ", "")
+                 for k in ["svc","svcs","facility","facilidad","centro","centrooperativo","estacion","station","lc","logisticcenter"])]
+    if not cand_svc:
+        # Heurística por patrón tipo SVC (SPB1, SMX7, SAG1, etc.)
+        import re
+        pat = re.compile(r"^[A-Z]{3,4}\d{1,2}$")  # ej: SMX7, SPB1, SAG12
+        best_hits, best_col = -1, None
+        for c in df.columns:
+            vals = df[c].astype(str).str.strip().str.upper()
+            hits = (vals.str.match(pat, na=False)).sum()
+            if hits > best_hits:
+                best_hits, best_col = hits, c
+        if best_hits >= 3:
+            cand_svc = [best_col]
+    if not cand_svc:
+        raise ValueError(f"Crowd: falta columna SVC. Encabezados detectados: {list(df.columns)}")
+    svc_col = cand_svc[0]
+
+    # --- 2) Detectar columnas de capacidad (Base y E1) por día ---
+    cols = list(df.columns)
+
+    def _pick(tags_main, tags_day):
+        # Busca la primera columna que contenga al menos un token de cada grupo
+        for c in cols:
+            cc = c.lower()
+            if any(t in cc for t in tags_main) and any(t in cc for t in tags_day):
+                return c
         return None
-    c_base_wd = _pick(["base entre"])
-    c_base_sa = _pick(["base sab"])
-    c_base_su = _pick(["base domingo","base dom"])
-    c_e1_wd   = _pick(["holgura entre","e1 entre"])
-    c_e1_sa   = _pick(["holgura sab","e1 sab"])
-    c_e1_su   = _pick(["holgura domingo","e1 dom"])
 
-    need_cols = [c_base_wd,c_base_sa,c_base_su,c_e1_wd,c_e1_sa,c_e1_su]
-    if any(c is None for c in need_cols):
-        raise ValueError("Crowd: no se encontraron columnas base/e1 esperadas (entre semana/sábado/domingo).")
+    # Sinónimos
+    base_tags = ["base","normal"]
+    e1_tags   = ["e1","holgura","escala","escalada","alto","high"]
+    wd_tags   = ["entre", "sem", "weekday", "wd", "laboral"]
+    sa_tags   = ["sab", "sábado", "sat"]
+    su_tags   = ["dom", "domingo", "sun"]
 
-    for c in need_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+    c_base_wd = _pick(base_tags, wd_tags)
+    c_base_sa = _pick(base_tags, sa_tags)
+    c_base_su = _pick(base_tags, su_tags)
+    c_e1_wd   = _pick(e1_tags,   wd_tags)
+    c_e1_sa   = _pick(e1_tags,   sa_tags)
+    c_e1_su   = _pick(e1_tags,   su_tags)
 
-    out = df[["svc", c_base_wd,c_base_sa,c_base_su,c_e1_wd,c_e1_sa,c_e1_su]].copy()
+    missing = [n for n,v in {
+        "base entre semana": c_base_wd,
+        "base sábado": c_base_sa,
+        "base domingo": c_base_su,
+        "E1 entre semana": c_e1_wd,
+        "E1 sábado": c_e1_sa,
+        "E1 domingo": c_e1_su,
+    }.items() if v is None]
+
+    if missing:
+        raise ValueError(
+            "Crowd: no se encontraron columnas esperadas: "
+            + ", ".join(missing)
+            + f". Encabezados: {list(df.columns)}\n"
+            "Sugerencia: nombra las columnas con palabras clave como "
+            "'base' o 'E1' + 'entre'/'sab'/'dom' (ej: 'Base entre semana', 'Holgura sábado', 'E1 domingo')."
+        )
+
+    # --- 3) Convertir a número y construir salida estándar ---
+    for c in [c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]:
+        df[c] = _to_num(df[c]).fillna(0).astype(int)
+
+    out = df[[svc_col, c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]].copy()
     out = out.rename(columns={
-        c_base_wd:"base_wd", c_base_sa:"base_sa", c_base_su:"base_su",
-        c_e1_wd:"e1_wd", c_e1_sa:"e1_sa", c_e1_su:"e1_su",
+        svc_col: "svc",
+        c_base_wd: "base_wd", c_base_sa: "base_sa", c_base_su: "base_su",
+        c_e1_wd:   "e1_wd",   c_e1_sa:   "e1_sa",   c_e1_su:   "e1_su",
     })
+
+    # Debug suave en UI para confirmar mapeos
+    st.caption(
+        f"Crowd: usando SVC='{svc_col}'. "
+        f"Base→ wd='{c_base_wd}', sa='{c_base_sa}', dom='{c_base_su}'. "
+        f"E1→ wd='{c_e1_wd}', sa='{c_e1_sa}', dom='{c_e1_su}'."
+    )
     return out
+
 
 # ------------- SPR SCENARIOS -------------
 def compute_spr_scenarios(fcst: pd.DataFrame, spr_real: pd.DataFrame, capacity: pd.DataFrame) -> pd.DataFrame:
