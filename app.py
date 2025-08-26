@@ -1,619 +1,406 @@
-# app.py
-# ============================================================
-# Mel-IA Ops — Copiloto de Planeación de Flota (Jarvis)
-# ============================================================
-
-import os, re, json, glob
-import numpy as np
+import os, yaml
 import pandas as pd
+import numpy as np
+from math import ceil
+from datetime import timedelta, datetime, date
 import streamlit as st
-import gspread
-from google.oauth2.service_account import Credentials
-from datetime import datetime
 
-# --------------------- Página ---------------------
-st.set_page_config(page_title="Mel-IA Ops — Jarvis de Flota", layout="wide")
+from utils_gsheets import read_ws, _client, get_service_account_email
 
-# --------------------- IDs / opciones base ---------------------
-SHEET_ID  = "1UBjU3-ftGCow3EzTD0NB6UaYwMUYUARbn9QjD7SlxtY"
-TABS = dict(EJ="Ejecución", SRM="SRM", FCST="FCST",
-            OUT_RES="Plan_14_resumen", OUT_DET="Plan_14_detalle")
+# ------------- CONFIG -------------
+st.set_page_config(page_title="Mel-IA — Plan táctico", layout="wide")
 
-RUTAS_SRM_IS_DAILY = True
-FACTOR_SRM_SEM_A_DIA = 1/6
-CROWD_VT = "Car"
-
-# ============================================================
-# OpenAI opcional
-# ============================================================
-_HAS_OPENAI = False
-try:
-    from openai import OpenAI
-    if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
-        os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
-        _client = OpenAI()
-        _HAS_OPENAI = True
-    else:
-        _client = None
-except Exception:
-    _client = None
-    _HAS_OPENAI = False
-
-# ============================================================
-# Estado inicial
-# ============================================================
-if "params" not in st.session_state:
-    st.session_state["params"] = {
-        "escalar_si_excede_fcst": True,   # sólo lo NO-overriden
-        "factor_escalado_mlp": 1.0,
-        "factor_escalado_rentals": 1.0,
-    }
-
-# overrides = {"mlp":{"GLOBAL":80, "SPB1":100}, "rentals":{"GLOBAL":25, "SPB2":60}}
-if "overrides" not in st.session_state:
-    st.session_state["overrides"] = {"mlp":{}, "rentals":{}}
-
-# ============================================================
-# Google Sheets client (secrets o archivo local)
-# ============================================================
 @st.cache_resource
-def get_client():
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    # 1) Secrets (recomendado)
-    if "gcp_service_account" in st.secrets:
-        creds = Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"], scopes=scope
-        )
-        return gspread.authorize(creds)
-    # 2) Archivo local (fallback)
-    CRED_FILE = "planificacionflota-76b4821edef5.json"
-    if os.path.exists(CRED_FILE):
-        creds = Credentials.from_service_account_file(CRED_FILE, scopes=scope)
-        return gspread.authorize(creds)
-    # 3) Falla
-    raise RuntimeError("No se encontraron credenciales. Configura Settings → Secrets con [gcp_service_account].")
+def load_config():
+    with open("config.yaml","r",encoding="utf-8") as f:
+        return yaml.safe_load(f)
+cfg = load_config()
+proj_key = list(cfg["projects"].keys())[0]
+proj = cfg["projects"][proj_key]
+SHEET_ID = proj["sheet_id"]
 
-def _unique_headers(headers):
-    out, seen = [], set()
-    for i, h in enumerate(headers):
-        h = (h or "").strip()
-        if not h: h = f"col_{i+1}"
-        h = re.sub(r"\s+", " ", h)
-        base, k, name = h, 1, h
-        while name in seen:
-            k += 1; name = f"{base}__{k}"
-        out.append(name); seen.add(name)
-    return out
-
-def read_ws(sheet, title, expected=None, any_keys=None, header_probe=10):
-    ws = sheet.worksheet(title)
-    vals = ws.get_all_values()
-    if not vals: return pd.DataFrame()
-    hdr_i = 0
-    if expected:
-        for i,row in enumerate(vals[:header_probe]):
-            r = [c.strip().lower() for c in row]
-            if all(k.lower() in r for k in expected): hdr_i = i; break
-        else:
-            if any_keys:
-                for i,row in enumerate(vals[:header_probe]):
-                    r = [c.strip().lower() for c in row]
-                    if any(k.lower() in r for k in any_keys): hdr_i = i; break
-    headers = _unique_headers(vals[hdr_i])
-    df = pd.DataFrame(vals[hdr_i+1:], columns=headers)
-    df = df[~(df.astype(str).apply(lambda x: "".join(x).strip(), axis=1)=="")]
+# ------------- HELPERS -------------
+def _norm_cols(df: pd.DataFrame):
+    rn = {c: c.strip().lower() for c in df.columns}
+    df = df.rename(columns=rn)
     return df
 
-def write_ws(sheet, title, df):
-    try:
-        ws = sheet.worksheet(title)
-        sheet.del_worksheet(ws)
-    except:
-        pass
-    rows = len(df) + 10
-    cols = max(10, len(df.columns)+2)
-    ws = sheet.add_worksheet(title=title, rows=str(rows), cols=str(cols))
-    out = df.copy()
-    for c in out.columns:
-        if pd.api.types.is_datetime64_any_dtype(out[c]):
-            out[c] = out[c].dt.strftime("%Y-%m-%d")
-    ws.update([out.columns.tolist()] + out.astype(object).values.tolist())
+def _weekday(d: date) -> int:
+    return pd.Timestamp(d).weekday()  # 0=Lunes ... 6=Domingo
 
-def clean_num(s):
-    return (pd.Series(s).astype(str)
-            .str.replace(r"[^\d\-\.\,]", "", regex=True)
-            .str.replace(",", "", regex=False)
-            .replace({"": "0"}).astype(float))
+def _iso_yr_week(d: date):
+    iso = pd.Timestamp(d).isocalendar()
+    return int(iso.year), int(iso.week)
 
-def winsor(s, low=0.05, high=0.95, min_n=10):
-    s = pd.Series(s).dropna()
-    if len(s) < min_n: return s
-    ql,qh = s.quantile([low,high])
-    return s.clip(ql,qh)
+def _safe_mean(vals):
+    vals = [float(v) for v in vals if pd.notna(v)]
+    return float(np.mean(vals)) if vals else np.nan
 
-# ============================================================
-# Carga de datos (cache 5 min)
-# ============================================================
-@st.cache_data(ttl=300)
-def load_all():
-    client = get_client()
-    sheet  = client.open_by_key(SHEET_ID)
+def _read_sheet(tab: str) -> pd.DataFrame:
+    df = read_ws(SHEET_ID, tab)
+    return _norm_cols(df)
 
-    df_ej  = read_ws(sheet, TABS["EJ"],
-                     expected=["DELIVERY_MODEL","HOMOLOGACION_VEHICULO","Shps Dispatched","TOTAL_RUTAS"],
-                     any_keys=["SVC","Fecha","Año de DATE","DELIVERY_MODEL"])
-    df_srm = read_ws(sheet, TABS["SRM"], expected=["MLP","Region","SVC"], any_keys=["MLP","SVC"])
-    df_fc  = read_ws(sheet, TABS["FCST"], expected=["SVC"], any_keys=["SVC"])
-    return sheet, df_ej, df_srm, df_fc
+# ------------- READ TABS -------------
+def load_fcst() -> pd.DataFrame:
+    df = _read_sheet("FCST")
+    # columnas esperadas: svc, fecha, shipments
+    need = {"svc","fecha","shipments"}
+    miss = need - set(df.columns)
+    if miss:
+        raise ValueError(f"FCST: faltan columnas {miss}")
+    df["shipments"] = pd.to_numeric(df["shipments"], errors="coerce").fillna(0).astype(float)
+    return df[["svc","fecha","shipments"]]
 
-sheet, df_ej, df_srm, df_fc = load_all()
+def load_spr_real() -> pd.DataFrame:
+    df = _read_sheet("SPR")
+    # admite encabezados: FECHA, SVC, SPR (+vehículo se promedia por día/SVC)
+    need = {"fecha","svc","spr"}
+    miss = need - set(df.columns)
+    if miss:
+        raise ValueError(f"SPR: faltan columnas {miss}")
+    day = (df.groupby(["fecha","svc"], as_index=False)["spr"].mean()
+             .rename(columns={"spr":"spr_exec"}))
+    day["dow"] = day["fecha"].apply(_weekday)
+    iso = day["fecha"].apply(lambda d: pd.Timestamp(d).isocalendar())
+    day["iso_year"] = [int(x.year) for x in iso]
+    day["iso_week"] = [int(x.week) for x in iso]
+    return day
 
-# --------------------- Normalización de ejecución ---------------------
-if "DELIVERY_MODEL" not in df_ej.columns:
-    for alt in ["DELIVERY_MODEL 1","Delivery Model","DELIVERY MODEL"]:
-        if alt in df_ej.columns: df_ej["DELIVERY_MODEL"]=df_ej[alt]; break
-if "SVC" not in df_ej.columns:
-    for alt in ["Estación","Estacion"]:
-        if alt in df_ej.columns: df_ej["SVC"]=df_ej[alt]; break
-for c in ["Shps Dispatched","TOTAL_RUTAS"]:
-    if c in df_ej.columns: df_ej[c]=pd.to_numeric(df_ej[c], errors="coerce")
+def load_capacity() -> pd.DataFrame:
+    df = _read_sheet("Capacity")
+    # columnas: delivery model, tipo (Routes/Shipments/SPR), svc, tipo dm, fecha, cantidad
+    need = {"delivery model","tipo","svc","fecha","cantidad"}
+    miss = need - set(df.columns)
+    if miss:
+        raise ValueError(f"Capacity: faltan columnas {miss}")
+    df["cantidad"] = pd.to_numeric(df["cantidad"], errors="coerce").fillna(0).astype(float)
+    return df
 
-_fecha = None
-for cand in ["DATE","Fecha","FECHA","Date"]:
-    if cand in df_ej.columns:
-        _fecha = pd.to_datetime(df_ej[cand], errors="coerce"); break
-if _fecha is None and {"Año de DATE","Mes de DATE","Día de DATE"}.issubset(df_ej.columns):
-    mes_map = {"enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
-               "julio":7,"agosto":8,"septiembre":9,"octubre":10,"noviembre":11,"diciembre":12}
-    month_series = df_ej["Mes de DATE"].map(mes_map).fillna(pd.to_numeric(df_ej["Mes de DATE"], errors="coerce"))
-    _fecha = pd.to_datetime(dict(
-        year=pd.to_numeric(df_ej["Año de DATE"], errors="coerce"),
-        month=pd.to_numeric(month_series, errors="coerce"),
-        day=pd.to_numeric(df_ej["Día de DATE"], errors="coerce")
-    ), errors="coerce")
+def load_srm() -> pd.DataFrame:
+    df = _read_sheet("SRM")
+    # buscamos SVC y columnas que contengan "Total SDD" y "Total SPOT"
+    svc_col = [c for c in df.columns if c in ("svc","svcs","svc ")]
+    if not svc_col:
+        raise ValueError("SRM: no se encontró columna SVC.")
+    svc_col = svc_col[0]
+    sdd_cols = [c for c in df.columns if "total" in c and "sdd" in c]
+    spot_cols = [c for c in df.columns if "total" in c and "spot" in c]
+    if not sdd_cols or not spot_cols:
+        raise ValueError("SRM: no se hallaron columnas 'Total SDD ...' y/o 'Total SPOT ...'")
+    out = df[[svc_col]+sdd_cols+spot_cols].copy()
+    out = out.rename(columns={svc_col:"svc"})
+    for c in sdd_cols+spot_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    out["sdd_routes_max"]  = out[sdd_cols].sum(axis=1)
+    out["spot_routes_max"] = out[spot_cols].sum(axis=1)
+    out = (out.groupby("svc", as_index=False)[["sdd_routes_max","spot_routes_max"]].sum())
+    return out
 
-df_ej["_fecha"] = _fecha
-df_ej = df_ej[df_ej["_fecha"].notna()].copy()
-df_ej["_dow"]   = df_ej["_fecha"].dt.weekday
+def load_rentals() -> pd.DataFrame:
+    df = _read_sheet("Rentals")
+    # columnas: svc o svcs, unidades disponibles
+    svc_col = "svc" if "svc" in df.columns else ("svcs" if "svcs" in df.columns else None)
+    if not svc_col or "unidades disponibles" not in df.columns:
+        raise ValueError("Rentals: se esperan columnas 'SVC/SVCs' y 'Unidades disponibles'.")
+    df["unidades disponibles"] = pd.to_numeric(df["unidades disponibles"], errors="coerce").fillna(0).astype(int)
+    out = df.groupby(svc_col, as_index=False)["unidades disponibles"].sum()
+    out = out.rename(columns={svc_col:"svc","unidades disponibles":"rentals_routes_max"})
+    return out
 
-# --------------------- SPR por DOW ---------------------
-df_ej["SPR_raw"] = df_ej["Shps Dispatched"] / df_ej["TOTAL_RUTAS"]
-df_ej["SPR_w"]   = df_ej["SPR_raw"]
-_w = df_ej.groupby(["DELIVERY_MODEL","HOMOLOGACION_VEHICULO","_dow"])["SPR_raw"].transform(
-    lambda s: winsor(s,0.05,0.95,10)
-)
-df_ej.loc[_w.notna(),"SPR_w"] = _w
+def load_crowd_caps() -> pd.DataFrame:
+    df = _read_sheet("Crowd")
+    # columnas parecidas a: 'svc', 'base entre sem', 'base sabado', 'base domingo',
+    # 'holgura entre sem', 'holgura sabado', 'holgura domingo'
+    if "svc" not in df.columns:
+        raise ValueError("Crowd: falta columna 'SVC'.")
+    def _pick(name_opts):
+        for n in df.columns:
+            for opt in name_opts:
+                if opt in n:
+                    return n
+        return None
+    c_base_wd = _pick(["base entre"])
+    c_base_sa = _pick(["base sab"])
+    c_base_su = _pick(["base domingo","base dom"])
+    c_e1_wd   = _pick(["holgura entre","e1 entre"])
+    c_e1_sa   = _pick(["holgura sab","e1 sab"])
+    c_e1_su   = _pick(["holgura domingo","e1 dom"])
 
-spr_dow = (df_ej.groupby(["DELIVERY_MODEL","HOMOLOGACION_VEHICULO","_dow"])["SPR_w"]
-           .mean().reset_index().rename(columns={"SPR_w":"SPR_dow"}))
-spr_dow_vt = (spr_dow.groupby(["HOMOLOGACION_VEHICULO","_dow"])["SPR_dow"]
-              .mean().reset_index().rename(columns={"SPR_dow":"SPR_dow_vt"}))
-spr_dow_global = (spr_dow.groupby(["_dow"])["SPR_dow"]
-                  .mean().reset_index().rename(columns={"SPR_dow":"SPR_dow_global"}))
-spr_global = float(df_ej["SPR_w"].mean()) if not df_ej.empty else 0.0
+    need_cols = [c_base_wd,c_base_sa,c_base_su,c_e1_wd,c_e1_sa,c_e1_su]
+    if any(c is None for c in need_cols):
+        raise ValueError("Crowd: no se encontraron columnas base/e1 esperadas (entre semana/sábado/domingo).")
 
-# --------------------- SRM capacidad (MLP) ---------------------
-veh_cols = [c for c in ["Extra Large Van","Large Van","Small Van","Car"] if c in df_srm.columns]
-df_srm_long = df_srm.melt(id_vars=["MLP","Region","SVC"], value_vars=veh_cols,
-                          var_name="HOMOLOGACION_VEHICULO", value_name="Rutas_MLP").fillna(0)
-df_srm_long["Rutas_MLP"] = pd.to_numeric(df_srm_long["Rutas_MLP"], errors="coerce").fillna(0)
-if not RUTAS_SRM_IS_DAILY:
-    df_srm_long["Rutas_MLP"] *= FACTOR_SRM_SEM_A_DIA
-mlp_capacity = df_srm_long.groupby(["SVC","HOMOLOGACION_VEHICULO"], as_index=False).agg(Rutas_MLP=("Rutas_MLP","sum"))
+    for c in need_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
 
-# --------------------- Rentals (promedio) ---------------------
-is_rent = df_ej["DELIVERY_MODEL"].astype(str).str.upper().str.contains("RENT")
-df_rent = df_ej[is_rent].copy()
-grp = ["SVC","HOMOLOGACION_VEHICULO"] if "SVC" in df_rent.columns else ["HOMOLOGACION_VEHICULO"]
-rent_rutas = df_rent.groupby(grp, dropna=False)["TOTAL_RUTAS"].mean().reset_index().rename(columns={"TOTAL_RUTAS":"Rutas_Rentals_avg"})
-if "SVC" not in rent_rutas.columns:
-    svcs = mlp_capacity["SVC"].dropna().unique().tolist()
-    rent_rutas = rent_rutas.assign(_k=1).merge(pd.DataFrame({"SVC":svcs,"_k":[1]*len(svcs)}), on="_k").drop(columns="_k")
-rentals_capacity = rent_rutas[["SVC","HOMOLOGACION_VEHICULO","Rutas_Rentals_avg"]].copy()
+    out = df[["svc", c_base_wd,c_base_sa,c_base_su,c_e1_wd,c_e1_sa,c_e1_su]].copy()
+    out = out.rename(columns={
+        c_base_wd:"base_wd", c_base_sa:"base_sa", c_base_su:"base_su",
+        c_e1_wd:"e1_wd", c_e1_sa:"e1_sa", c_e1_su:"e1_su",
+    })
+    return out
 
-# ============================================================
-# FCST SOLO FUTURO
-# ============================================================
-date_cols = [c for c in df_fc.columns if re.match(r"\d{1,2}\-\w{3}", str(c))]
-for c in date_cols: 
-    df_fc[c] = clean_num(df_fc[c])
-YEAR = int(df_ej["_fecha"].dt.year.max()) if not df_ej.empty else datetime.now().year
+# ------------- SPR SCENARIOS -------------
+def compute_spr_scenarios(fcst: pd.DataFrame, spr_real: pd.DataFrame, capacity: pd.DataFrame) -> pd.DataFrame:
+    target = fcst[["fecha","svc"]].drop_duplicates().copy()
+    target["dow"] = target["fecha"].apply(_weekday)
+    target["iso_year"] = target["fecha"].apply(lambda d: int(pd.Timestamp(d).isocalendar().year))
 
-df_fcst = df_fc.melt(
-    id_vars=["SVC"], value_vars=date_cols,
-    var_name="Fecha_txt", value_name="Shipments_FCST"
-).dropna(subset=["SVC"])
-df_fcst["Fecha"] = pd.to_datetime(
-    df_fcst["Fecha_txt"] + f"-{YEAR}", format="%d-%b-%Y", errors="coerce"
-)
-df_fcst = df_fcst[["SVC","Fecha","Shipments_FCST"]]
-TODAY = pd.Timestamp.today().normalize()
-df_fcst = df_fcst[df_fcst["Fecha"] >= TODAY].copy()
+    # SPR_promedio: últimas 4 semanas, MISMO DOW
+    spr_exec_map = spr_real.set_index(["fecha","svc"])["spr_exec"]
 
-fechas = sorted(df_fcst["Fecha"].dropna().unique())
-cal = pd.DataFrame({"Fecha": fechas})
-cal["_dow"] = cal["Fecha"].dt.weekday
+    def avg_last4(row):
+        d, s = row["fecha"], row["svc"]
+        vals = []
+        for k in [7,14,21,28]:
+            dk = d - timedelta(days=k)
+            v = spr_exec_map.get((dk,s), np.nan)
+            if pd.notna(v):
+                vals.append(float(v))
+        if not vals:
+            # fallback: últimos 28 días cualquier DOW
+            mask = (spr_real["svc"]==s) & (spr_real["fecha"].between(d - timedelta(days=28), d - timedelta(days=1)))
+            vals = list(spr_real.loc[mask,"spr_exec"])
+        return _safe_mean(vals)
 
-# ============================================================
-# Motor principal con overrides absolutos
-# ============================================================
-def run(params: dict):
-    scale_if_exceed = bool(params.get("escalar_si_excede_fcst", True))
-    f_mlp   = float(params.get("factor_escalado_mlp", 1.0))
-    f_rent  = float(params.get("factor_escalado_rentals", 1.0))
+    target["spr_promedio"] = target.apply(avg_last4, axis=1)
 
-    # --- MLP base ---
-    spr_mlp = spr_dow[spr_dow["DELIVERY_MODEL"]=="MLP"][["HOMOLOGACION_VEHICULO","_dow","SPR_dow"]]
-    mlp = mlp_capacity.assign(_k=1).merge(cal.assign(_k=1), on="_k").drop(columns="_k")
-    mlp = (mlp.merge(spr_mlp, on=["HOMOLOGACION_VEHICULO","_dow"], how="left")
-               .merge(spr_dow_vt, on=["HOMOLOGACION_VEHICULO","_dow"], how="left")
-               .merge(spr_dow_global, on=["_dow"], how="left"))
-    mlp["SPR_final"] = mlp["SPR_dow"].fillna(mlp["SPR_dow_vt"]).fillna(mlp["SPR_dow_global"]).fillna(spr_global)
-    mlp["Rutas_MLP_int"] = np.round(mlp["Rutas_MLP"] * f_mlp).clip(lower=0).astype(int)
-    mlp["OVR"] = False
+    # SPR_peak: semanas 20-22 del mismo año, MISMO DOW (fallback 19..23)
+    def avg_peak(row):
+        d, s, yr, dow = row["fecha"], row["svc"], row["iso_year"], row["dow"]
+        m = (spr_real["svc"].eq(s) & spr_real["iso_year"].eq(yr) &
+             spr_real["iso_week"].isin([20,21,22]) & spr_real["dow"].eq(dow))
+        vals = list(spr_real.loc[m,"spr_exec"])
+        if not vals:
+            m = (spr_real["svc"].eq(s) & spr_real["iso_year"].eq(yr) &
+                 spr_real["iso_week"].between(19,23) & spr_real["dow"].eq(dow))
+            vals = list(spr_real.loc[m,"spr_exec"])
+        return _safe_mean(vals)
 
-    # --- Rentals base ---
-    rent = rentals_capacity.assign(_k=1).merge(cal.assign(_k=1), on="_k").drop(columns="_k")
-    rent = (rent.merge(spr_dow_vt, on=["HOMOLOGACION_VEHICULO","_dow"], how="left")
-               .merge(spr_dow_global, on=["_dow"], how="left"))
-    rent["SPR_final"] = rent["SPR_dow_vt"].fillna(rent["SPR_dow_global"]).fillna(spr_global)
-    rent["Rutas_Rentals_int"] = np.round(rent["Rutas_Rentals_avg"] * f_rent).clip(lower=0).astype(int)
-    rent["OVR"] = False
+    target["spr_peak"] = target.apply(avg_peak, axis=1)
 
-    # ===== Overrides: absolutos con bandera =====
-    ov = st.session_state.get("overrides", {"mlp":{}, "rentals":{}})
+    # SPR_plan desde Capacity (Tipo == 'SPR')
+    cap = capacity.copy()
+    m_spr = cap["tipo"].str.strip().str.lower().eq("spr")
+    spr_plan = cap.loc[m_spr, ["svc","fecha","cantidad"]].rename(columns={"cantidad":"spr_plan"})
+    if spr_plan.empty:
+        # si no hay por fecha, intenta por SVC (promedio)
+        spr_by_svc = cap.loc[m_spr].groupby("svc", as_index=False)["cantidad"].mean().rename(columns={"cantidad":"spr_plan"})
+        spr_plan = target[["fecha","svc"]].merge(spr_by_svc, on="svc", how="left")
+    target = target.merge(spr_plan, on=["fecha","svc"], how="left")
 
-    # MLP GLOBAL
-    if "GLOBAL" in ov["mlp"]:
-        mlp["Rutas_MLP_int"] = int(ov["mlp"]["GLOBAL"]); mlp["OVR"] = True
-    # MLP por SVC
-    for svc_k, rutas_k in ov["mlp"].items():
-        if svc_k == "GLOBAL": continue
-        mask = mlp["SVC"].astype(str).str.upper().eq(str(svc_k).upper())
-        mlp.loc[mask, "Rutas_MLP_int"] = int(rutas_k); mlp.loc[mask, "OVR"] = True
+    return target[["fecha","svc","spr_promedio","spr_peak","spr_plan"]]
 
-    # Rentals GLOBAL
-    if "GLOBAL" in ov["rentals"]:
-        rent["Rutas_Rentals_int"] = int(ov["rentals"]["GLOBAL"]); rent["OVR"] = True
-    # Rentals por SVC
-    for svc_k, rutas_k in ov["rentals"].items():
-        if svc_k == "GLOBAL": continue
-        mask = rent["SVC"].astype(str).str.upper().eq(str(svc_k).upper())
-        rent.loc[mask, "Rutas_Rentals_int"] = int(rutas_k); rent.loc[mask, "OVR"] = True
+# ------------- SHARE CROWD (desde Capacity → Shipments) -------------
+def compute_crowd_share(capacity: pd.DataFrame) -> pd.DataFrame:
+    cap = capacity.copy()
+    cap["tipo"] = cap["tipo"].str.strip().str.lower()
+    cap["delivery model"] = cap["delivery model"].str.strip().str.lower()
 
-    # Shipments
-    mlp["Shipments_MLP"]      = mlp["Rutas_MLP_int"]      * mlp["SPR_final"]
-    rent["Shipments_Rentals"] = rent["Rutas_Rentals_int"] * rent["SPR_final"]
+    m_ship = cap["tipo"].eq("shipments")
+    ship = cap.loc[m_ship, ["fecha","svc","delivery model","cantidad"]].copy()
 
-    # --- Crowd SPR
-    crowd = cal.merge(
-        spr_dow_vt[spr_dow_vt["HOMOLOGACION_VEHICULO"]==CROWD_VT][["_dow","SPR_dow_vt"]],
-        on="_dow", how="left"
-    ).merge(spr_dow_global, on="_dow", how="left")
-    crowd["SPR_Crowd"] = crowd["SPR_dow_vt"].fillna(crowd["SPR_dow_global"]).fillna(spr_global)
+    tot = ship.groupby(["fecha","svc"], as_index=False)["cantidad"].sum().rename(columns={"cantidad":"ship_total"})
+    crw = ship.loc[ship["delivery model"].eq("crowd")].groupby(["fecha","svc"], as_index=False)["cantidad"].sum().rename(columns={"cantidad":"ship_crowd"})
 
-    fcst = df_fcst.copy()
+    out = tot.merge(crw, on=["fecha","svc"], how="left").fillna({"ship_crowd":0.0})
+    out["share_crowd_obj"] = np.where(out["ship_total"]>0, (out["ship_crowd"]/out["ship_total"]).clip(0,1), 0.0)
+    return out[["fecha","svc","share_crowd_obj","ship_total","ship_crowd"]]
 
-    # --- Detalle base
-    det_mlp = (mlp.rename(columns={"Rutas_MLP_int":"Rutas","SPR_final":"SPR","Shipments_MLP":"Shipments"})
-                  .assign(Modelo="MLP")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments","OVR"]])
-    det_rent= (rent.rename(columns={"Rutas_Rentals_int":"Rutas","SPR_final":"SPR","Shipments_Rentals":"Shipments"})
-                  .assign(Modelo="Rentals")[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments","OVR"]])
-    det_crowd = fcst[["SVC","Fecha"]].drop_duplicates().merge(crowd[["Fecha","SPR_Crowd"]], on="Fecha", how="left")
-    det_crowd["HOMOLOGACION_VEHICULO"] = f"Crowd ({CROWD_VT})"
-    det_crowd["Modelo"] = "Crowd"
-    det_crowd["Rutas"] = 0
-    det_crowd["SPR"] = det_crowd["SPR_Crowd"]
-    det_crowd["Shipments"] = 0.0
-    det_crowd["OVR"] = False
-    det_crowd = det_crowd[["SVC","Fecha","HOMOLOGACION_VEHICULO","Modelo","Rutas","SPR","Shipments","OVR"]]
-
-    det = pd.concat([det_mlp, det_rent, det_crowd], ignore_index=True)
-
-    # --- Ajuste vs FCST (NO tocar OVR=True)
-    def ajustar(gr):
-        svc, fecha = gr.name
-        fc = float(fcst[(fcst.SVC==svc)&(fcst.Fecha==fecha)]["Shipments_FCST"].sum())
-        m = gr["Modelo"].eq("MLP"); r = gr["Modelo"].eq("Rentals"); c = gr["Modelo"].eq("Crowd")
-        base = gr.loc[m|r,"Shipments"].sum()
-
-        # Reducir si excede: sólo en filas NO OVR
-        if scale_if_exceed and base > fc:
-            exceso = base - fc
-            reducible = gr.loc[(m|r) & (~gr["OVR"]), "Shipments"].sum()
-            if reducible > 0:
-                f = max((reducible - exceso)/reducible, 0.0)
-                idx = ((m|r) & (~gr["OVR"]))
-                gr.loc[idx, "Rutas"] = np.round(gr.loc[idx,"Rutas"]*f).clip(lower=0).astype(int)
-                gr.loc[idx, "Shipments"] = gr.loc[idx,"Rutas"] * gr.loc[idx,"SPR"]
-                gr.loc[c, ["Rutas","Shipments"]] = (0,0.0)
-                return gr
-            # si todo es OVR → respetar, Crowd 0
-            gr.loc[c, ["Rutas","Shipments"]] = (0,0.0)
-            return gr
-
-        # Si falta: Crowd cierra gap
-        gap = max(fc - base, 0.0)
-        spr_c = float(gr.loc[c,"SPR"].iloc[0]) if gr.loc[c,"SPR"].notna().any() else 0.0
-        if gap>0 and spr_c>0:
-            rr = int(np.round(gap/spr_c))
-            gr.loc[c,"Rutas"] = rr
-            gr.loc[c,"Shipments"] = rr*spr_c
+# ------------- CROWD CAP POR DÍA -------------
+def map_crowd_capacity_by_date(target_days: pd.DataFrame, crowd_caps: pd.DataFrame) -> pd.DataFrame:
+    # target_days: FECHA×SVC
+    def cap_for(row):
+        s, d = row["svc"], row["fecha"]
+        dow = _weekday(d)  # 0-4 wd, 5 sab, 6 dom
+        r = crowd_caps.loc[crowd_caps["svc"]==s]
+        if r.empty:
+            return pd.Series({"crowd_base_routes":0,"crowd_e1_routes":0})
+        r = r.iloc[0]
+        if dow <= 4:
+            base, e1 = r["base_wd"], r["e1_wd"]
+        elif dow == 5:
+            base, e1 = r["base_sa"], r["e1_sa"]
         else:
-            gr.loc[c, ["Rutas","Shipments"]] = (0,0.0)
-        return gr
+            base, e1 = r["base_su"], r["e1_su"]
+        return pd.Series({"crowd_base_routes":int(base), "crowd_e1_routes":int(e1)})
 
-    det = det.groupby(["SVC","Fecha"], group_keys=False).apply(ajustar)
+    tmp = target_days.apply(cap_for, axis=1)
+    return pd.concat([target_days.reset_index(drop=True), tmp], axis=1)
 
-    # --- Resumen
-    g = det.groupby(["SVC","Fecha","Modelo"], as_index=False).agg(Rutas=("Rutas","sum"),
-                                                                  Shipments=("Shipments","sum"))
-    mlp_s = g[g["Modelo"]=="MLP"][["SVC","Fecha","Rutas","Shipments"]].rename(columns={"Rutas":"Rutas_MLP","Shipments":"Shipments_MLP"})
-    ren_s = g[g["Modelo"]=="Rentals"][["SVC","Fecha","Rutas","Shipments"]].rename(columns={"Rutas":"Rutas_Rentals","Shipments":"Shipments_Rentals"})
-    crw_s = g[g["Modelo"]=="Crowd"][["SVC","Fecha","Rutas","Shipments"]].rename(columns={"Rutas":"Rutas_Crowd","Shipments":"Shipments_Crowd"})
-    res = (mlp_s.merge(ren_s,on=["SVC","Fecha"],how="outer")
-               .merge(crw_s,on=["SVC","Fecha"],how="outer")).fillna(0)
-    res = res.merge(df_fcst, on=["SVC","Fecha"], how="left")
-    res["Shipments_Totales"] = res["Shipments_MLP"]+res["Shipments_Rentals"]+res["Shipments_Crowd"]
-    res["Dif_vs_FCST"] = res["Shipments_Totales"] - res["Shipments_FCST"]
-    return res, det
+# ------------- SCHEDULER MLP DESCANSOS -------------
+def schedule_mlp_rest(df_day: pd.DataFrame) -> pd.DataFrame:
+    # df_day: FECHA,SVC,routes_mlp_need,sdd_routes_max,spot_routes_max
+    out = df_day.copy()
+    out["week_key"] = out["fecha"].apply(lambda d: f"{_iso_yr_week(d)[0]}-{_iso_yr_week(d)[1]:02d}")
+    out["sdd_trabaja"]  = 1
+    out["spot_trabaja"] = 1
 
-# Primera corrida
-if "plan_res" not in st.session_state or "plan_det" not in st.session_state:
-    st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
+    def proc(g):
+        n = len(g)
+        need_days = int((g["routes_mlp_need"]>0).sum())
+        # SDD: 6x7 pero no más que días con necesidad
+        work_sdd = min(6, need_days)
+        rest_sdd = max(n - work_sdd, 0)
+        # Spot: 5x7; si hay déficit en ≥6 días, subir a 6x7; si hay <5 días con necesidad, trabajar solo esos
+        work_spot = 5
+        if need_days >= 6:
+            work_spot = 6
+        elif need_days < 5:
+            work_spot = need_days
+        rest_spot = max(n - work_spot, 0)
 
-# ============================================================
-# UI — Encabezado
-# ============================================================
-def _pick_logo():
-    prefer = ["mel-ia-ops.png","Mel-IA Ops.png","mel-ia-ops.jpg","assets/mel-ia-ops.png"]
-    for p in prefer:
-        if os.path.exists(p): return p
-    pngs = glob.glob("*.png") + glob.glob("assets/*.png")
-    if pngs:
-        pngs.sort(key=lambda p: os.path.getsize(p), reverse=True)
-        return pngs[0]
-    return None
+        # asigna descansos a días con menor necesidad
+        g_sorted = g.sort_values(["routes_mlp_need","fecha"], ascending=[True,True])
+        if rest_sdd > 0:
+            idx = g_sorted.head(rest_sdd).index
+            g.loc[idx,"sdd_trabaja"] = 0
+        # Recalcula orden para Spot (levemente desalineado si hay empates)
+        g_sorted2 = g.sort_values(["routes_mlp_need","fecha"], ascending=[True,True])
+        if rest_spot > 0:
+            idx2 = g_sorted2.head(rest_spot).index
+            g.loc[idx2,"spot_trabaja"] = 0
+        return g
 
-with st.container():
-    col_logo, col_title = st.columns([1,4])
-    with col_logo:
-        lp = _pick_logo()
-        if lp: st.image(lp, use_container_width=True)
-    with col_title:
-        st.markdown("## **Mel-IA Ops — Copiloto de Planeación de Flota (Jarvis)**")
+    out = out.groupby(["svc","week_key"], group_keys=False).apply(proc)
+    return out.drop(columns=["week_key"])
 
-# ============================================================
-# Panel Izquierdo — Jarvis (cambia el plan)
-# ============================================================
-with st.sidebar.expander("🧠 Jarvis — Instrucciones en español", expanded=True):
-    st.caption("**CAMBIA** el plan. Ej.: `rentals=100`, `pon mlp 80 en SPB1`, `apaga escalar_si_excede_fcst`, `crowd needed`, `quita override de rentals en SPB2`.")
-    instr = st.text_input("Instrucción", placeholder="Ej: ajusta rentals a 50")
-    openai_ok = "✅" if _HAS_OPENAI else "⚪️"
-    st.markdown(f"OpenAI: {openai_ok} conectado")
+# ------------- MOTOR PRINCIPAL -------------
+def compute_plan(spr_mode: str):
+    # Carga
+    fcst       = load_fcst()
+    spr_real   = load_spr_real()
+    capacity   = load_capacity()
+    srm        = load_srm()
+    rentals    = load_rentals()
+    crowd_caps = load_crowd_caps()
 
-    see_params = st.checkbox("Ver params", value=False)
-    if see_params: st.json(st.session_state["params"])
+    # SPRs
+    spr_tbl = compute_spr_scenarios(fcst, spr_real, capacity)
+    spr_col = {"promedio":"spr_promedio","peak":"spr_peak","plan":"spr_plan"}[spr_mode]
 
-    see_over = st.checkbox("Ver overrides", value=False)
-    if see_over: st.json(st.session_state["overrides"])
+    # Share crowd objetivo desde Capacity (Shipments)
+    share_tbl = compute_crowd_share(capacity)
 
-    def apply_instruction(txt: str):
-        txt = (txt or "").strip().lower()
-        if not txt: return "Sin instrucción."
-        ov = st.session_state["overrides"]
+    # CROWD caps por día
+    target_days = fcst[["fecha","svc"]].drop_duplicates()
+    crowd_daily = map_crowd_capacity_by_date(target_days, crowd_caps)
 
-        # encendido/apagado del escalar
-        if "apaga escalar_si_excede_fcst" in txt or "apaga escalar" in txt:
-            st.session_state["params"]["escalar_si_excede_fcst"] = False
-            return "OK: apagué `escalar_si_excede_fcst`."
-        if "prende escalar_si_excede_fcst" in txt or "activa escalar" in txt or "enciende escalar" in txt:
-            st.session_state["params"]["escalar_si_excede_fcst"] = True
-            return "OK: prendí `escalar_si_excede_fcst`."
+    # Merge base
+    df = (fcst
+          .merge(share_tbl, on=["fecha","svc"], how="left")
+          .merge(crowd_daily, on=["fecha","svc"], how="left")
+          .merge(srm, on="svc", how="left")
+          .merge(rentals, on="svc", how="left")
+          .merge(spr_tbl[["fecha","svc",spr_col]], on=["fecha","svc"], how="left")
+         )
 
-        # reset overrides
-        if "reset overrides" in txt or "borra overrides" in txt or "quita overrides" in txt:
-            st.session_state["overrides"] = {"mlp":{}, "rentals":{}}
-            return "OK: limpié todos los overrides."
+    # Limpieza/nulos
+    for c in ["share_crowd_obj","crowd_base_routes","crowd_e1_routes","sdd_routes_max","spot_routes_max","rentals_routes_max"]:
+        df[c] = pd.to_numeric(df.get(c,0), errors="coerce").fillna(0)
+    df["spr_objetivo"] = pd.to_numeric(df[spr_col], errors="coerce")
+    df.drop(columns=[spr_col], inplace=True)
 
-        # crowd needed (consulta rápida)
-        if "crowd needed" in txt:
-            tot = int(st.session_state.plan_res["Rutas_Crowd"].sum())
-            return f"Rutas Crowd necesarias totales: **{tot}**."
+    # Remanente (por ahora no se descuenta DC/SP explícito)
+    df["q_rem"] = df["shipments"].clip(lower=0)
 
-        # global rentals=NUM  /  mlp=NUM
-        m = re.search(r"\brentals\s*=\s*(\d+)", txt)
-        if m:
-            ov["rentals"]["GLOBAL"] = int(m.group(1))
-            st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
-            return f"OK: rentals GLOBAL → {m.group(1)}."
-        m = re.search(r"\bmlp\s*=\s*(\d+)", txt)
-        if m:
-            ov["mlp"]["GLOBAL"] = int(m.group(1))
-            st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
-            return f"OK: mlp GLOBAL → {m.group(1)}."
-
-        # pon mlp NUM en SVC
-        m = re.search(r"pon\s+mlp\s+(\d+)\s+en\s+([a-z0-9\-]+)", txt)
-        if m:
-            rutas, svc = int(m.group(1)), m.group(2).upper()
-            ov["mlp"][svc] = rutas
-            st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
-            return f"OK: mlp en {svc} → {rutas}."
-
-        # pon rentals NUM en SVC
-        m = re.search(r"pon\s+rentals\s+(\d+)\s+en\s+([a-z0-9\-]+)", txt)
-        if m:
-            rutas, svc = int(m.group(1)), m.group(2).upper()
-            ov["rentals"][svc] = rutas
-            st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
-            return f"OK: rentals en {svc} → {rutas}."
-
-        # ajusta rentals a NUM (GLOBAL absoluto)
-        m = re.search(r"ajusta\s+rentals\s+a\s+(\d+)", txt)
-        if m:
-            rutas = int(m.group(1))
-            ov["rentals"]["GLOBAL"] = rutas
-            st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
-            return f"OK: rentals GLOBAL → {rutas}."
-
-        # quita override de rentals en SVC
-        m = re.search(r"quita\s+override\s+de\s+rentals\s+en\s+([a-z0-9\-]+)", txt)
-        if m:
-            svc = m.group(1).upper()
-            ov["rentals"].pop(svc, None)
-            st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
-            return f"OK: quité override de rentals en {svc}."
-
-        # quita override de mlp en SVC
-        m = re.search(r"quita\s+override\s+de\s+mlp\s+en\s+([a-z0-9\-]+)", txt)
-        if m:
-            svc = m.group(1).upper()
-            ov["mlp"].pop(svc, None)
-            st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
-            return f"OK: quité override de mlp en {svc}."
-
-        return "(Ignorado) Acción no soportada."
-
-    if st.button("Ejecutar instrucción"):
-        msg = apply_instruction(instr)
-        st.info(msg)
-
-# ============================================================
-# Panel rápido de parámetros
-# ============================================================
-with st.sidebar:
-    st.subheader("Parámetros rápidos")
-    val = st.checkbox("Escalar MLP/Rentals si exceden el FCST",
-                      value=st.session_state["params"]["escalar_si_excede_fcst"])
-    st.session_state["params"]["escalar_si_excede_fcst"] = bool(val)
-    st.caption(f"Sheet ID: {SHEET_ID}")
-
-# ============================================================
-# UI Principal — Resumen/Detalle (solo futuro)
-# ============================================================
-st.subheader("Resumen (incluye Shipments_FCST) — Solo futuro")
-cols_pref = [
-    "SVC","Fecha",
-    "Rutas_MLP","Rutas_Rentals","Rutas_Crowd",
-    "Shipments_MLP","Shipments_Rentals","Shipments_Crowd",
-    "Shipments_Totales","Shipments_FCST","Dif_vs_FCST"
-]
-res_view = st.session_state.plan_res.copy()
-res_view = res_view[[c for c in cols_pref if c in res_view.columns]]
-
-col1, col2 = st.columns([2,1])
-with col1:
-    st.dataframe(
-        res_view.sort_values(["SVC","Fecha"]).reset_index(drop=True),
-        use_container_width=True
+    # Rutas requeridas
+    df["routes_need_total"] = np.where(
+        (df["q_rem"]>0) & (df["spr_objetivo"]>0),
+        np.ceil(df["q_rem"]/df["spr_objetivo"]).astype(int),
+        0
     )
-with col2:
-    st.metric("Max |Dif_vs_FCST|", f"{st.session_state.plan_res['Dif_vs_FCST'].abs().max():,.0f}")
-    if st.button("🔁 Recalcular"):
-        st.session_state.plan_res, st.session_state.plan_det = run(st.session_state["params"])
-        st.rerun()
+    df["alerta_spr_missing"] = ((df["q_rem"]>0) & (df["spr_objetivo"].isna() | (df["spr_objetivo"]<=0)))
 
-st.subheader("Detalle (Solo futuro)")
-st.dataframe(
-    st.session_state.plan_det.sort_values(["SVC","Fecha","Modelo","HOMOLOGACION_VEHICULO"]).reset_index(drop=True),
-    use_container_width=True, height=380
-)
+    # Target Crowd
+    df["routes_crowd_target"] = np.ceil(df["routes_need_total"] * df["share_crowd_obj"]).astype(int)
+    # Asignación Crowd base y E1 (high cost)
+    df["routes_crowd_base"] = np.minimum(df["routes_crowd_target"], df["crowd_base_routes"]).astype(int)
+    df["routes_crowd_e1"] = np.minimum(
+        (df["routes_crowd_target"] - df["routes_crowd_base"]).clip(lower=0),
+        df["crowd_e1_routes"]
+    ).astype(int)
+    df["routes_crowd_alloc"] = df["routes_crowd_base"] + df["routes_crowd_e1"]
+    df["alerta_crowd_high"] = df["routes_crowd_e1"] > 0
 
-# ============================================================
-# Escribir al Google Sheet
-# ============================================================
-st.subheader("📝 Escribir al Google Sheet")
-if st.button("Escribir 'Plan_14_resumen' y 'Plan_14_detalle'"):
-    try:
-        write_ws(get_client().open_by_key(SHEET_ID), TABS["OUT_RES"],
-                 st.session_state.plan_res.sort_values(["SVC","Fecha"]))
-        write_ws(get_client().open_by_key(SHEET_ID), TABS["OUT_DET"],
-                 st.session_state.plan_det.sort_values(["SVC","Fecha","Modelo","HOMOLOGACION_VEHICULO"]))
-        st.success("¡Listo! Se actualizaron las pestañas.")
-    except Exception as e:
-        st.error(f"No se pudo escribir: {e}")
+    # Rentals directo (rutas fijas)
+    df["routes_after_crowd"] = (df["routes_need_total"] - df["routes_crowd_alloc"]).clip(lower=0).astype(int)
+    df["routes_rentals_alloc"] = np.minimum(df["routes_after_crowd"], df["rentals_routes_max"]).astype(int)
 
-# ============================================================
-# Chat — Consultas (NO cambia plan). Si hay OpenAI, usa IA.
-# ============================================================
-st.subheader("💬 Chat (CONSULTAS). Para CAMBIOS usa Jarvis a la izquierda.")
-if "chat" not in st.session_state: st.session_state.chat = []
-for role, msg in st.session_state.chat:
-    with st.chat_message(role): st.markdown(msg)
+    # Necesidad para MLP
+    df["routes_mlp_need"] = (df["routes_after_crowd"] - df["routes_rentals_alloc"]).clip(lower=0).astype(int)
 
-q = st.chat_input("Ej: ‘resumen svc SPB1’ · ‘para fecha 2025-08-10’ · ‘totales por modelo’ · ‘¿mayor Dif_vs_FCST?’")
+    # Descansos MLP por semana y SVC
+    rest_base = df[["fecha","svc","routes_mlp_need","sdd_routes_max","spot_routes_max"]]
+    rest_sched = schedule_mlp_rest(rest_base)
+    df = df.merge(rest_sched[["fecha","svc","sdd_trabaja","spot_trabaja"]], on=["fecha","svc"], how="left")
+    df["routes_mlp_cap_day"] = (df["sdd_routes_max"]*df["sdd_trabaja"] + df["spot_routes_max"]*df["spot_trabaja"]).fillna(0).astype(int)
+    df["routes_mlp_alloc"] = np.minimum(df["routes_mlp_need"], df["routes_mlp_cap_day"]).astype(int)
 
-def _nl_answer(question: str) -> str:
-    txt = (question or "").lower()
-    plan_res = st.session_state.plan_res
-    plan_det = st.session_state.plan_det
-    try:
-        # Preguntas rápidas sin IA
-        if "mayor dif" in txt or "max" in txt:
-            row = plan_res.loc[plan_res["Dif_vs_FCST"].abs().idxmax()]
-            return (f"El máximo |Dif_vs_FCST| es **{abs(row['Dif_vs_FCST']):,.0f}** en "
-                    f"**{row['SVC']}** el **{pd.to_datetime(row['Fecha']).date()}**.")
-        if "resumen" in txt and "svc" in txt:
-            svcs = sorted(plan_res["SVC"].dropna().unique().tolist(), key=len, reverse=True)
-            svc = next((s for s in svcs if s.lower() in txt), None)
-            if svc:
-                df = (plan_res[plan_res["SVC"]==svc]
-                      .sort_values("Fecha")[["Fecha","Rutas_MLP","Rutas_Rentals",
-                                             "Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]]
-                      .head(30))
-                st.dataframe(df, use_container_width=True)
-                return f"Te mostré el resumen de **{svc}** (próximas fechas)."
-            return "Dime el SVC exacto (ej. SPB1, SPB2…)."
-        if "totales por modelo" in txt:
-            df = (plan_det.groupby("Modelo")["Rutas"].sum().reset_index())
-            st.dataframe(df, use_container_width=True)
-            return "Totales de rutas por modelo (futuro)."
-        if "para fecha" in txt or "el día" in txt:
-            m = re.search(r"(20\d{2}-\d{2}-\d{2})", txt)
-            if m:
-                fecha = pd.to_datetime(m.group(1))
-                df = plan_res[plan_res["Fecha"]==fecha][["SVC","Rutas_MLP","Rutas_Rentals","Rutas_Crowd","Shipments_Totales","Shipments_FCST","Dif_vs_FCST"]]
-                if not df.empty:
-                    st.dataframe(df.sort_values("SVC"), use_container_width=True)
-                    return f"Resumen para **{fecha.date()}**."
-                return "No encontré esa fecha en el plan."
+    # Déficit + Shipments logrados
+    df["routes_deficit"] = (df["routes_mlp_need"] - df["routes_mlp_alloc"]).clip(lower=0).astype(int)
+    df["routes_total_alloc"] = (df["routes_crowd_alloc"] + df["routes_rentals_alloc"] + df["routes_mlp_alloc"]).astype(int)
+    df["shipments_plan"] = np.where(
+        df["spr_objetivo"]>0,
+        df["routes_total_alloc"] * df["spr_objetivo"],
+        0.0
+    )
+    df["alerta_deficit"] = df["shipments_plan"] + 1e-6 < df["shipments"]
 
-        # Con IA (opcional)
-        if _HAS_OPENAI:
-            def _safe_preview(df, n=8):
-                d = df.head(n).copy()
-                for c in d.columns:
-                    if str(d[c].dtype).startswith("datetime") or "datetime64" in str(d[c].dtype):
-                        d[c] = pd.to_datetime(d[c], errors="coerce").dt.strftime("%Y-%m-%d")
-                return d.astype(object).where(pd.notnull(d), None).to_dict(orient="records")
+    # Métricas
+    df["spr_logrado"] = np.where(
+        df["routes_total_alloc"]>0,
+        df["q_rem"] / df["routes_total_alloc"],
+        np.nan
+    )
+    df["share_crowd_real"] = np.where(
+        df["routes_need_total"]>0,
+        df["routes_crowd_alloc"] / df["routes_need_total"],
+        0.0
+    )
+    df["risk_flag"] = df["alerta_deficit"] | df["alerta_spr_missing"]
 
-            schema = {
-                "plan_res_columns": list(plan_res.columns),
-                "plan_det_columns": list(plan_det.columns),
-                "ejemplo_plan_res": _safe_preview(plan_res, 8),
-                "ejemplo_plan_det": _safe_preview(plan_det, 8),
-            }
+    cols = [
+        "fecha","svc","shipments","spr_objetivo",
+        "q_rem","routes_need_total",
+        "share_crowd_obj","routes_crowd_target","routes_crowd_base","routes_crowd_e1","routes_crowd_alloc","alerta_crowd_high",
+        "rentals_routes_max","routes_rentals_alloc",
+        "sdd_routes_max","spot_routes_max","sdd_trabaja","spot_trabaja","routes_mlp_need","routes_mlp_cap_day","routes_mlp_alloc",
+        "routes_deficit","routes_total_alloc","shipments_plan","spr_logrado","share_crowd_real",
+        "alerta_spr_missing","alerta_deficit","risk_flag"
+    ]
+    return df[cols].sort_values(["fecha","svc"])
 
-            resp = _client.responses.create(
-                model="gpt-4o-mini",
-                input=[
-                    {"role":"system","content":"Eres analista de planeación. Responde conciso y pide SVC/fecha si falta."},
-                    {"role":"user","content": f"Pregunta: {question}\nContexto (muestra de datos, solo futuro):\n{json.dumps(schema, default=str)[:8000]}"},
-                ],
-            )
-            return resp.output_text
-        else:
-            return "Este chat es para **CONSULTAS**. Para **CAMBIOS** usa Jarvis a la izquierda."
-    except Exception as e:
-        return f"Ocurrió un error respondiendo: {e}"
+# ------------- UI -------------
+with st.sidebar:
+    st.header("⚙️ Proyecto")
+    st.write(f"**Sheet:** `{SHEET_ID}`")
+    st.subheader("🔐 Credenciales")
+    svc_email = get_service_account_email()
+    if svc_email:
+        st.caption("Comparte el Sheet con:")
+        st.code(svc_email, language="text")
+    else:
+        st.warning("No se detectó Service Account.")
 
-if q:
-    st.session_state.chat.append(("user", q))
-    ans = _nl_answer(q)
-    st.session_state.chat.append(("assistant", ans))
-    st.rerun()
+st.title("Mel-IA — Plan táctico (diario por SVC)")
+spr_mode = st.radio("SPR objetivo", ["promedio","peak","plan"], index=0, horizontal=True)
+
+try:
+    plan = compute_plan(spr_mode)
+    st.dataframe(plan, use_container_width=True, hide_index=True)
+
+    st.subheader("Riesgos por fecha")
+    resumen = (plan.groupby("fecha")
+               .agg(
+                   svcs_con_deficit=("alerta_deficit","sum"),
+                   rutas_deficit=("routes_deficit","sum"),
+                   svcs_sin_spr=("alerta_spr_missing","sum"),
+               ).reset_index())
+    st.dataframe(resumen, use_container_width=True, hide_index=True)
+
+except Exception as e:
+    st.error(f"Error: {e}")
+
+
 
