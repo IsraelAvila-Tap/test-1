@@ -112,24 +112,55 @@ def load_capacity() -> pd.DataFrame:
     return df
 
 def load_srm() -> pd.DataFrame:
-    df = _read_sheet("SRM")
-    # buscamos SVC y columnas que contengan "Total SDD" y "Total SPOT"
-    svc_col = [c for c in df.columns if c in ("svc","svcs","svc ")]
-    if not svc_col:
-        raise ValueError("SRM: no se encontró columna SVC.")
-    svc_col = svc_col[0]
-    sdd_cols = [c for c in df.columns if "total" in c and "sdd" in c]
-    spot_cols = [c for c in df.columns if "total" in c and "spot" in c]
-    if not sdd_cols or not spot_cols:
-        raise ValueError("SRM: no se hallaron columnas 'Total SDD ...' y/o 'Total SPOT ...'")
-    out = df[[svc_col]+sdd_cols+spot_cols].copy()
-    out = out.rename(columns={svc_col:"svc"})
-    for c in sdd_cols+spot_cols:
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
-    out["sdd_routes_max"]  = out[sdd_cols].sum(axis=1)
-    out["spot_routes_max"] = out[spot_cols].sum(axis=1)
-    out = (out.groupby("svc", as_index=False)[["sdd_routes_max","spot_routes_max"]].sum())
+    df = _read_sheet("SRM")  # ya viene con nombres en minúsculas y strip
+    if df.empty:
+        raise ValueError("SRM: hoja vacía.")
+
+    # 1) Detectar columna SVC por aproximación
+    svc_cols = [c for c in df.columns if "svc" in c.replace(" ", "")]
+    if not svc_cols:
+        # heurística: busca una columna con valores tipo "SPB1", "SCV1", "SAG1", etc.
+        import re
+        pat = re.compile(r"^[A-Za-z]{2,4}\d{1,2}$")
+        cand = []
+        for c in df.columns:
+            vals = df[c].astype(str).str.strip()
+            hit = (vals.str.len().between(3, 6) & vals.str.match(pat)).sum()
+            cand.append((hit, c))
+        cand.sort(reverse=True)
+        if cand and cand[0][0] >= 3:
+            svc_cols = [cand[0][1]]
+
+    if not svc_cols:
+        raise ValueError(f"SRM: no se encontró columna SVC. Encabezados detectados: {list(df.columns)}")
+
+    svc_col = svc_cols[0]
+
+    # 2) Columnas de capacidad SDD y SPOT (sumamos todas las que contengan esos tokens)
+    sdd_cols  = [c for c in df.columns if ("sdd"  in c)]
+    spot_cols = [c for c in df.columns if ("spot" in c)]
+    # intenta priorizar “total …”
+    sdd_total  = [c for c in sdd_cols  if "total" in c] or sdd_cols
+    spot_total = [c for c in spot_cols if "total" in c] or spot_cols
+
+    if not sdd_total and not spot_total:
+        raise ValueError(f"SRM: no se hallaron columnas con 'sdd' o 'spot'. Encabezados: {list(df.columns)}")
+
+    out = df[[svc_col] + list(set(sdd_total + spot_total))].copy()
+    out = out.rename(columns={svc_col: "svc"})
+
+    for c in out.columns:
+        if c != "svc":
+            out[c] = _to_num(out[c]).fillna(0)
+
+    out["sdd_routes_max"]  = out[[c for c in out.columns if c != "svc" and "sdd"  in c]].sum(axis=1)
+    out["spot_routes_max"] = out[[c for c in out.columns if c != "svc" and "spot" in c]].sum(axis=1)
+
+    out = (out.groupby("svc", as_index=False)[["sdd_routes_max", "spot_routes_max"]].sum())
+    # debug suave en UI
+    st.caption(f"SRM: usando columna SVC = '{svc_col}'. SDD cols: {len(sdd_total)} · SPOT cols: {len(spot_total)}")
     return out
+
 
 def load_rentals() -> pd.DataFrame:
     df = _read_sheet("Rentals")
