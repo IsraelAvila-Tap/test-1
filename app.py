@@ -77,6 +77,7 @@ def _read_sheet(tab: str) -> pd.DataFrame:
     return _norm_cols(df)
 
 # ------------- READ TABS -------------
+@st.cache_data(ttl=300)
 def load_fcst() -> pd.DataFrame:
     df = _read_sheet("FCST")
     # columnas esperadas: svc, fecha, shipments
@@ -87,6 +88,7 @@ def load_fcst() -> pd.DataFrame:
     df["shipments"] = pd.to_numeric(df["shipments"], errors="coerce").fillna(0).astype(float)
     return df[["svc","fecha","shipments"]]
 
+@st.cache_data(ttl=300)
 def load_spr_real() -> pd.DataFrame:
     df = _read_sheet("SPR")
     need = {"fecha","svc","spr"}
@@ -108,7 +110,7 @@ def load_spr_real() -> pd.DataFrame:
     day["iso_week"] = [int(x.week) for x in iso]
     return day
 
-
+@st.cache_data(ttl=300)
 def load_capacity() -> pd.DataFrame:
     df = _read_sheet("Capacity")
     # columnas: delivery model, tipo (Routes/Shipments/SPR), svc, tipo dm, fecha, cantidad
@@ -119,6 +121,7 @@ def load_capacity() -> pd.DataFrame:
     df["cantidad"] = _to_float0(df["cantidad"])
     return df
 
+@st.cache_data(ttl=300)
 def load_srm() -> pd.DataFrame:
     # Leemos SRM en crudo para ubicar el header real
     gc = _client()
@@ -218,7 +221,7 @@ def load_srm() -> pd.DataFrame:
     return out
 
 
-
+@st.cache_data(ttl=300)
 def load_rentals() -> pd.DataFrame:
     df = _read_sheet("Rentals")   # ya normaliza a minúsculas y hace strip
     if df.empty:
@@ -268,7 +271,7 @@ def load_rentals() -> pd.DataFrame:
     st.caption(f"Rentals: usando SVC='{svc_col}' · cantidad='{qty_col}'")
     return out
 
-
+@st.cache_data(ttl=300)
 def load_crowd_caps() -> pd.DataFrame:
     df = _read_sheet("Crowd")  # headers ya normalizados (minúsculas, strip)
     if df.empty:
@@ -498,13 +501,14 @@ def schedule_mlp_rest(df_day: pd.DataFrame) -> pd.DataFrame:
 
 # ------------- MOTOR PRINCIPAL -------------
 def compute_plan(spr_mode: str):
-    # Carga
-    fcst       = load_fcst()
-    spr_real   = load_spr_real()
-    capacity   = load_capacity()
-    srm        = load_srm()
-    rentals    = load_rentals()
-    crowd_caps = load_crowd_caps()
+    with st.status("Cargando datos...", expanded=True) as status:
+        st.write("1/6 FCST…");       fcst       = load_fcst()
+        st.write("2/6 SPR (real)…"); spr_real   = load_spr_real()
+        st.write("3/6 Capacity…");   capacity   = load_capacity()
+        st.write("4/6 SRM…");        srm        = load_srm()
+        st.write("5/6 Rentals…");    rentals    = load_rentals()
+        st.write("6/6 Crowd…");      crowd_caps = load_crowd_caps()
+        status.update(label="Datos listos ✅", state="complete")
 
     # SPRs
     spr_tbl = compute_spr_scenarios(fcst, spr_real, capacity)
