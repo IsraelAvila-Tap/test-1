@@ -1,6 +1,15 @@
-import os, streamlit as st
+import os, json, streamlit as st
+
+# Lee credenciales desde Secrets y las expone como variable de entorno
 if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
+    # Caso 1: secreto como string JSON en una sola línea (con \n en la private_key)
     os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
+elif "gcp_service_account" in st.secrets:
+    # Caso 2: secreto como bloque [gcp_service_account] (TOML)
+    # Lo convertimos a JSON válido para utils_gsheets
+    os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = json.dumps(dict(st.secrets["gcp_service_account"]))
+
+# (opcional) si guardaste PROJECT_KEY en Secrets
 if "PROJECT_KEY" in st.secrets:
     os.environ["PROJECT_KEY"] = st.secrets["PROJECT_KEY"]
 
