@@ -1,6 +1,11 @@
-import os, json 
+import os, json
+import yaml                       # <-- IMPORTANTE
+import pandas as pd               # súbelo antes de usar pd en _to_num
+import numpy as np
 import streamlit as st
-import pandas as pd
+from math import ceil
+from datetime import timedelta, datetime, date
+
 
 # Lee credenciales desde Secrets y las expone como variable de entorno
 if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
