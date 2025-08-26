@@ -39,10 +39,49 @@ def read_ws(sheet_id: str, tab: str) -> pd.DataFrame:
     gc = _client()
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab)
-    rows = ws.get_all_records()
-    df = pd.DataFrame(rows)
-    # normaliza fecha si existe
+
+    # Leemos todas las celdas (incluye filas vacías arriba)
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+
+    # 1) Detectar la fila de encabezados: primera con >=2 celdas no vacías
+    header_idx = 0
+    for i, row in enumerate(values[:50]):  # mira hasta las primeras 50 filas
+        nonempty = [c.strip() for c in row if c.strip() != ""]
+        if len(nonempty) >= 2:
+            header_idx = i
+            break
+
+    headers_raw = values[header_idx]
+
+    # 2) Sanear encabezados: reemplazar vacíos, evitar duplicados
+    seen = {}
+    headers = []
+    for j, h in enumerate(headers_raw):
+        base = (h or "").replace("\n", " ").strip()
+        if not base:
+            base = f"col_{j+1}"
+        name = base
+        k = 1
+        while name in seen:
+            k += 1
+            name = f"{base}_{k}"
+        seen[name] = True
+        headers.append(name)
+
+    # 3) Construir DataFrame
+    rows = values[header_idx + 1 : ]
+    df = pd.DataFrame(rows, columns=headers)
+
+    # 4) Quitar filas totalmente vacías
+    if not df.empty:
+        mask_empty = df.apply(lambda r: "".join(map(str, r.values)).strip() == "", axis=1)
+        df = df.loc[~mask_empty].copy()
+
+    # 5) Normalizar fechas si existe "Fecha" o "date"
     for c in df.columns:
-        if c.strip().lower() in ("fecha","date"):
+        if c.strip().lower() in ("fecha", "date"):
             df[c] = pd.to_datetime(df[c], errors="coerce").dt.date
+
     return df
