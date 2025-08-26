@@ -1,4 +1,6 @@
-import os, json, streamlit as st
+import os, json 
+import streamlit as st
+import pandas as pd
 
 # Lee credenciales desde Secrets y las expone como variable de entorno
 if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
@@ -15,14 +17,12 @@ if "PROJECT_KEY" in st.secrets:
 
 
 def _to_num(s: pd.Series) -> pd.Series:
-    # limpia comas, %, espacios y convierte a número
     return pd.to_numeric(
         s.astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False).str.strip(),
         errors="coerce"
     )
 
-import os, yaml
-import pandas as pd
+
 import numpy as np
 from math import ceil
 from datetime import timedelta, datetime, date
