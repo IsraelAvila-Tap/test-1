@@ -212,15 +212,54 @@ def load_srm() -> pd.DataFrame:
 
 
 def load_rentals() -> pd.DataFrame:
-    df = _read_sheet("Rentals")
-    # columnas: svc o svcs, unidades disponibles
-    svc_col = "svc" if "svc" in df.columns else ("svcs" if "svcs" in df.columns else None)
-    if not svc_col or "unidades disponibles" not in df.columns:
-        raise ValueError("Rentals: se esperan columnas 'SVC/SVCs' y 'Unidades disponibles'.")
-    df["unidades disponibles"] = pd.to_numeric(df["unidades disponibles"], errors="coerce").fillna(0).astype(int)
-    out = df.groupby(svc_col, as_index=False)["unidades disponibles"].sum()
-    out = out.rename(columns={svc_col:"svc","unidades disponibles":"rentals_routes_max"})
+    df = _read_sheet("Rentals")   # ya normaliza a minúsculas y hace strip
+    if df.empty:
+        raise ValueError("Rentals: hoja vacía.")
+
+    # 1) Detectar columna SVC por aproximación (svc / svcs / con espacios)
+    svc_candidates = [c for c in df.columns if "svc" in c.replace(" ", "")]
+    if not svc_candidates:
+        raise ValueError(f"Rentals: no se encontró columna SVC. Encabezados: {list(df.columns)}")
+    svc_col = svc_candidates[0]
+
+    # 2) Detectar la columna de cantidad (unidades disponibles)
+    #    Preferencias por nombre; si no hay match claro, elegimos la columna con más números válidos
+    qty_prefer = [
+        "unidades disponibles", "unidades", "cantidad", "capacidad",
+        "units", "available", "disp", "available units"
+    ]
+    qty_col = None
+    for name in qty_prefer:
+        for c in df.columns:
+            if name in c:
+                qty_col = c
+                break
+        if qty_col:
+            break
+    if qty_col is None:
+        # Heurística: columna con más valores numéricos tras limpiar
+        counts = []
+        for c in df.columns:
+            if c == svc_col:
+                continue
+            nums = _to_num(df[c])
+            counts.append((nums.notna().sum(), c))
+        counts.sort(reverse=True)
+        if counts and counts[0][0] > 0:
+            qty_col = counts[0][1]
+
+    if qty_col is None:
+        raise ValueError(f"Rentals: no se encontró columna de cantidad. Encabezados: {list(df.columns)}")
+
+    # 3) A número y agregamos por SVC
+    df[qty_col] = _to_num(df[qty_col]).fillna(0).astype(int)
+    out = (df.groupby(svc_col, as_index=False)[qty_col].sum()
+             .rename(columns={svc_col: "svc", qty_col: "rentals_routes_max"}))
+
+    # Debug suave en UI
+    st.caption(f"Rentals: usando SVC='{svc_col}' · cantidad='{qty_col}'")
     return out
+
 
 def load_crowd_caps() -> pd.DataFrame:
     df = _read_sheet("Crowd")
