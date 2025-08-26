@@ -262,17 +262,17 @@ def load_rentals() -> pd.DataFrame:
 
 
 def load_crowd_caps() -> pd.DataFrame:
-    df = _read_sheet("Crowd")  # ya normaliza headers a minúsculas y strip
+    df = _read_sheet("Crowd")  # headers ya normalizados (minúsculas, strip)
     if df.empty:
         raise ValueError("Crowd: hoja vacía.")
 
-    # --- 1) Detectar columna SVC por nombre aproximado o por patrón de valores ---
+    # --- 1) Detectar columna SVC ---
     cand_svc = [c for c in df.columns if any(k in c.replace(" ", "")
                  for k in ["svc","svcs","facility","facilidad","centro","centrooperativo","estacion","station","lc","logisticcenter"])]
     if not cand_svc:
-        # Heurística por patrón tipo SVC (SPB1, SMX7, SAG1, etc.)
+        # Heurística por patrón de valores (p. ej., SMX7, SPB1, SAG12)
         import re
-        pat = re.compile(r"^[A-Z]{3,4}\d{1,2}$")  # ej: SMX7, SPB1, SAG12
+        pat = re.compile(r"^[A-Z]{3,4}\d{1,2}$")
         best_hits, best_col = -1, None
         for c in df.columns:
             vals = df[c].astype(str).str.strip().str.upper()
@@ -285,18 +285,15 @@ def load_crowd_caps() -> pd.DataFrame:
         raise ValueError(f"Crowd: falta columna SVC. Encabezados detectados: {list(df.columns)}")
     svc_col = cand_svc[0]
 
-    # --- 2) Detectar columnas de capacidad (Base y E1) por día ---
+    # --- 2) Intentar formato detallado (6 columnas) ---
     cols = list(df.columns)
-
     def _pick(tags_main, tags_day):
-        # Busca la primera columna que contenga al menos un token de cada grupo
         for c in cols:
             cc = c.lower()
             if any(t in cc for t in tags_main) and any(t in cc for t in tags_day):
                 return c
         return None
 
-    # Sinónimos
     base_tags = ["base","normal"]
     e1_tags   = ["e1","holgura","escala","escalada","alto","high"]
     wd_tags   = ["entre", "sem", "weekday", "wd", "laboral"]
@@ -310,41 +307,59 @@ def load_crowd_caps() -> pd.DataFrame:
     c_e1_sa   = _pick(e1_tags,   sa_tags)
     c_e1_su   = _pick(e1_tags,   su_tags)
 
-    missing = [n for n,v in {
-        "base entre semana": c_base_wd,
-        "base sábado": c_base_sa,
-        "base domingo": c_base_su,
-        "E1 entre semana": c_e1_wd,
-        "E1 sábado": c_e1_sa,
-        "E1 domingo": c_e1_su,
-    }.items() if v is None]
+    if all([c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]):
+        # --- Formato DETALLADO ---
+        for c in [c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]:
+            df[c] = _to_num(df[c]).fillna(0).astype(int)
+        out = df[[svc_col, c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]].copy()
+        out = out.rename(columns={
+            svc_col: "svc",
+            c_base_wd: "base_wd", c_base_sa: "base_sa", c_base_su: "base_su",
+            c_e1_wd:   "e1_wd",   c_e1_sa:   "e1_sa",   c_e1_su:   "e1_su",
+        })
+        st.caption(
+            f"Crowd (detallado): SVC='{svc_col}'. "
+            f"Base→ wd='{c_base_wd}', sa='{c_base_sa}', dom='{c_base_su}'. "
+            f"E1→ wd='{c_e1_wd}', sa='{c_e1_sa}', dom='{c_e1_su}'."
+        )
+        return out
 
-    if missing:
+    # --- 3) Formato COMPACTO: usar 'base' y 'e1' para TODOS los días ---
+    # Buscar columnas 'base' y 'e1' (sin etiquetas de día)
+    def _find_single(tag_list):
+        for c in cols:
+            cc = c.lower()
+            if any(t in cc for t in tag_list) and not any(d in cc for d in (wd_tags + sa_tags + su_tags)):
+                return c
+        return None
+
+    c_base = _find_single(base_tags)
+    c_e1   = _find_single(e1_tags)
+
+    if c_base is None:
         raise ValueError(
-            "Crowd: no se encontraron columnas esperadas: "
-            + ", ".join(missing)
-            + f". Encabezados: {list(df.columns)}\n"
-            "Sugerencia: nombra las columnas con palabras clave como "
-            "'base' o 'E1' + 'entre'/'sab'/'dom' (ej: 'Base entre semana', 'Holgura sábado', 'E1 domingo')."
+            "Crowd: no se encontraron columnas esperadas. "
+            "Para formato compacto, crea columnas 'base' y (opcional) 'e1'. "
+            f"Encabezados actuales: {list(df.columns)}"
         )
 
-    # --- 3) Convertir a número y construir salida estándar ---
-    for c in [c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]:
-        df[c] = _to_num(df[c]).fillna(0).astype(int)
+    # A número
+    df[c_base] = _to_num(df[c_base]).fillna(0).astype(int)
+    if c_e1 and c_e1 in df.columns:
+        df[c_e1] = _to_num(df[c_e1]).fillna(0).astype(int)
+    else:
+        # Si no hay E1, asumimos 0 (no escalable)
+        df["__e1_tmp__"] = 0
+        c_e1 = "__e1_tmp__"
 
-    out = df[[svc_col, c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]].copy()
-    out = out.rename(columns={
-        svc_col: "svc",
-        c_base_wd: "base_wd", c_base_sa: "base_sa", c_base_su: "base_su",
-        c_e1_wd:   "e1_wd",   c_e1_sa:   "e1_sa",   c_e1_su:   "e1_su",
-    })
+    out = df[[svc_col, c_base, c_e1]].copy()
+    out = out.rename(columns={svc_col: "svc", c_base: "base", c_e1: "e1"})
+    # Replicar a wd/sa/su
+    out["base_wd"] = out["base"]; out["base_sa"] = out["base"]; out["base_su"] = out["base"]
+    out["e1_wd"]   = out["e1"];   out["e1_sa"]   = out["e1"];   out["e1_su"]   = out["e1"]
+    out = out[["svc","base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]]
 
-    # Debug suave en UI para confirmar mapeos
-    st.caption(
-        f"Crowd: usando SVC='{svc_col}'. "
-        f"Base→ wd='{c_base_wd}', sa='{c_base_sa}', dom='{c_base_su}'. "
-        f"E1→ wd='{c_e1_wd}', sa='{c_e1_sa}', dom='{c_e1_su}'."
-    )
+    st.caption(f"Crowd (compacto): SVC='{svc_col}'. base='{c_base}' → wd/sa/su; e1='{c_e1}' → wd/sa/su.")
     return out
 
 
