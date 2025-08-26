@@ -112,43 +112,92 @@ def load_capacity() -> pd.DataFrame:
     return df
 
 def load_srm() -> pd.DataFrame:
-    df = _read_sheet("SRM")  # ya viene con nombres en minúsculas y strip
-    if df.empty:
+    # Leemos SRM en crudo para ubicar el header real
+    gc = _client()
+    sh = gc.open_by_key(SHEET_ID)
+    ws = sh.worksheet("SRM")
+    values = ws.get_all_values()
+    if not values:
         raise ValueError("SRM: hoja vacía.")
 
-    # 1) Detectar columna SVC por aproximación
+    # 1) Detectar la fila de encabezados (salta filas de totales/números)
+    header_idx = None
+    best_score, best_i = -1, None
+    for i, row in enumerate(values[:100]):  # busca en las primeras 100 filas
+        row_lower = [c.strip().lower() for c in row]
+        nonempty = sum(1 for c in row_lower if c)
+        alphas   = sum(1 for c in row_lower if any(ch.isalpha() for ch in c))
+        has_svc  = any("svc"  in c for c in row_lower)
+        has_sdd  = any("sdd"  in c for c in row_lower)
+        has_spot = any("spot" in c for c in row_lower)
+        has_tot  = any("total" in c for c in row_lower)
+
+        score = (2 if has_svc else 0) + (1 if has_sdd else 0) + (1 if has_spot else 0) \
+                + (1 if has_tot else 0) + (1 if nonempty >= 4 else 0) + (1 if alphas >= 3 else 0)
+        if score > best_score:
+            best_score, best_i = score, i
+
+        if has_svc and (has_sdd or has_spot) and nonempty >= 4:
+            header_idx = i
+            break
+
+    if header_idx is None:
+        header_idx = best_i if best_i is not None else 0
+
+    headers_raw = values[header_idx]
+
+    # 2) Saneamos encabezados y evitamos duplicados
+    seen, headers = {}, []
+    for j, h in enumerate(headers_raw):
+        base = (h or "").replace("\n", " ").strip()
+        if not base:
+            base = f"col_{j+1}"
+        name = base
+        k = 1
+        while name in seen:
+            k += 1
+            name = f"{base}_{k}"
+        seen[name] = True
+        headers.append(name)
+
+    # 3) Construimos DF desde la línea siguiente
+    rows = values[header_idx + 1 :]
+    df = pd.DataFrame(rows, columns=headers)
+    # Normaliza nombres
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # 4) Detectar columna SVC (por nombre o por patrón)
     svc_cols = [c for c in df.columns if "svc" in c.replace(" ", "")]
     if not svc_cols:
-        # heurística: busca una columna con valores tipo "SPB1", "SCV1", "SAG1", etc.
         import re
         pat = re.compile(r"^[A-Za-z]{2,4}\d{1,2}$")
-        cand = []
+        # busca la columna con más celdas que parezcan códigos de SVC
+        best, best_c = -1, None
         for c in df.columns:
             vals = df[c].astype(str).str.strip()
-            hit = (vals.str.len().between(3, 6) & vals.str.match(pat)).sum()
-            cand.append((hit, c))
-        cand.sort(reverse=True)
-        if cand and cand[0][0] >= 3:
-            svc_cols = [cand[0][1]]
+            hits = (vals.str.match(pat, na=False)).sum()
+            if hits > best:
+                best, best_c = hits, c
+        if best >= 3:
+            svc_cols = [best_c]
 
     if not svc_cols:
         raise ValueError(f"SRM: no se encontró columna SVC. Encabezados detectados: {list(df.columns)}")
-
     svc_col = svc_cols[0]
 
-    # 2) Columnas de capacidad SDD y SPOT (sumamos todas las que contengan esos tokens)
-    sdd_cols  = [c for c in df.columns if ("sdd"  in c)]
-    spot_cols = [c for c in df.columns if ("spot" in c)]
-    # intenta priorizar “total …”
+    # 5) Columnas de SDD / SPOT (sumamos todas)
+    sdd_cols  = [c for c in df.columns if "sdd"  in c]
+    spot_cols = [c for c in df.columns if "spot" in c]
+    # prioriza las que dicen "total"
     sdd_total  = [c for c in sdd_cols  if "total" in c] or sdd_cols
     spot_total = [c for c in spot_cols if "total" in c] or spot_cols
-
     if not sdd_total and not spot_total:
         raise ValueError(f"SRM: no se hallaron columnas con 'sdd' o 'spot'. Encabezados: {list(df.columns)}")
 
     out = df[[svc_col] + list(set(sdd_total + spot_total))].copy()
     out = out.rename(columns={svc_col: "svc"})
 
+    # 6) A número
     for c in out.columns:
         if c != "svc":
             out[c] = _to_num(out[c]).fillna(0)
@@ -156,10 +205,10 @@ def load_srm() -> pd.DataFrame:
     out["sdd_routes_max"]  = out[[c for c in out.columns if c != "svc" and "sdd"  in c]].sum(axis=1)
     out["spot_routes_max"] = out[[c for c in out.columns if c != "svc" and "spot" in c]].sum(axis=1)
 
-    out = (out.groupby("svc", as_index=False)[["sdd_routes_max", "spot_routes_max"]].sum())
-    # debug suave en UI
-    st.caption(f"SRM: usando columna SVC = '{svc_col}'. SDD cols: {len(sdd_total)} · SPOT cols: {len(spot_total)}")
+    out = (out.groupby("svc", as_index=False)[["sdd_routes_max","spot_routes_max"]].sum())
+    st.caption(f"SRM: header en fila {header_idx+1}. SVC='{svc_col}'. SDD cols={len(sdd_total)} · SPOT cols={len(spot_total)}")
     return out
+
 
 
 def load_rentals() -> pd.DataFrame:
