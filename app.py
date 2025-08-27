@@ -593,4 +593,3 @@ resumen = (plan.groupby("fecha", as_index=False)
 st.dataframe(resumen, use_container_width=True, hide_index=True)
 
 
-
