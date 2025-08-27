@@ -517,14 +517,17 @@ def compute_plan(spr_mode: str, sel_svcs=None):
         status.update(label="Datos listos ✅", state="complete")
 
     # ---- FILTRO DE SVC (si se usa) ----
-    if sel_svcs:
-        sel_svcs = set([str(s).strip().str.upper() if hasattr(s,'strip') else str(s).upper() for s in sel_svcs])
-        fcst       = fcst[fcst["svc"].isin(sel_svcs)]
-        spr_real   = spr_real[spr_real["svc"].isin(sel_svcs)]
-        capacity   = capacity[capacity["svc"].isin(sel_svcs)]
-        srm        = srm[srm["svc"].isin(sel_svcs)]
-        rentals    = rentals[rentals["svc"].isin(sel_svcs)]
-        crowd_caps = crowd_caps[crowd_caps["svc"].isin(sel_svcs)]
+if sel_svcs:
+    # normaliza a strings en MAYÚSCULAS sin espacios
+    sel_svcs = set(str(s).strip().upper() for s in sel_svcs if s)
+
+    fcst       = fcst[fcst["svc"].isin(sel_svcs)]
+    spr_real   = spr_real[spr_real["svc"].isin(sel_svcs)]
+    capacity   = capacity[capacity["svc"].isin(sel_svcs)]
+    srm        = srm[srm["svc"].isin(sel_svcs)]
+    rentals    = rentals[rentals["svc"].isin(sel_svcs)]
+    crowd_caps = crowd_caps[crowd_caps["svc"].isin(sel_svcs)]
+
 
     # SPRs
     spr_tbl = compute_spr_scenarios(fcst, spr_real, capacity)
