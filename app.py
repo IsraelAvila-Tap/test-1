@@ -110,10 +110,12 @@ def load_crowd_caps() -> pd.DataFrame:
     """
     Devuelve capacidad Crowd por SVC con 6 columnas normalizadas:
       base_wd, base_sa, base_su, e1_wd, e1_sa, e1_su
-    Soporta 3 variantes:
+
+    Soporta:
       (A) Detallado: columnas ya separadas (base/e1 x wd/sa/su)
-      (B) Compacto: columna de día + 'base' + 'e1/holgura'
-      (C) “Ancho” con encabezados repetidos: base, base_2, base_3, e1, e1_2, e1_3
+      (B) Compacto: columna de día + 'base' + 'e1/holgura' (pivotea)
+      (C) Repetidos: 3 cols que empiezan con 'base' y 3 con 'e1/holgura'
+      (D) AGRUPADO (tu caso): 'base', dos 'col_*' después; 'e1', dos 'col_*' después
     """
     df_raw = read_ws(SHEET_ID, "Crowd")
     if df_raw is None or len(df_raw) == 0:
@@ -122,49 +124,30 @@ def load_crowd_caps() -> pd.DataFrame:
     df = df_raw.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # ---------- helpers ----------
-    import unicodedata
-
-    def deacc(s: str) -> str:
-        if s is None:
-            return ""
-        s = str(s)
-        s = unicodedata.normalize("NFD", s)
-        s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-        return s
-
-    def norm_name(s: str) -> str:
-        s = deacc(s).lower().strip()
-        s = s.replace("\n", " ").replace("\t", " ")
-        s = s.replace("  ", " ")
-        return s
-
-    ncols = {c: norm_name(c) for c in df.columns}
-
-    # detectar SVC (svc, svcs, etc.)
+    # ---- detectar columna SVC (flexible) ----
     svc_col = None
-    for c, nc in ncols.items():
-        if "svc" in nc.replace(" ", ""):
+    for c in df.columns:
+        if "svc" in c.replace(" ", ""):
             svc_col = c
             break
-    if not svc_col:
-        # último intento: columna con códigos cortos
+    if svc_col is None:
+        # último intento: heurística
         for c in df.columns:
             vals = df[c].dropna().astype(str).str.strip().unique().tolist()[:10]
             if any(3 <= len(v) <= 5 for v in vals):
                 svc_col = c
                 break
-    if not svc_col:
+    if svc_col is None:
         raise ValueError(f"Crowd: no se encontró columna de SVC. Encabezados: {list(df.columns)}")
 
     df["svc"] = df[svc_col].astype(str).str.strip().str.upper()
 
     # ---------- (A) DETALLADO ----------
     def pick(patterns):
-        # patterns: lista de (incluye, incluye)
-        for c, nc in ncols.items():
+        for c in df.columns:
+            name = c
             for a, b in patterns:
-                if (a in nc) and (b in nc):
+                if (a in name) and (b in name):
                     return c
         return None
 
@@ -175,37 +158,50 @@ def load_crowd_caps() -> pd.DataFrame:
     e1_sa   = pick([("holgura","sab"),("e1","sab")])
     e1_su   = pick([("holgura","dom"),("e1","dom")])
 
-    detailed_ok = all([base_wd, base_sa, base_su, e1_wd, e1_sa, e1_su])
-
-    if detailed_ok:
+    if all([base_wd, base_sa, base_su, e1_wd, e1_sa, e1_su]):
         out = df[["svc", base_wd, base_sa, base_su, e1_wd, e1_sa, e1_su]].copy()
         out.columns = ["svc","base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]
         for c in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
             out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
-        st.caption(f"Crowd (detallado): SVC='{svc_col}'.")
+        st.caption(f"Crowd (detallado) usando columnas explícitas.")
         return out
 
-    # ---------- (B) COMPACTO (día + base + e1/holgura) ----------
-    dia_col  = None
-    base_col = None
-    e1_col   = None
+    # ---------- (D) AGRUPADO: 'base', 'col_*', 'col_*' + 'e1', 'col_*', 'col_*' ----------
+    cols = list(df.columns)
+    if ("base" in cols) and ("e1" in cols):
+        ib = cols.index("base")
+        ie = cols.index("e1")
+        # grupos consecutivos desde el título de bloque
+        base_group = [c for c in cols[ib:ib+3] if c in df.columns]
+        e1_group   = [c for c in cols[ie:ie+3] if c in df.columns]
+        if len(base_group) == 3 and len(e1_group) == 3:
+            out = df[["svc"] + base_group + e1_group].copy()
+            # mapeo por POSICIÓN → asumimos orden wd, sa, su
+            out.columns = ["svc","base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]
+            for c in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
+                out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
+            st.caption(f"Crowd (agrupado): base={base_group}, e1={e1_group}.")
+            return out
 
-    for c, nc in ncols.items():
-        if any(k in nc for k in ["dia","día","categoria","categoría","tipo","entre semana","entre_semana","semana","sabado","sábado","domingo"]):
-            if dia_col is None:
-                dia_col = c
-        if ("base" in nc) and (base_col is None):
-            base_col = c
-        if (("e1" in nc) or ("holgura" in nc)) and (e1_col is None):
-            e1_col = c
+    # ---------- (B) COMPACTO (día + base + e1/holgura) ----------
+    # (igual que antes, por si tuvieras ese layout en otra versión)
+    dia_col  = next((c for c in df.columns if any(k in c for k in
+                 ["dia","día","categoria","categoría","tipo","entre semana","entre_semana","semana","sabado","sábado","domingo"])), None)
+    base_col = next((c for c in df.columns if "base" in c), None)
+    e1_col   = next((c for c in df.columns if ("e1" in c) or ("holgura" in c)), None)
 
     if dia_col and base_col and e1_col:
         tmp = df[["svc", dia_col, base_col, e1_col]].copy()
         tmp.columns = ["svc","dia","base","e1"]
-        tmp["dia"] = tmp["dia"].astype(str).str.lower()
 
-        def tag(x: str) -> str | None:
-            x = deacc(x).lower()
+        import unicodedata
+        def deacc(s):
+            s = "" if s is None else str(s)
+            s = unicodedata.normalize("NFD", s)
+            return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
+        def tag(x):
+            x = deacc(str(x)).lower()
             if ("entre" in x) or ("sem" in x): return "wd"
             if "sab" in x: return "sa"
             if "dom" in x: return "su"
@@ -218,38 +214,29 @@ def load_crowd_caps() -> pd.DataFrame:
                         .rename(columns={"wd":"base_wd","sa":"base_sa","su":"base_su"}))
         e1_pivot   = (tmp.pivot_table(index="svc", columns="dtag", values="e1",   aggfunc="sum")
                         .rename(columns={"wd":"e1_wd","sa":"e1_sa","su":"e1_su"}))
-
         out = base_pivot.join(e1_pivot, how="outer").reset_index()
         for c in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
             if c not in out.columns: out[c] = 0
             out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
-
         st.caption(f"Crowd (compacto/pivoteado): dia='{dia_col}', base='{base_col}', e1='{e1_col}'.")
         return out[["svc","base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]]
 
-    # ---------- (C) “ANCHO” con encabezados repetidos ----------
-    # ej: base, base_2, base_3 …  e1, e1_2, e1_3
-    base_like = [c for c, nc in ncols.items() if nc.startswith("base")]
-    e1_like   = [c for c, nc in ncols.items() if nc.startswith("e1") or "holgura" in nc]
-    # si hay más de tres, tomamos las 3 primeras (asumimos orden wd, sa, su de izquierda a derecha)
+    # ---------- (C) Repetidos por prefijo ----------
+    base_like = [c for c in df.columns if c.startswith("base")]
+    e1_like   = [c for c in df.columns if c.startswith("e1") or ("holgura" in c)]
     if len(base_like) >= 3 and len(e1_like) >= 3:
-        base_like = base_like[:3]
-        e1_like   = e1_like[:3]
+        base_like = base_like[:3]; e1_like = e1_like[:3]
         out = df[["svc"] + base_like + e1_like].copy()
         out.columns = ["svc","base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]
         for c in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
             out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
-        st.caption(f"Crowd (ancho/repetidos): base={base_like}, e1={e1_like}.")
+        st.caption(f"Crowd (repetidos por prefijo): base={base_like}, e1={e1_like}.")
         return out
 
-    # ---------- sin match: mensaje con diagnóstico ----------
+    # ---------- Sin match: diagnóstico ----------
     st.write("Encabezados Crowd detectados:", list(df.columns))
     raise ValueError(
-        "Crowd: no se reconoció el layout.\n"
-        "Detallado esperado: 'SVC', 'Base entre semana', 'Base sábado', 'Base domingo', "
-        "'Holgura entre semana', 'Holgura sábado', 'Holgura domingo'.\n"
-        "Compacto alterno: 'SVC', columna de día ('Entre semana'/'Sábado'/'Domingo') + columnas 'base' y 'e1/holgura'.\n"
-        "Otro alterno: tres columnas que empiezan con 'base' y tres con 'e1/holgura' (se usan en orden)."
+        "Crowd: no se reconoció el layout. Se intentó (A) detallado, (B) compacto, (C) repetidos por prefijo y (D) agrupado."
     )
 
 
