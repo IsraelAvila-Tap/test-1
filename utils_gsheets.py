@@ -1,105 +1,87 @@
-import os, json, gspread
-from typing import Optional
-from functools import lru_cache
-from google.oauth2.service_account import Credentials
+# -*- coding: utf-8 -*-
+import os, json, io
 import pandas as pd
-import numpy as np
+import gspread
+from google.oauth2.service_account import Credentials
 
-_SCOPES = [
+SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
-def _load_credentials() -> Credentials:
-    json_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if json_env:
-        data = json.loads(json_env)
-        return Credentials.from_service_account_info(data, scopes=_SCOPES)
-    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if path and os.path.exists(path):
-        return Credentials.from_service_account_file(path, scopes=_SCOPES)
-    raise RuntimeError("Set GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_APPLICATION_CREDENTIALS.")
+_client_cache = None
+_svc_email = None
 
-def get_service_account_email() -> Optional[str]:
-    try:
-        json_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-        if json_env:
-            return json.loads(json_env).get("client_email")
-        path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if path and os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f).get("client_email")
-    except Exception:
-        pass
-    return None
-
-@lru_cache(maxsize=1)
 def _client():
-    creds = _load_credentials()
-    return gspread.authorize(creds)
+    global _client_cache, _svc_email
+    if _client_cache is not None:
+        return _client_cache
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON","").strip()
+    if not raw:
+        raise RuntimeError("No GOOGLE_SERVICE_ACCOUNT_JSON en el entorno.")
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        # por si llegó con comillas escapadas
+        info = json.loads(bytes(raw, "utf-8").decode("unicode_escape"))
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    _svc_email = info.get("client_email","")
+    _client_cache = gspread.authorize(creds)
+    return _client_cache
 
-@lru_cache(maxsize=4)
-def _open_sheet(sheet_id: str):
-    return _client().open_by_key(sheet_id)
+def get_service_account_email():
+    global _svc_email
+    if _svc_email:
+        return _svc_email
+    # forzar construcción
+    try:
+        _client()
+    except Exception:
+        return None
+    return _svc_email
 
-def _parse_date_series(s: pd.Series) -> pd.Series:
-    s = s.astype(str).str.strip()
-    d = pd.to_datetime(s, errors="coerce")  # intenta ISO primero
-    if d.notna().mean() < 0.8:
-        d = pd.to_datetime(s, errors="coerce", dayfirst=True)  # dd/mm/yyyy
-    return d.dt.date
+def _fix_headers(headers):
+    seen={}
+    fixed=[]
+    for j,h in enumerate(headers):
+        base = (h or "").replace("\n"," ").strip() or f"col_{j+1}"
+        name=base; k=1
+        while name in seen:
+            k+=1; name=f"{base}_{k}"
+        seen[name]=1; fixed.append(name)
+    return fixed
 
 def read_ws(sheet_id: str, tab: str) -> pd.DataFrame:
-    sh = _open_sheet(sheet_id)
+    """Lee una pestaña en modo tolerante:
+       - toma la primera fila no-vacía como header
+       - rellena encabezados vacíos y desduplica
+       - convierte fechas con autoguess (sin forzar dayfirst)
+    """
+    gc = _client()
+    sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab)
     values = ws.get_all_values()
     if not values:
         return pd.DataFrame()
 
-    # Detecta fila de encabezado (favor tokens típicos)
-    header_idx = 0
-    best_i, best_score = 0, -1
-    tokens = ("svc","fecha","shipments","spr","delivery","tipo","cantidad","base","e1","total","spot","sdd","rentals")
-    for i, row in enumerate(values[:100]):
-        row_lower = [c.strip().lower() for c in row]
-        nonempty = sum(1 for c in row_lower if c)
-        alphas   = sum(1 for c in row_lower if any(ch.isalpha() for ch in c))
-        tok = sum(1 for c in row_lower if any(t in c for t in tokens))
-        score = (tok*2) + (1 if nonempty>=3 else 0) + (1 if alphas>=3 else 0)
-        if score > best_score:
-            best_score, best_i = score, i
-        if tok>=2 and nonempty>=3:
-            header_idx = i
+    # header = primera fila con ≥2 celdas no vacías
+    header_row = 0
+    for i, row in enumerate(values):
+        non_empty = [c for c in row if str(c).strip()!=""]
+        if len(non_empty) >= 2:
+            header_row = i
             break
-    else:
-        header_idx = best_i
 
-    headers_raw = values[header_idx]
-    # Sanea headers y evita duplicados
-    seen, headers = {}, []
-    for j, h in enumerate(headers_raw):
-        base = (h or "").replace("\n"," ").strip()
-        if not base:
-            base = f"col_{j+1}"
-        name = base
-        k = 1
-        while name in seen:
-            k += 1
-            name = f"{base}_{k}"
-        seen[name] = True
-        headers.append(name)
+    header = _fix_headers(values[header_row])
+    data   = values[header_row+1:]
+    df = pd.DataFrame(data, columns=header)
 
-    rows = values[header_idx+1:]
-    df = pd.DataFrame(rows, columns=headers)
-
-    # Quita filas completamente vacías
-    if not df.empty:
-        mask_empty = df.apply(lambda r: "".join(map(str, r.values)).strip() == "", axis=1)
-        df = df.loc[~mask_empty].copy()
-
-    # Normaliza fechas si existe "Fecha"/"date"
+    # fechas: intenta parsear columnas que luzcan como fecha
     for c in df.columns:
-        if c.strip().lower() in ("fecha","date"):
-            df[c] = _parse_date_series(df[c])
-
+        if "fecha" in c.lower():
+            try:
+                df[c] = pd.to_datetime(df[c], errors="coerce").dt.date
+            except Exception:
+                pass
     return df
+
