@@ -386,6 +386,11 @@ def load_crowd() -> pd.DataFrame:
     out["svc"] = out["svc"].astype(str).str.strip().str.upper()
     return out.groupby("svc", as_index=False).sum()
 
+# --- compatibilidad con código previo ---
+def load_crowd_caps() -> pd.DataFrame:
+    """Alias compatible: devuelve las mismas columnas que load_crowd()."""
+    return load_crowd()
+
 
 # ====== SPR (promedio/peak/plan) por SVC-fecha ======
 
