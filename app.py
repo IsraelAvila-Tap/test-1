@@ -57,6 +57,52 @@ def _norm_date_col(df: pd.DataFrame, col: str) -> pd.DataFrame:
     df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True).dt.date
     return df
 
+import re
+
+def _find_header_row_by_svc_df(raw: pd.DataFrame, search_rows: int = 12) -> int | None:
+    """Devuelve el índice (0-based) de la fila que contiene 'svc'/'svcs'. None si no aparece."""
+    for i in range(min(search_rows, len(raw))):
+        vals = (
+            raw.iloc[i]
+               .astype(str)
+               .str.replace(r"\s+", " ", regex=True)
+               .str.strip()
+               .str.lower()
+        )
+        if any(v in ("svc", "svcs", "svc ") for v in vals):
+            return i
+    return None
+
+def _apply_header_from_row(raw: pd.DataFrame, hdr_idx: int) -> pd.DataFrame:
+    hdr = (
+        raw.iloc[hdr_idx]
+           .astype(str)
+           .str.replace(r"[\r\n]+", " ", regex=True)
+           .str.replace(r"\s+", " ", regex=True)
+           .str.strip()
+           .str.lower()
+           .tolist()
+    )
+    hdr = [h if h else f"col_{i+1}" for i, h in enumerate(hdr)]
+    body = raw.iloc[hdr_idx + 1 :].copy()
+    body.columns = hdr
+    body = body.dropna(how="all", axis=1).reset_index(drop=True)
+    return body
+
+def _guess_svc_col(df: pd.DataFrame) -> str | None:
+    """Adivina la columna SVC por patrón (p.ej. SPB1, SMX9, SGD1, SMT1)."""
+    svc_regex = re.compile(r"^[A-Z]{3}\d$")  # 3 letras + 1 dígito (e.g., SPB1)
+    best_col, best_ratio = None, 0.0
+    for c in df.columns:
+        s = df[c].astype(str).str.strip().str.upper()
+        valid = s[(s != "") & (s != "NAN")]
+        if valid.empty:
+            continue
+        ratio = valid.map(lambda x: bool(svc_regex.match(x))).mean()
+        if ratio > best_ratio:
+            best_ratio, best_col = ratio, c
+    return best_col if best_ratio >= 0.5 else None
+
 
 # ====== Carga de config.yaml ======
 
@@ -280,31 +326,42 @@ def load_rentals_by_vehicle() -> pd.DataFrame:
 
 
 def load_crowd() -> pd.DataFrame:
-    """Lee Crowd y devuelve columnas normalizadas:
-       svc, base_wd, base_sa, base_su, e1_wd, e1_sa, e1_su (enteros)."""
-    raw = read_ws(SHEET_ID, "Crowd")
-    df = raw.copy()
+    """Devuelve: svc, base_wd, base_sa, base_su, e1_wd, e1_sa, e1_su (enteros)."""
+    raw = read_ws(SHEET_ID, "Crowd").dropna(how="all", axis=1)
 
-    # normaliza nombres actuales (los que ya vinieron como header de primera fila)
+    # 1) Intento: detectar fila de encabezado con 'svc'
+    hdr_idx = _find_header_row_by_svc_df(raw)
+    if hdr_idx is not None:
+        df = _apply_header_from_row(raw, hdr_idx)
+    else:
+        # si no hay 'svc' visible en las primeras filas, usamos tal cual
+        df = raw.copy()
+
+    # Normaliza nombres de columnas
     cols = [str(c).strip().lower() if str(c).strip() else f"col_{i+1}" for i, c in enumerate(df.columns)]
     df.columns = cols
 
-    # localizar SVC
+    # 2) Localizar/crear columna SVC
     svc_col = None
     for cand in ("svc", "svcs", "svc "):
         if cand in df.columns:
             svc_col = cand
             break
-    if not svc_col:
-        raise ValueError("Crowd: falta columna 'svc'.")
+    if svc_col is None:
+        guess = _guess_svc_col(df)
+        if guess:
+            df = df.rename(columns={guess: "svc"})
+            svc_col = "svc"
+    if svc_col is None:
+        raise ValueError("Crowd: falta columna 'svc' y no se pudo inferir por patrón. "
+                         f"Encabezados vistos: {list(df.columns)}")
 
-    # --------- CASO A) Encabezado en 2 filas: 'base' ... 'e1' en fila 1 y 'entre/sab/dom' en fila 2 ----------
+    # 3) Layout A: encabezado en 2 filas (grupos 'base' y 'e1' + subetiquetas wd/sa/su en la primera fila de datos)
     if ("base" in df.columns) and ("e1" in df.columns):
-        # fila de etiquetas secundarias (entre semana / sábado / domingo)
+        # la primera fila bajo el header contiene 'entre / sab / dom'
         labrow = df.iloc[0].astype(str).str.strip().str.lower()
 
         def _take3(start_idx: int) -> list[str]:
-            # toma 3 columnas seguidas empezando en start_idx
             return cols[start_idx:start_idx+3]
 
         b_idx = cols.index("base")
@@ -322,7 +379,7 @@ def load_crowd() -> pd.DataFrame:
                     mapping["sa"] = c
                 elif "dom" in lab:
                     mapping["su"] = c
-            # completa por orden si faltara alguno
+            # completa por orden si falta
             order = ["wd", "sa", "su"]
             out = [mapping.get(k) for k in order]
             rest = [c for c in group_cols if c not in out]
@@ -334,10 +391,9 @@ def load_crowd() -> pd.DataFrame:
         b_wd, b_sa, b_su = _reorder(base_cols)
         e_wd, e_sa, e_su = _reorder(e1_cols)
 
-        # quita la fila de etiquetas secundarias
+        # quita fila de etiquetas
         df = df.iloc[1:].reset_index(drop=True)
 
-        # coerción numérica
         for c in [b_wd, b_sa, b_su, e_wd, e_sa, e_su]:
             df[c] = _to_num(df[c]).fillna(0)
 
@@ -352,8 +408,7 @@ def load_crowd() -> pd.DataFrame:
         })
         return out.groupby("svc", as_index=False).sum()
 
-    # --------- CASO B) Layout detallado: columnas ya vienen separadas ---------
-    # buscamos columnas que contengan las palabras clave
+    # 4) Layout B: detallado (columnas ya separadas)
     def _pick(name_opts: list[str]) -> str | None:
         for n in df.columns:
             n2 = str(n).lower()
@@ -372,10 +427,9 @@ def load_crowd() -> pd.DataFrame:
     if any(c is None for c in need_cols):
         raise ValueError(
             f"Crowd: no se reconoció layout. Encabezados: {list(df.columns)}\n"
-            "Opciones soportadas:\n"
-            "  • Encabezado en 2 filas: 'base'...'e1' + segunda fila con 'entre/sab/dom'.\n"
-            "  • Detallado: 'Base entre semana', 'Base sábado', 'Base domingo', "
-            "'Holgura entre semana', 'Holgura sábado', 'Holgura domingo'."
+            "Soportado:\n"
+            "  • Header en 2 filas (base/e1 + entre/sab/dom)\n"
+            "  • Detallado (Base entre semana/sábado/domingo + Holgura entre/sábado/domingo)"
         )
 
     for c in need_cols:
@@ -385,6 +439,7 @@ def load_crowd() -> pd.DataFrame:
     out.columns = ["svc", "base_wd", "base_sa", "base_su", "e1_wd", "e1_sa", "e1_su"]
     out["svc"] = out["svc"].astype(str).str.strip().str.upper()
     return out.groupby("svc", as_index=False).sum()
+
 
 # --- compatibilidad con código previo ---
 def load_crowd_caps() -> pd.DataFrame:
