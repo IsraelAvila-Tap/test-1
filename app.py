@@ -461,7 +461,8 @@ def schedule_mlp_rest(df_day: pd.DataFrame) -> pd.DataFrame:
 
 # ------------- MOTOR PRINCIPAL -------------
 
-def compute_plan(spr_mode: str):
+def compute_plan(spr_mode: str, sel_svcs=None):
+
     with st.status("Cargando datos...", expanded=True) as status:
         st.write("1/6 FCST…");       fcst       = load_fcst()
         st.write("2/6 SPR (real)…"); spr_real   = load_spr_real()
@@ -470,6 +471,17 @@ def compute_plan(spr_mode: str):
         st.write("5/6 Rentals…");    rentals    = load_rentals()
         st.write("6/6 Crowd…");      crowd_caps = load_crowd_caps()
         status.update(label="Datos listos ✅", state="complete")
+
+        # ---- FILTRO DE SVC (aplicar temprano para que todo el cálculo use solo esos) ----
+    if sel_svcs:
+        sel_svcs = set([str(s).strip().upper() for s in sel_svcs])
+        fcst       = fcst[fcst["svc"].isin(sel_svcs)]
+        spr_real   = spr_real[spr_real["svc"].isin(sel_svcs)]
+        capacity   = capacity[capacity["svc"].isin(sel_svcs)]
+        srm        = srm[srm["svc"].isin(sel_svcs)]
+        rentals    = rentals[rentals["svc"].isin(sel_svcs)]
+        crowd_caps = crowd_caps[crowd_caps["svc"].isin(sel_svcs)]
+
 
     # SPRs
     spr_tbl = compute_spr_scenarios(fcst, spr_real, capacity)
@@ -577,12 +589,34 @@ with st.sidebar:
         st.code(svc_email, language="text")
     else:
         st.warning("No se detectó Service Account.")
+with st.sidebar:
+    st.header("⚙️ Proyecto")
+    st.write(f"**Sheet:** `{SHEET_ID}`")
+    st.subheader("🔐 Credenciales")
+    svc_email = get_service_account_email()
+    if svc_email:
+        st.caption("Comparte el Sheet con:")
+        st.code(svc_email, language="text")
+    else:
+        st.warning("No se detectó Service Account.")
+
+    # ⬇⬇⬇ NUEVO: selector de SVC
+    svcs_all = sorted(load_fcst()["svc"].unique().tolist())
+    default_svcs = ["SPB1", "SMX9", "SGD1", "SMT1"]
+    sel_svcs = st.multiselect(
+        "Filtrar SVC",
+        options=svcs_all,
+        default=[s for s in default_svcs if s in svcs_all],
+        help="El cálculo y las tablas solo incluirán estos SVC."
+    )
+
+
 
 st.title("Mel-IA — Plan táctico (diario por SVC)")
 spr_mode = st.radio("SPR objetivo", ["promedio","peak","plan"], index=0, horizontal=True)
 
 try:
-    plan = compute_plan(spr_mode)
+    plan = compute_plan(spr_mode, sel_svcs)
     st.dataframe(plan, use_container_width=True, hide_index=True)
 
     st.subheader("Riesgos por fecha")
