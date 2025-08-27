@@ -82,19 +82,60 @@ def _safe_mean(vals):
 
 # ======================== CARGA DE HOJAS ================================
 def load_fcst() -> pd.DataFrame:
-    df = read_ws(SHEET_ID, "FCST")
-    df = _lower_cols(df)
-    need = {"svc","fecha","shipments"}
+    raw = read_ws(SHEET_ID, "FCST")
+
+    # Normalizamos lo que venga
+    df = _lower_cols(raw.copy())
+
+    def _ok(x: pd.DataFrame) -> bool:
+        return {"svc", "fecha", "shipments"}.issubset(x.columns)
+
+    if not _ok(df):
+        # Escaneo defensivo: buscamos la fila de encabezado dentro de las primeras 15 filas
+        header_row = None
+
+        # 1) criterio fuerte: las 3 palabras
+        for i in range(min(15, len(raw))):
+            row = [str(x).strip().lower() for x in raw.iloc[i, :].tolist()]
+            has_svc   = "svc" in row
+            has_fecha = any((r == "fecha") or ("date" in r) for r in row)
+            has_ship  = any(r == "shipments" for r in row)
+            if has_svc and has_fecha and has_ship:
+                header_row = i
+                break
+
+        # 2) criterio laxo: al menos 2 de los 3
+        if header_row is None:
+            wanted = {"svc", "fecha", "shipments"}
+            for i in range(min(15, len(raw))):
+                row = set(str(x).strip().lower() for x in raw.iloc[i, :].tolist())
+                if len(wanted.intersection(row)) >= 2:
+                    header_row = i
+                    break
+
+        # Si encontramos fila header, re-encabezamos
+        if header_row is not None:
+            cols = [
+                (str(x).strip().lower() if str(x).strip() else f"col_{j+1}")
+                for j, x in enumerate(raw.iloc[header_row, :].tolist())
+            ]
+            df = raw.iloc[header_row + 1 :].reset_index(drop=True)
+            df.columns = cols
+            df = _lower_cols(df)
+
+    # Validación final
+    need = {"svc", "fecha", "shipments"}
     if not need.issubset(df.columns):
-        raise ValueError(f"FCST: faltan columnas {sorted(need - set(df.columns))}")
+        raise ValueError(f"FCST: faltan columnas {sorted(list(need))}")
+
     out = pd.DataFrame({
-        "svc":    _upper_series(df["svc"]),
-        "fecha":  _ensure_series(df["fecha"]),
+        "svc": _upper_series(df["svc"]),
+        "fecha": pd.to_datetime(_ensure_series(df["fecha"]), errors="coerce", dayfirst=True).dt.date,
         "shipments": _to_num(df["shipments"]).fillna(0.0)
-    })
-    out["fecha"] = pd.to_datetime(out["fecha"], errors="coerce", dayfirst=True).dt.date
-    out = out.dropna(subset=["fecha","svc"])
+    }).dropna(subset=["fecha", "svc"])
+
     return out
+
 
 def load_spr_real() -> pd.DataFrame:
     df = read_ws(SHEET_ID, "SPR")
