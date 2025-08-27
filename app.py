@@ -89,16 +89,15 @@ def load_fcst() -> pd.DataFrame:
 
 
 def load_spr_sheet() -> pd.DataFrame:
-    # SPR ejecutado real (si existe)
     df = _lower_cols(read_ws(SHEET_ID, "SPR"))
-    # intentamos columnas: delivery_model, fecha, svc, shp_lg_vehicle, spr
-    # son tolerantes a nombres cercanos
+
+    # Mapeo tolerante de columnas
     map_cand = {
-        "delivery_model": [ "delivery_model", "delivery model", "dm" ],
-        "fecha":          [ "fecha", "date" ],
-        "svc":            [ "svc", "svcs" ],
-        "veh":            [ "shp_lg_vehicle", "veh", "vehicle", "tipo de vehículo", "tipo dm" ],
-        "spr":            [ "spr", "shipments per route" ],
+        "delivery_model": ["delivery_model", "delivery model", "dm"],
+        "fecha":          ["fecha", "date"],
+        "svc":            ["svc", "svcs"],
+        "veh":            ["shp_lg_vehicle", "veh", "vehicle", "tipo de vehículo", "tipo dm"],
+        "spr":            ["spr", "shipments per route"],
     }
     picked = {}
     for k, opts in map_cand.items():
@@ -106,23 +105,35 @@ def load_spr_sheet() -> pd.DataFrame:
             if o in df.columns:
                 picked[k] = o
                 break
-    need = ["fecha","svc","spr"]
-    if any(k not in picked for k in need):
-        # si no hay hoja compatible, devolvemos vacía
-        return pd.DataFrame(columns=["fecha","svc","dm","veh","spr"])
 
-    df["svc"]   = SSTRIP(df[picked.get("svc","svc")]).str.upper()
-    df["dm"]    = SSTRIP(df[picked.get("delivery_model","")]) if "delivery_model" in picked else "GEN"
-    df["dm"]    = df["dm"].astype(str).str.upper()
-    df["veh"]   = SSTRIP(df[picked.get("veh","")]) if "veh" in picked else "GEN"
-    df["veh"]   = df["veh"].astype(str).str.upper()
-    df         = _norm_date_col(df, picked["fecha"]).rename(columns={picked["fecha"]:"fecha"})
-    df["spr"]  = _to_num(df[picked["spr"]]).astype(float)
-    # add DOW / ISO week
-    df["dow"] = df["fecha"].apply(_weekday)
-    iso = df["fecha"].apply(lambda d: pd.Timestamp(d).isocalendar())
-    df["iso_year"] = [int(x.year) for x in iso]
-    df["iso_week"] = [int(x.week) for x in iso]
+    need = ["fecha", "svc", "spr"]
+    if any(k not in picked for k in need):
+        # no hay hoja compatible -> devolvemos vacía
+        return pd.DataFrame(columns=["fecha","svc","dm","veh","spr","dow","iso_year","iso_week"])
+
+    # Normalización básica
+    df["svc"] = SSTRIP(df[picked.get("svc","svc")]).str.upper()
+    df["dm"]  = SSTRIP(df[picked.get("delivery_model","")]).str.upper() if "delivery_model" in picked else "GEN"
+    df["veh"] = SSTRIP(df[picked.get("veh","")]).str.upper() if "veh" in picked else "GEN"
+
+    # Fechas y SPR
+    df = _norm_date_col(df, picked["fecha"]).rename(columns={picked["fecha"]: "fecha"})
+    df["spr"] = _to_num(df[picked["spr"]]).astype(float)
+
+    # 🔒 Filtra filas sin fecha válida para evitar NaTType/isocalendar
+    df = df.dropna(subset=["fecha"]).copy()
+
+    # DOW y año/semana ISO de forma segura
+    dt = pd.to_datetime(df["fecha"], errors="coerce")
+    iso = dt.dt.isocalendar()
+    df["dow"] = dt.dt.weekday
+    df["iso_year"] = iso["year"].astype("Int64")
+    df["iso_week"] = iso["week"].astype("Int64")
+
+    # Descarta cualquier fila que aún no tenga año/semana/dow calculados (muy raro)
+    df = df.dropna(subset=["dow","iso_year","iso_week"]).copy()
+    df[["dow","iso_year","iso_week"]] = df[["dow","iso_year","iso_week"]].astype(int)
+
     return df[["fecha","svc","dm","veh","spr","dow","iso_year","iso_week"]]
 
 
