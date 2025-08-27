@@ -279,60 +279,112 @@ def load_rentals_by_vehicle() -> pd.DataFrame:
     return out
 
 
-def load_crowd_caps() -> pd.DataFrame:
-    df = _lower_cols(read_ws(SHEET_ID, "Crowd"))
-    # layout detallado típico:
-    # 'svc', 'base entre semana', 'base sabado', 'base domingo',
-    # 'holgura entre semana', 'holgura sabado', 'holgura domingo'
-    if "svc" not in df.columns:
-        # intentar encontrar / renombrar
-        cand = [c for c in df.columns if "svc" in c]
-        if cand:
-            df = df.rename(columns={cand[0]:"svc"})
-        else:
-            # Layout alterno (3 columnas base* + 3 columnas e1*) detectado en sesiones previas
-            base_cols = [c for c in df.columns if str(c).lower().startswith("base")]
-            e1_cols   = [c for c in df.columns if str(c).lower().startswith(("e1","holgura"))]
-            if len(base_cols) >= 3 and len(e1_cols) >= 3:
-                df["svc"] = SSTRIP(df.iloc[:,1]).str.upper()
-                df = df.rename(columns={
-                    base_cols[0]: "base entre semana",
-                    base_cols[1]: "base sabado",
-                    base_cols[2]: "base domingo",
-                    e1_cols[0]:   "holgura entre semana",
-                    e1_cols[1]:   "holgura sabado",
-                    e1_cols[2]:   "holgura domingo",
-                })
-            else:
-                raise ValueError(f"Crowd: no se reconoció layout. Encabezados: {list(df.columns)}")
+def load_crowd() -> pd.DataFrame:
+    """Lee Crowd y devuelve columnas normalizadas:
+       svc, base_wd, base_sa, base_su, e1_wd, e1_sa, e1_su (enteros)."""
+    raw = read_ws(SHEET_ID, "Crowd")
+    df = raw.copy()
 
-    df["svc"] = SSTRIP(df["svc"]).str.upper()
+    # normaliza nombres actuales (los que ya vinieron como header de primera fila)
+    cols = [str(c).strip().lower() if str(c).strip() else f"col_{i+1}" for i, c in enumerate(df.columns)]
+    df.columns = cols
 
-    def pick(name):
-        for c in df.columns:
-            if name in c:
-                return c
+    # localizar SVC
+    svc_col = None
+    for cand in ("svc", "svcs", "svc "):
+        if cand in df.columns:
+            svc_col = cand
+            break
+    if not svc_col:
+        raise ValueError("Crowd: falta columna 'svc'.")
+
+    # --------- CASO A) Encabezado en 2 filas: 'base' ... 'e1' en fila 1 y 'entre/sab/dom' en fila 2 ----------
+    if ("base" in df.columns) and ("e1" in df.columns):
+        # fila de etiquetas secundarias (entre semana / sábado / domingo)
+        labrow = df.iloc[0].astype(str).str.strip().str.lower()
+
+        def _take3(start_idx: int) -> list[str]:
+            # toma 3 columnas seguidas empezando en start_idx
+            return cols[start_idx:start_idx+3]
+
+        b_idx = cols.index("base")
+        e_idx = cols.index("e1")
+        base_cols = _take3(b_idx)
+        e1_cols   = _take3(e_idx)
+
+        def _reorder(group_cols: list[str]) -> tuple[str, str, str]:
+            labs = [str(labrow.get(c, "")).lower() for c in group_cols]
+            mapping = {}
+            for c, lab in zip(group_cols, labs):
+                if ("entre" in lab) or ("sem" in lab) or (lab in ("wd", "entre semana")):
+                    mapping["wd"] = c
+                elif "sab" in lab:
+                    mapping["sa"] = c
+                elif "dom" in lab:
+                    mapping["su"] = c
+            # completa por orden si faltara alguno
+            order = ["wd", "sa", "su"]
+            out = [mapping.get(k) for k in order]
+            rest = [c for c in group_cols if c not in out]
+            for i in range(3):
+                if out[i] is None and rest:
+                    out[i] = rest.pop(0)
+            return out[0], out[1], out[2]
+
+        b_wd, b_sa, b_su = _reorder(base_cols)
+        e_wd, e_sa, e_su = _reorder(e1_cols)
+
+        # quita la fila de etiquetas secundarias
+        df = df.iloc[1:].reset_index(drop=True)
+
+        # coerción numérica
+        for c in [b_wd, b_sa, b_su, e_wd, e_sa, e_su]:
+            df[c] = _to_num(df[c]).fillna(0)
+
+        out = pd.DataFrame({
+            "svc": df[svc_col].astype(str).str.strip().str.upper(),
+            "base_wd": df[b_wd].astype(int),
+            "base_sa": df[b_sa].astype(int),
+            "base_su": df[b_su].astype(int),
+            "e1_wd": df[e_wd].astype(int),
+            "e1_sa": df[e_sa].astype(int),
+            "e1_su": df[e_su].astype(int),
+        })
+        return out.groupby("svc", as_index=False).sum()
+
+    # --------- CASO B) Layout detallado: columnas ya vienen separadas ---------
+    # buscamos columnas que contengan las palabras clave
+    def _pick(name_opts: list[str]) -> str | None:
+        for n in df.columns:
+            n2 = str(n).lower()
+            if any(opt in n2 for opt in name_opts):
+                return n
         return None
 
-    c_base_wd = pick("base entre semana")
-    c_base_sa = pick("base sabado")
-    c_base_su = pick("base domingo")
-    c_e1_wd   = pick("holgura entre semana")
-    c_e1_sa   = pick("holgura sabado")
-    c_e1_su   = pick("holgura domingo")
+    c_base_wd = _pick(["base entre", "entre sem"])
+    c_base_sa = _pick(["base sab"])
+    c_base_su = _pick(["base dom"])
+    c_e1_wd   = _pick(["holgura entre", "e1 entre"])
+    c_e1_sa   = _pick(["holgura sab", "e1 sab"])
+    c_e1_su   = _pick(["holgura dom", "e1 dom"])
 
-    for c in [c_base_wd,c_base_sa,c_base_su,c_e1_wd,c_e1_sa,c_e1_su]:
-        if c is None: raise ValueError("Crowd: faltan columnas base/e1 (entre semana/sábado/domingo).")
+    need_cols = [c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]
+    if any(c is None for c in need_cols):
+        raise ValueError(
+            f"Crowd: no se reconoció layout. Encabezados: {list(df.columns)}\n"
+            "Opciones soportadas:\n"
+            "  • Encabezado en 2 filas: 'base'...'e1' + segunda fila con 'entre/sab/dom'.\n"
+            "  • Detallado: 'Base entre semana', 'Base sábado', 'Base domingo', "
+            "'Holgura entre semana', 'Holgura sábado', 'Holgura domingo'."
+        )
 
-    for c in [c_base_wd,c_base_sa,c_base_su,c_e1_wd,c_e1_sa,c_e1_su]:
-        df[c] = _to_num(df[c]).fillna(0).astype(int)
+    for c in need_cols:
+        df[c] = _to_num(df[c]).fillna(0)
 
-    out = df[["svc", c_base_wd,c_base_sa,c_base_su, c_e1_wd,c_e1_sa,c_e1_su]].copy()
-    out = out.rename(columns={
-        c_base_wd:"base_wd", c_base_sa:"base_sa", c_base_su:"base_su",
-        c_e1_wd:"e1_wd",     c_e1_sa:"e1_sa",     c_e1_su:"e1_su",
-    })
-    return out
+    out = df[[svc_col, c_base_wd, c_base_sa, c_base_su, c_e1_wd, c_e1_sa, c_e1_su]].copy()
+    out.columns = ["svc", "base_wd", "base_sa", "base_su", "e1_wd", "e1_sa", "e1_su"]
+    out["svc"] = out["svc"].astype(str).str.strip().str.upper()
+    return out.groupby("svc", as_index=False).sum()
 
 
 # ====== SPR (promedio/peak/plan) por SVC-fecha ======
