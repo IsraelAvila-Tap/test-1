@@ -514,6 +514,7 @@ def schedule_mlp_rest(df_day: pd.DataFrame) -> pd.DataFrame:
     return out.drop(columns=["week_key"])
 
 # ------------- MOTOR PRINCIPAL -------------
+# ------------- MOTOR PRINCIPAL -------------
 def compute_plan(spr_mode: str, sel_svcs=None):
     with st.status("Cargando datos...", expanded=True) as status:
         st.write("1/6 FCST…");       fcst       = load_fcst()
@@ -525,23 +526,20 @@ def compute_plan(spr_mode: str, sel_svcs=None):
         status.update(label="Datos listos ✅", state="complete")
 
     # ---- FILTRO DE SVC (si se usa) ----
-if sel_svcs:
-    # normaliza a strings en MAYÚSCULAS sin espacios
-    sel_svcs = set(str(s).strip().upper() for s in sel_svcs if s)
-
-    fcst       = fcst[fcst["svc"].isin(sel_svcs)]
-    spr_real   = spr_real[spr_real["svc"].isin(sel_svcs)]
-    capacity   = capacity[capacity["svc"].isin(sel_svcs)]
-    srm        = srm[srm["svc"].isin(sel_svcs)]
-    rentals    = rentals[rentals["svc"].isin(sel_svcs)]
-    crowd_caps = crowd_caps[crowd_caps["svc"].isin(sel_svcs)]
-
+    if sel_svcs:
+        sel_svcs = set(str(s).strip().upper() for s in sel_svcs if s)
+        fcst       = fcst[fcst["svc"].isin(sel_svcs)]
+        spr_real   = spr_real[spr_real["svc"].isin(sel_svcs)]
+        capacity   = capacity[capacity["svc"].isin(sel_svcs)]
+        srm        = srm[srm["svc"].isin(sel_svcs)]
+        rentals    = rentals[rentals["svc"].isin(sel_svcs)]
+        crowd_caps = crowd_caps[crowd_caps["svc"].isin(sel_svcs)]
 
     # SPRs
     spr_tbl = compute_spr_scenarios(fcst, spr_real, capacity)
     spr_col = {"promedio":"spr_promedio","peak":"spr_peak","plan":"spr_plan"}[spr_mode]
 
-    # Share crowd objetivo desde Capacity
+    # Share crowd objetivo desde Capacity (Shipments, con fallback a Routes)
     share_tbl = compute_crowd_share(capacity)
 
     # CROWD caps por día
@@ -563,7 +561,7 @@ if sel_svcs:
     df["spr_objetivo"] = pd.to_numeric(df[spr_col], errors="coerce")
     df.drop(columns=[spr_col], inplace=True)
 
-    # Remanente (si luego descontamos DC/SP, aquí es el lugar)
+    # Remanente (si más adelante descontamos DC/SP, se hace sobre q_rem)
     df["q_rem"] = df["shipments"].clip(lower=0)
 
     # Rutas requeridas
@@ -574,9 +572,8 @@ if sel_svcs:
     )
     df["alerta_spr_missing"] = ((df["q_rem"]>0) & (df["spr_objetivo"].isna() | (df["spr_objetivo"]<=0)))
 
-    # Target Crowd
+    # Crowd objetivo y asignación base/E1
     df["routes_crowd_target"] = np.ceil(df["routes_need_total"] * df["share_crowd_obj"])
-    # Asignación Crowd base y E1 (high cost)
     df["routes_crowd_base"] = np.minimum(df["routes_crowd_target"], df["crowd_base_routes"])
     df["routes_crowd_e1"] = np.minimum(
         (df["routes_crowd_target"] - df["routes_crowd_base"]).clip(lower=0),
@@ -585,31 +582,28 @@ if sel_svcs:
     df["routes_crowd_alloc"] = df["routes_crowd_base"] + df["routes_crowd_e1"]
     df["alerta_crowd_high"] = df["routes_crowd_e1"] > 0
 
-    # Rentals directo (rutas fijas)
+    # Rentals y MLP
     df["routes_after_crowd"] = (df["routes_need_total"] - df["routes_crowd_alloc"]).clip(lower=0)
     df["routes_rentals_alloc"] = np.minimum(df["routes_after_crowd"], df["rentals_routes_max"])
-    # Necesidad para MLP
     df["routes_mlp_need"] = (df["routes_after_crowd"] - df["routes_rentals_alloc"]).clip(lower=0)
 
-    # Descansos MLP por semana y SVC
     rest_base = df[["fecha","svc","routes_mlp_need","sdd_routes_max","spot_routes_max"]].copy()
     rest_sched = schedule_mlp_rest(rest_base)
     df = df.merge(rest_sched[["fecha","svc","sdd_trabaja","spot_trabaja"]], on=["fecha","svc"], how="left")
     df["routes_mlp_cap_day"] = (df["sdd_routes_max"]*df["sdd_trabaja"] + df["spot_routes_max"]*df["spot_trabaja"]).fillna(0.0)
     df["routes_mlp_alloc"] = np.minimum(df["routes_mlp_need"], df["routes_mlp_cap_day"])
 
-    # Déficit + Shipments logrados
+    # Déficit y métricas
     df["routes_deficit"] = (df["routes_mlp_need"] - df["routes_mlp_alloc"]).clip(lower=0)
     df["routes_total_alloc"] = (df["routes_crowd_alloc"] + df["routes_rentals_alloc"] + df["routes_mlp_alloc"])
     df["shipments_plan"] = np.where(df["spr_objetivo"]>0, df["routes_total_alloc"] * df["spr_objetivo"], 0.0)
     df["alerta_deficit"] = df["shipments_plan"] + 1e-6 < df["shipments"]
 
-    # Métricas
     df["spr_logrado"] = np.where(df["routes_total_alloc"]>0, df["q_rem"] / df["routes_total_alloc"], np.nan)
     df["share_crowd_real"] = np.where(df["routes_need_total"]>0, df["routes_crowd_alloc"] / df["routes_need_total"], 0.0)
     df["risk_flag"] = df["alerta_deficit"] | df["alerta_spr_missing"]
 
-    # --- sanidad final enteros ---
+    # Convertir a enteros seguros al final
     int_cols = [
         "routes_need_total","routes_crowd_target","routes_crowd_base","routes_crowd_e1",
         "routes_crowd_alloc","routes_after_crowd","routes_rentals_alloc","routes_mlp_need",
@@ -618,7 +612,7 @@ if sel_svcs:
     ]
     for c in int_cols:
         if c in df.columns:
-            df[c] = _to_intsafe(df[c])
+            df[c] = pd.to_numeric(df[c], errors="coerce").replace([np.inf,-np.inf], np.nan).fillna(0).round().astype(int)
 
     cols = [
         "fecha","svc","shipments","spr_objetivo",
@@ -629,7 +623,7 @@ if sel_svcs:
         "routes_deficit","routes_total_alloc","shipments_plan","spr_logrado","share_crowd_real",
         "alerta_spr_missing","alerta_deficit","risk_flag"
     ]
-    return df[cols].sort_values(["fecha","svc"])
+    return df[cols].sort_values(["fecha","svc"]).reset_index(drop=True)
 
 # ------------- SIDEBAR -------------
 with st.sidebar:
