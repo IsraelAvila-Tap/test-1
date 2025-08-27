@@ -10,6 +10,11 @@ elif "gcp_service_account" in st.secrets:
 if "PROJECT_KEY" in st.secrets:
     os.environ["PROJECT_KEY"] = st.secrets["PROJECT_KEY"]
 
+def SSTRIP(s: pd.Series) -> pd.Series:
+    """strip seguro para Series (convierte a string y aplica .str.strip())."""
+    return s.astype(str).str.strip()
+
+
 # ---------------- Imports ----------------
 import yaml, pandas as pd, numpy as np
 from math import ceil
@@ -72,17 +77,20 @@ def load_capacity() -> pd.DataFrame:
     if miss := (need - set(df.columns)):
         raise ValueError(f"Capacity: faltan columnas {miss}")
     df = df.rename(columns={
-        "Delivery model":"dm","Tipo":"tipo","SVC":"svc","Tipo DM":"veh","Fecha":"fecha","Cantidad":"cantidad"
-    })
-    df["dm"]  = df["dm"].astype(str).strip().str.upper()
-    df["veh"] = df["veh"].astype(str).strip().str.upper()
-    df["svc"] = df["svc"].astype(str).strip().str.upper()
+    "Delivery model":"dm","Tipo":"tipo","SVC":"svc","Tipo DM":"veh","Fecha":"fecha","Cantidad":"cantidad"})
+    df["dm"]   = SSTRIP(df["dm"]).str.upper()
+    df["veh"]  = SSTRIP(df["veh"]).str.upper()
+    df["svc"]  = SSTRIP(df["svc"]).str.upper()
+    df["tipo"] = SSTRIP(df["tipo"<]).str.lower()
     df["cantidad"] = _to_num(df["cantidad"]).fillna(0.0)
+
     return df
 
 @st.cache_data(ttl=300)
 def compute_crowd_share(capacity: pd.DataFrame) -> pd.DataFrame:
     cap = capacity.copy()
+    cap["tipo"] = SSTRIP(cap["tipo"]).str.lower()
+    cap["dm"]   = SSTRIP(cap["dm"]).str.upper()
     cap["tipo"] = cap["tipo"].str.strip().str.lower()
     cap["dm"]   = cap["dm"].astype(str).str.upper()
     m_ship = cap["tipo"].eq("shipments")
@@ -177,10 +185,13 @@ def load_rentals_by_vehicle() -> pd.DataFrame:
     veh_col = next((c for c in df.columns if "tipo de veh" in c.lower()), None)
     if not svc_col or not qty_col:
         raise ValueError("Rentals: se esperan columnas SVC/SVCS y 'Unidades ...'")
-    df["svc"] = df[svc_col].astype(str).str.strip().str.upper()
-    df["veh"] = (df[veh_col].astype(str).str.strip().str.upper() if veh_col else "GEN")
+    df["dm"]  = SSTRIP(df["dm"]).str.upper()
+    df["veh"] = SSTRIP(df["veh"]).str.upper()
+    df["svc"] = SSTRIP(df["svc"]).str.upper()
     df["units"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0).astype(int)
     out = df.groupby(["svc","veh"], as_index=False)["units"].sum()
+    
+
     return out  # svc, veh, units
 
 # ---------------- Crowd (cap base/E1 por día) ----------------
