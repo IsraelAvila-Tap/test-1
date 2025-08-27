@@ -5,8 +5,7 @@ import os, json, yaml
 import pandas as pd
 import numpy as np
 import streamlit as st
-from math import ceil
-from datetime import timedelta, datetime, date
+from datetime import timedelta, date
 
 # --- Secrets (Streamlit Cloud) ---
 # Acepta GOOGLE_SERVICE_ACCOUNT_JSON como string o bloque [gcp_service_account]
@@ -118,7 +117,7 @@ def load_capacity() -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def load_srm() -> pd.DataFrame:
-    # Lectura cruda para detectar header real (por si hay filas superiores con totales)
+    # Lectura cruda para detectar header real
     gc = _client()
     sh = gc.open_by_key(SHEET_ID)
     ws = sh.worksheet("SRM")
@@ -251,9 +250,8 @@ def load_crowd_caps() -> pd.DataFrame:
     if df.empty:
         raise ValueError("Crowd: hoja vacía.")
 
-    # SVC por nombre/patrón
     cand_svc = [c for c in df.columns if any(k in c.replace(" ", "")
-                 for k in ["svc","svcs","facility","facilidad","centro","centrooperativo","estacion","station","lc","logisticcenter"])]
+                 for k in ["svc","svcs","facility","estacion","station","lc","logisticcenter","centro"])]
     if not cand_svc:
         import re
         pat = re.compile(r"^[A-Z]{3,4}\d{1,2}$")
@@ -352,9 +350,14 @@ def compute_spr_scenarios(fcst: pd.DataFrame, spr_real: pd.DataFrame, capacity: 
             v = spr_exec_map.get((dk,s), np.nan)
             if pd.notna(v): vals.append(float(v))
         if not vals:
-            mask = (spr_real["svc"]==s) & (spr_real["fecha"].between(d - timedelta(days=28), d - timedelta(days=1)))
+            mask = (spr_real["svc"]==s) & (spr_real["fecha"].between(d - timedelta(days=56), d - timedelta(days=1)))
             vals = list(spr_real.loc[mask,"spr_exec"])
-        return _safe_mean(vals)
+        v = _safe_mean(vals)
+        # fallback por SVC si sigue vacío
+        if (pd.isna(v) or v<=0) and not spr_real.empty:
+            v = float(spr_real.loc[spr_real["svc"].eq(s), "spr_exec"].mean())
+        return v
+
     target["spr_promedio"] = target.apply(avg_last4, axis=1)
 
     def avg_peak(row):
@@ -366,9 +369,15 @@ def compute_spr_scenarios(fcst: pd.DataFrame, spr_real: pd.DataFrame, capacity: 
             m = (spr_real["svc"].eq(s) & spr_real["iso_year"].eq(yr) &
                  spr_real["iso_week"].between(19,23) & spr_real["dow"].eq(dow))
             vals = list(spr_real.loc[m,"spr_exec"])
-        return _safe_mean(vals)
+        v = _safe_mean(vals)
+        if pd.isna(v) or v<=0:
+            v = target.loc[(target["fecha"]==d)&(target["svc"]==s),"spr_promedio"].values
+            v = float(v[0]) if len(v) else np.nan
+        return v
+
     target["spr_peak"] = target.apply(avg_peak, axis=1)
 
+    # SPR_plan desde Capacity (Tipo == 'SPR')
     cap = capacity.copy()
     m_spr = cap["tipo"].str.strip().str.lower().eq("spr")
     spr_plan = cap.loc[m_spr, ["svc","fecha","cantidad"]].rename(columns={"cantidad":"spr_plan"})
@@ -379,24 +388,69 @@ def compute_spr_scenarios(fcst: pd.DataFrame, spr_real: pd.DataFrame, capacity: 
 
     return target[["fecha","svc","spr_promedio","spr_peak","spr_plan"]]
 
-# ------------- SHARE CROWD (desde Capacity → Shipments) -------------
+# ------------- SHARE CROWD (Capacity → Shipments; fallback Routes) -------------
 def compute_crowd_share(capacity: pd.DataFrame) -> pd.DataFrame:
     cap = capacity.copy()
     cap["tipo"] = cap["tipo"].str.strip().str.lower()
     cap["delivery model"] = cap["delivery model"].str.strip().str.lower()
 
-    m_ship = cap["tipo"].eq("shipments")
-    ship = cap.loc[m_ship, ["fecha","svc","delivery model","cantidad"]].copy()
+    # 1) Shipments
+    ship = cap.loc[cap["tipo"].eq("shipments"), ["fecha","svc","delivery model","cantidad"]].copy()
+    out_ship = None
+    if not ship.empty:
+        tot = (ship.groupby(["fecha","svc"], as_index=False)["cantidad"]
+                    .sum().rename(columns={"cantidad":"ship_total"}))
+        crw = (ship.loc[ship["delivery model"].eq("crowd")]
+                    .groupby(["fecha","svc"], as_index=False)["cantidad"]
+                    .sum().rename(columns={"cantidad":"ship_crowd"}))
+        out_ship = tot.merge(crw, on=["fecha","svc"], how="left")
+        out_ship["ship_crowd"] = pd.to_numeric(out_ship["ship_crowd"], errors="coerce").fillna(0.0)
+        out_ship["share_crowd_obj"] = np.where(
+            out_ship["ship_total"] > 0,
+            (out_ship["ship_crowd"] / out_ship["ship_total"]).clip(0, 1),
+            np.nan
+        )
 
-    tot = ship.groupby(["fecha","svc"], as_index=False)["cantidad"].sum().rename(columns={"cantidad":"ship_total"})
-    crw = ship.loc[ship["delivery model"].eq("crowd")].groupby(["fecha","svc"], as_index=False)["cantidad"].sum().rename(columns={"cantidad":"ship_crowd"})
-    out = tot.merge(crw, on=["fecha","svc"], how="left").fillna({"ship_crowd":0.0})
-    out["share_crowd_obj"] = np.where(out["ship_total"]>0, (out["ship_crowd"]/out["ship_total"]).clip(0,1), 0.0)
+    # 2) Routes (fallback)
+    routes = cap.loc[cap["tipo"].eq("routes"), ["fecha","svc","delivery model","cantidad"]].copy()
+    out_routes = None
+    if not routes.empty:
+        tot_r = (routes.groupby(["fecha","svc"], as_index=False)["cantidad"]
+                      .sum().rename(columns={"cantidad":"routes_total"}))
+        crw_r = (routes.loc[routes["delivery model"].eq("crowd")]
+                      .groupby(["fecha","svc"], as_index=False)["cantidad"]
+                      .sum().rename(columns={"cantidad":"routes_crowd"}))
+        out_routes = tot_r.merge(crw_r, on=["fecha","svc"], how="left")
+        out_routes["routes_crowd"] = pd.to_numeric(out_routes["routes_crowd"], errors="coerce").fillna(0.0)
+        out_routes["share_crowd_routes"] = np.where(
+            out_routes["routes_total"] > 0,
+            (out_routes["routes_crowd"] / out_routes["routes_total"]).clip(0, 1),
+            np.nan
+        )
+
+    # 3) Combinar
+    if out_ship is None and out_routes is None:
+        return pd.DataFrame(columns=["fecha","svc","share_crowd_obj","ship_total","ship_crowd"])
+
+    if out_ship is None:
+        out = out_routes[["fecha","svc"]].copy()
+        out["share_crowd_obj"] = out_routes["share_crowd_routes"]
+        out["ship_total"] = 0.0
+        out["ship_crowd"] = 0.0
+    else:
+        out = out_ship[["fecha","svc","share_crowd_obj","ship_total","ship_crowd"]].copy()
+        if out_routes is not None:
+            out = out.merge(out_routes[["fecha","svc","share_crowd_routes"]], on=["fecha","svc"], how="left")
+            out["share_crowd_obj"] = out["share_crowd_obj"].fillna(out["share_crowd_routes"])
+            out.drop(columns=["share_crowd_routes"], inplace=True)
+
+    out["share_crowd_obj"] = pd.to_numeric(out["share_crowd_obj"], errors="coerce").fillna(0.0).clip(0,1)
+    out["ship_total"] = pd.to_numeric(out.get("ship_total", 0), errors="coerce").fillna(0.0)
+    out["ship_crowd"] = pd.to_numeric(out.get("ship_crowd", 0), errors="coerce").fillna(0.0)
     return out[["fecha","svc","share_crowd_obj","ship_total","ship_crowd"]]
 
 # ------------- CROWD CAP POR DÍA -------------
 def map_crowd_capacity_by_date(target_days: pd.DataFrame, crowd_caps: pd.DataFrame) -> pd.DataFrame:
-    # target_days: FECHA×SVC
     def cap_for(row):
         s, d = row["svc"], row["fecha"]
         dow = _weekday(d)  # 0-4 wd, 5 sab, 6 dom
@@ -410,24 +464,16 @@ def map_crowd_capacity_by_date(target_days: pd.DataFrame, crowd_caps: pd.DataFra
             base, e1 = r.get("base_sa", 0), r.get("e1_sa", 0)
         else:
             base, e1 = r.get("base_su", 0), r.get("e1_su", 0)
-
-        # saneo numérico -> 0 si NaN/inf
-        base = pd.to_numeric(base, errors="coerce")
-        e1   = pd.to_numeric(e1,   errors="coerce")
+        base = pd.to_numeric(base, errors="coerce"); e1 = pd.to_numeric(e1, errors="coerce")
         base = 0.0 if not np.isfinite(base) else float(base)
         e1   = 0.0 if not np.isfinite(e1)   else float(e1)
-
         return pd.Series({"crowd_base_routes": base, "crowd_e1_routes": e1})
 
     tmp = target_days.apply(cap_for, axis=1)
     out = pd.concat([target_days.reset_index(drop=True), tmp], axis=1)
-
-    # cast final seguro (por si algo quedó float)
     out["crowd_base_routes"] = _to_intsafe(out["crowd_base_routes"])
     out["crowd_e1_routes"]   = _to_intsafe(out["crowd_e1_routes"])
     return out
-
-    return pd.concat([target_days.reset_index(drop=True), tmp], axis=1)
 
 # ------------- SCHEDULER MLP DESCANSOS -------------
 def schedule_mlp_rest(df_day: pd.DataFrame) -> pd.DataFrame:
@@ -460,9 +506,7 @@ def schedule_mlp_rest(df_day: pd.DataFrame) -> pd.DataFrame:
     return out.drop(columns=["week_key"])
 
 # ------------- MOTOR PRINCIPAL -------------
-
 def compute_plan(spr_mode: str, sel_svcs=None):
-
     with st.status("Cargando datos...", expanded=True) as status:
         st.write("1/6 FCST…");       fcst       = load_fcst()
         st.write("2/6 SPR (real)…"); spr_real   = load_spr_real()
@@ -472,9 +516,9 @@ def compute_plan(spr_mode: str, sel_svcs=None):
         st.write("6/6 Crowd…");      crowd_caps = load_crowd_caps()
         status.update(label="Datos listos ✅", state="complete")
 
-        # ---- FILTRO DE SVC (aplicar temprano para que todo el cálculo use solo esos) ----
+    # ---- FILTRO DE SVC (si se usa) ----
     if sel_svcs:
-        sel_svcs = set([str(s).strip().upper() for s in sel_svcs])
+        sel_svcs = set([str(s).strip().str.upper() if hasattr(s,'strip') else str(s).upper() for s in sel_svcs])
         fcst       = fcst[fcst["svc"].isin(sel_svcs)]
         spr_real   = spr_real[spr_real["svc"].isin(sel_svcs)]
         capacity   = capacity[capacity["svc"].isin(sel_svcs)]
@@ -482,13 +526,14 @@ def compute_plan(spr_mode: str, sel_svcs=None):
         rentals    = rentals[rentals["svc"].isin(sel_svcs)]
         crowd_caps = crowd_caps[crowd_caps["svc"].isin(sel_svcs)]
 
-
     # SPRs
     spr_tbl = compute_spr_scenarios(fcst, spr_real, capacity)
     spr_col = {"promedio":"spr_promedio","peak":"spr_peak","plan":"spr_plan"}[spr_mode]
 
-    # Share crowd
-    share_tbl   = compute_crowd_share(capacity)
+    # Share crowd objetivo desde Capacity
+    share_tbl = compute_crowd_share(capacity)
+
+    # CROWD caps por día
     target_days = fcst[["fecha","svc"]].drop_duplicates()
     crowd_daily = map_crowd_capacity_by_date(target_days, crowd_caps)
 
@@ -501,18 +546,16 @@ def compute_plan(spr_mode: str, sel_svcs=None):
           .merge(spr_tbl[["fecha","svc",spr_col]], on=["fecha","svc"], how="left")
          )
 
-    # Limpieza/nulos (mantén todo en float por ahora)
-    for c in ["share_crowd_obj","crowd_base_routes","crowd_e1_routes",
-              "sdd_routes_max","spot_routes_max","rentals_routes_max"]:
-        df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").replace([np.inf,-np.inf], np.nan).fillna(0.0)
-
+    # Limpieza/nulos (mantener float hasta el final)
+    for c in ["share_crowd_obj","crowd_base_routes","crowd_e1_routes","sdd_routes_max","spot_routes_max","rentals_routes_max"]:
+        df[c] = pd.to_numeric(df.get(c,0), errors="coerce").replace([np.inf,-np.inf], np.nan).fillna(0.0)
     df["spr_objetivo"] = pd.to_numeric(df[spr_col], errors="coerce")
     df.drop(columns=[spr_col], inplace=True)
 
-    # Demanda remanente
+    # Remanente (si luego descontamos DC/SP, aquí es el lugar)
     df["q_rem"] = df["shipments"].clip(lower=0)
 
-    # Rutas requeridas (deja en float; casteamos al final)
+    # Rutas requeridas
     df["routes_need_total"] = np.where(
         (df["q_rem"]>0) & (df["spr_objetivo"]>0),
         np.ceil(df["q_rem"]/df["spr_objetivo"]),
@@ -520,42 +563,42 @@ def compute_plan(spr_mode: str, sel_svcs=None):
     )
     df["alerta_spr_missing"] = ((df["q_rem"]>0) & (df["spr_objetivo"].isna() | (df["spr_objetivo"]<=0)))
 
-    # Crowd
+    # Target Crowd
     df["routes_crowd_target"] = np.ceil(df["routes_need_total"] * df["share_crowd_obj"])
-    df["routes_crowd_base"]   = np.minimum(df["routes_crowd_target"], df["crowd_base_routes"])
-    df["routes_crowd_e1"]     = np.minimum(
+    # Asignación Crowd base y E1 (high cost)
+    df["routes_crowd_base"] = np.minimum(df["routes_crowd_target"], df["crowd_base_routes"])
+    df["routes_crowd_e1"] = np.minimum(
         (df["routes_crowd_target"] - df["routes_crowd_base"]).clip(lower=0),
         df["crowd_e1_routes"]
     )
-    df["routes_crowd_alloc"]  = df["routes_crowd_base"] + df["routes_crowd_e1"]
-    df["alerta_crowd_high"]   = df["routes_crowd_e1"] > 0
+    df["routes_crowd_alloc"] = df["routes_crowd_base"] + df["routes_crowd_e1"]
+    df["alerta_crowd_high"] = df["routes_crowd_e1"] > 0
 
-    # Rentals y MLP (todo en float)
-    df["routes_after_crowd"]    = (df["routes_need_total"] - df["routes_crowd_alloc"]).clip(lower=0)
-    df["routes_rentals_alloc"]  = np.minimum(df["routes_after_crowd"], df["rentals_routes_max"])
-    df["routes_mlp_need"]       = (df["routes_after_crowd"] - df["routes_rentals_alloc"]).clip(lower=0)
+    # Rentals directo (rutas fijas)
+    df["routes_after_crowd"] = (df["routes_need_total"] - df["routes_crowd_alloc"]).clip(lower=0)
+    df["routes_rentals_alloc"] = np.minimum(df["routes_after_crowd"], df["rentals_routes_max"])
+    # Necesidad para MLP
+    df["routes_mlp_need"] = (df["routes_after_crowd"] - df["routes_rentals_alloc"]).clip(lower=0)
 
     # Descansos MLP por semana y SVC
-    rest_base   = df[["fecha","svc","routes_mlp_need","sdd_routes_max","spot_routes_max"]].copy()
-    rest_sched  = schedule_mlp_rest(rest_base)
+    rest_base = df[["fecha","svc","routes_mlp_need","sdd_routes_max","spot_routes_max"]].copy()
+    rest_sched = schedule_mlp_rest(rest_base)
     df = df.merge(rest_sched[["fecha","svc","sdd_trabaja","spot_trabaja"]], on=["fecha","svc"], how="left")
-
-    # Capacidad MLP diaria (sin casts)
     df["routes_mlp_cap_day"] = (df["sdd_routes_max"]*df["sdd_trabaja"] + df["spot_routes_max"]*df["spot_trabaja"]).fillna(0.0)
-    df["routes_mlp_alloc"]   = np.minimum(df["routes_mlp_need"], df["routes_mlp_cap_day"])
+    df["routes_mlp_alloc"] = np.minimum(df["routes_mlp_need"], df["routes_mlp_cap_day"])
 
-    # Déficit + shipments logrados
-    df["routes_deficit"]      = (df["routes_mlp_need"] - df["routes_mlp_alloc"]).clip(lower=0)
-    df["routes_total_alloc"]  = (df["routes_crowd_alloc"] + df["routes_rentals_alloc"] + df["routes_mlp_alloc"])
-    df["shipments_plan"]      = np.where(df["spr_objetivo"]>0, df["routes_total_alloc"] * df["spr_objetivo"], 0.0)
-    df["alerta_deficit"]      = df["shipments_plan"] + 1e-6 < df["shipments"]
+    # Déficit + Shipments logrados
+    df["routes_deficit"] = (df["routes_mlp_need"] - df["routes_mlp_alloc"]).clip(lower=0)
+    df["routes_total_alloc"] = (df["routes_crowd_alloc"] + df["routes_rentals_alloc"] + df["routes_mlp_alloc"])
+    df["shipments_plan"] = np.where(df["spr_objetivo"]>0, df["routes_total_alloc"] * df["spr_objetivo"], 0.0)
+    df["alerta_deficit"] = df["shipments_plan"] + 1e-6 < df["shipments"]
 
     # Métricas
     df["spr_logrado"] = np.where(df["routes_total_alloc"]>0, df["q_rem"] / df["routes_total_alloc"], np.nan)
     df["share_crowd_real"] = np.where(df["routes_need_total"]>0, df["routes_crowd_alloc"] / df["routes_need_total"], 0.0)
     df["risk_flag"] = df["alerta_deficit"] | df["alerta_spr_missing"]
 
-    # --- SANIDAD FINAL: convertir a enteros de forma SEGURA ---
+    # --- sanidad final enteros ---
     int_cols = [
         "routes_need_total","routes_crowd_target","routes_crowd_base","routes_crowd_e1",
         "routes_crowd_alloc","routes_after_crowd","routes_rentals_alloc","routes_mlp_need",
@@ -577,18 +620,7 @@ def compute_plan(spr_mode: str, sel_svcs=None):
     ]
     return df[cols].sort_values(["fecha","svc"])
 
-
-# ------------- UI -------------
-with st.sidebar:
-    st.header("⚙️ Proyecto")
-    st.write(f"**Sheet:** `{SHEET_ID}`")
-    st.subheader("🔐 Credenciales")
-    svc_email = get_service_account_email()
-    if svc_email:
-        st.caption("Comparte el Sheet con:")
-        st.code(svc_email, language="text")
-    else:
-        st.warning("No se detectó Service Account.")
+# ------------- SIDEBAR -------------
 with st.sidebar:
     st.header("⚙️ Proyecto")
     st.write(f"**Sheet:** `{SHEET_ID}`")
@@ -600,7 +632,7 @@ with st.sidebar:
     else:
         st.warning("No se detectó Service Account.")
 
-    # ⬇⬇⬇ NUEVO: selector de SVC
+    # Selector de SVC
     svcs_all = sorted(load_fcst()["svc"].unique().tolist())
     default_svcs = ["SPB1", "SMX9", "SGD1", "SMT1"]
     sel_svcs = st.multiselect(
@@ -610,88 +642,95 @@ with st.sidebar:
         help="El cálculo y las tablas solo incluirán estos SVC."
     )
 
-
-
+# ------------- UI PRINCIPAL -------------
 st.title("Mel-IA — Plan táctico (diario por SVC)")
 spr_mode = st.radio("SPR objetivo", ["promedio","peak","plan"], index=0, horizontal=True)
 
 try:
     plan = compute_plan(spr_mode, sel_svcs)
-    # ======= VISTAS AGRUPADAS POR DELIVERY MODEL =======
-st.subheader("Vistas agrupadas por Delivery Model")
-
-# 1) FCST (base)  -----------------------------------
-fcst_tbl = (plan.groupby(["fecha","svc"], as_index=False)["shipments"].sum()
-                 .sort_values(["fecha","svc"]))
-
-# 2) Capacity → Shipments por Delivery Model --------
-cap_all = load_capacity()
-if sel_svcs:
-    cap_all = cap_all[cap_all["svc"].isin(sel_svcs)]
-cap_ship = cap_all[cap_all["tipo"].str.lower().eq("shipments")].copy()
-
-cap_dm = (cap_ship.groupby(["fecha","svc","delivery model"], as_index=False)["cantidad"]
-                 .sum())
-cap_dm_pivot = (cap_dm.pivot_table(index=["fecha","svc"],
-                                   columns="delivery model",
-                                   values="cantidad",
-                                   aggfunc="sum",
-                                   fill_value=0)
-                      .reset_index())
-cap_dm_pivot.columns = [c if isinstance(c, str) else str(c) for c in cap_dm_pivot.columns]
-
-# 3) PLAN → Shipments por Delivery Model -------------
-plan_ship_dm = plan.assign(
-    shp_crowd   = plan["routes_crowd_alloc"]   * plan["spr_objetivo"],
-    shp_rentals = plan["routes_rentals_alloc"] * plan["spr_objetivo"],
-    shp_mlp     = plan["routes_mlp_alloc"]     * plan["spr_objetivo"],
-)[["fecha","svc","shp_crowd","shp_rentals","shp_mlp"]] \
- .groupby(["fecha","svc"], as_index=False).sum() \
- .sort_values(["fecha","svc"])
-
-# 4) PLAN → Rutas por Delivery Model ----------------
-plan_routes_dm = plan.rename(columns={
-    "routes_crowd_alloc":   "crowd_routes",
-    "routes_rentals_alloc": "rentals_routes",
-    "routes_mlp_alloc":     "mlp_routes",
-})[["fecha","svc","crowd_routes","rentals_routes","mlp_routes"]] \
-  .groupby(["fecha","svc"], as_index=False).sum() \
-  .sort_values(["fecha","svc"])
-
-# 5) Mostrar en tabs --------------------------------
-t1, t2, t3, t4 = st.tabs([
-    "FCST (shipments)",
-    "Capacity → Shipments por DM",
-    "PLAN → Shipments por DM",
-    "PLAN → Rutas por DM"
-])
-
-with t1:
-    st.dataframe(fcst_tbl, use_container_width=True, hide_index=True)
-
-with t2:
-    st.dataframe(cap_dm_pivot, use_container_width=True, hide_index=True)
-
-with t3:
-    st.dataframe(plan_ship_dm, use_container_width=True, hide_index=True)
-
-with t4:
-    st.dataframe(plan_routes_dm, use_container_width=True, hide_index=True)
-# ======= FIN VISTAS AGRUPADAS ======================
-
     st.dataframe(plan, use_container_width=True, hide_index=True)
 
+    # ======= VISTAS AGRUPADAS POR DELIVERY MODEL =======
+    st.subheader("Vistas agrupadas por Delivery Model")
+
+    # 1) FCST (shipments)
+    fcst_tbl = (
+        plan.groupby(["fecha","svc"], as_index=False)["shipments"].sum()
+            .sort_values(["fecha","svc"])
+    )
+
+    # 2) Capacity → Shipments por Delivery Model
+    cap_all = load_capacity()
+    if sel_svcs:
+        cap_all = cap_all[cap_all["svc"].isin(sel_svcs)]
+    cap_ship = cap_all[cap_all["tipo"].str.lower().eq("shipments")].copy()
+
+    cap_dm = (
+        cap_ship.groupby(["fecha","svc","delivery model"], as_index=False)["cantidad"].sum()
+    )
+    cap_dm_pivot = (
+        cap_dm.pivot_table(index=["fecha","svc"],
+                           columns="delivery model",
+                           values="cantidad",
+                           aggfunc="sum",
+                           fill_value=0)
+              .reset_index()
+    )
+    cap_dm_pivot.columns = [c if isinstance(c, str) else str(c) for c in cap_dm_pivot.columns]
+
+    # 3) PLAN → Shipments por Delivery Model
+    plan_ship_dm = (
+        plan.assign(
+            shp_crowd   = plan["routes_crowd_alloc"]   * plan["spr_objetivo"],
+            shp_rentals = plan["routes_rentals_alloc"] * plan["spr_objetivo"],
+            shp_mlp     = plan["routes_mlp_alloc"]     * plan["spr_objetivo"],
+        )[["fecha","svc","shp_crowd","shp_rentals","shp_mlp"]]
+         .groupby(["fecha","svc"], as_index=False).sum()
+         .sort_values(["fecha","svc"])
+    )
+
+    # 4) PLAN → Rutas por Delivery Model
+    plan_routes_dm = (
+        plan.rename(columns={
+            "routes_crowd_alloc":   "crowd_routes",
+            "routes_rentals_alloc": "rentals_routes",
+            "routes_mlp_alloc":     "mlp_routes",
+        })[["fecha","svc","crowd_routes","rentals_routes","mlp_routes"]]
+         .groupby(["fecha","svc"], as_index=False).sum()
+         .sort_values(["fecha","svc"])
+    )
+
+    # Tabs
+    t1, t2, t3, t4 = st.tabs([
+        "FCST (shipments)",
+        "Capacity → Shipments por DM",
+        "PLAN → Shipments por DM",
+        "PLAN → Rutas por DM"
+    ])
+    with t1:
+        st.dataframe(fcst_tbl, use_container_width=True, hide_index=True)
+    with t2:
+        st.dataframe(cap_dm_pivot, use_container_width=True, hide_index=True)
+    with t3:
+        st.dataframe(plan_ship_dm, use_container_width=True, hide_index=True)
+    with t4:
+        st.dataframe(plan_routes_dm, use_container_width=True, hide_index=True)
+    # ======= FIN VISTAS AGRUPADAS ======================
+
     st.subheader("Riesgos por fecha")
-    resumen = (plan.groupby("fecha")
-               .agg(
-                   svcs_con_deficit=("alerta_deficit","sum"),
-                   rutas_deficit=("routes_deficit","sum"),
-                   svcs_sin_spr=("alerta_spr_missing","sum"),
-               ).reset_index())
+    resumen = (
+        plan.groupby("fecha")
+            .agg(
+                svcs_con_deficit=("alerta_deficit","sum"),
+                rutas_deficit=("routes_deficit","sum"),
+                svcs_sin_spr=("alerta_spr_missing","sum"),
+            ).reset_index()
+    )
     st.dataframe(resumen, use_container_width=True, hide_index=True)
 
 except Exception as e:
     st.error(f"Error: {e}")
+
 
 
 
