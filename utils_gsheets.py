@@ -1,8 +1,9 @@
-from functools import lru_cache
 import os, json, gspread
 from typing import Optional
+from functools import lru_cache
 from google.oauth2.service_account import Credentials
 import pandas as pd
+import numpy as np
 
 _SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -32,35 +33,52 @@ def get_service_account_email() -> Optional[str]:
         pass
     return None
 
+@lru_cache(maxsize=1)
 def _client():
     creds = _load_credentials()
     return gspread.authorize(creds)
 
-def read_ws(sheet_id: str, tab: str) -> pd.DataFrame:
-    gc = _client()
-    sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(tab)
+@lru_cache(maxsize=4)
+def _open_sheet(sheet_id: str):
+    return _client().open_by_key(sheet_id)
 
-    # Leemos todas las celdas (incluye filas vacías arriba)
+def _parse_date_series(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.strip()
+    d = pd.to_datetime(s, errors="coerce")  # intenta ISO primero
+    if d.notna().mean() < 0.8:
+        d = pd.to_datetime(s, errors="coerce", dayfirst=True)  # dd/mm/yyyy
+    return d.dt.date
+
+def read_ws(sheet_id: str, tab: str) -> pd.DataFrame:
+    sh = _open_sheet(sheet_id)
+    ws = sh.worksheet(tab)
     values = ws.get_all_values()
     if not values:
         return pd.DataFrame()
 
-    # 1) Detectar la fila de encabezados: primera con >=2 celdas no vacías
+    # Detecta fila de encabezado (favor tokens típicos)
     header_idx = 0
-    for i, row in enumerate(values[:50]):  # mira hasta las primeras 50 filas
-        nonempty = [c.strip() for c in row if c.strip() != ""]
-        if len(nonempty) >= 2:
+    best_i, best_score = 0, -1
+    tokens = ("svc","fecha","shipments","spr","delivery","tipo","cantidad","base","e1","total","spot","sdd","rentals")
+    for i, row in enumerate(values[:100]):
+        row_lower = [c.strip().lower() for c in row]
+        nonempty = sum(1 for c in row_lower if c)
+        alphas   = sum(1 for c in row_lower if any(ch.isalpha() for ch in c))
+        tok = sum(1 for c in row_lower if any(t in c for t in tokens))
+        score = (tok*2) + (1 if nonempty>=3 else 0) + (1 if alphas>=3 else 0)
+        if score > best_score:
+            best_score, best_i = score, i
+        if tok>=2 and nonempty>=3:
             header_idx = i
             break
+    else:
+        header_idx = best_i
 
     headers_raw = values[header_idx]
-
-    # 2) Sanear encabezados: reemplazar vacíos, evitar duplicados
-    seen = {}
-    headers = []
+    # Sanea headers y evita duplicados
+    seen, headers = {}, []
     for j, h in enumerate(headers_raw):
-        base = (h or "").replace("\n", " ").strip()
+        base = (h or "").replace("\n"," ").strip()
         if not base:
             base = f"col_{j+1}"
         name = base
@@ -71,18 +89,17 @@ def read_ws(sheet_id: str, tab: str) -> pd.DataFrame:
         seen[name] = True
         headers.append(name)
 
-    # 3) Construir DataFrame
-    rows = values[header_idx + 1 : ]
+    rows = values[header_idx+1:]
     df = pd.DataFrame(rows, columns=headers)
 
-    # 4) Quitar filas totalmente vacías
+    # Quita filas completamente vacías
     if not df.empty:
         mask_empty = df.apply(lambda r: "".join(map(str, r.values)).strip() == "", axis=1)
         df = df.loc[~mask_empty].copy()
 
-    # 5) Normalizar fechas si existe "Fecha" o "date"
+    # Normaliza fechas si existe "Fecha"/"date"
     for c in df.columns:
-        if c.strip().lower() in ("fecha", "date"):
-            df[c] = pd.to_datetime(df[c], errors="coerce").dt.date
+        if c.strip().lower() in ("fecha","date"):
+            df[c] = _parse_date_series(df[c])
 
     return df
