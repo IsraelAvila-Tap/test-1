@@ -745,7 +745,14 @@ try:
 except Exception:
     svc_list = []
 
-sel_svcs = st.multiselect("Filtrar SVC", options=svc_list, default=svc_list[:4])
+# --- Filtro SVC (UI) ---
+svc_list = sorted(plan["svc"].dropna().astype(str).unique().tolist())
+sel_svcs = st.multiselect("Filtrar SVC", svc_list, default=svc_list)
+
+# ✅ nunca evalúes un Series en un if; filtra sólo si la lista no está vacía
+if sel_svcs:  # sel_svcs es una lista, esto sí es válido en un if
+    plan = plan[plan["svc"].isin(sel_svcs)]
+
 
 # Ejecución
 try:
