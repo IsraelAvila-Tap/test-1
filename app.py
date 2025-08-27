@@ -167,48 +167,90 @@ def load_capacity() -> pd.DataFrame:
     return df[["fecha","svc","dm","veh","tipo","cantidad"]]
 
 
+# --- Helpers SRM (detectar encabezado y aplicarlo) ---
+def _find_header_row_by_svc_df(raw: pd.DataFrame, search_rows: int = 12) -> int:
+    """Devuelve el índice (0-based) de la fila que contiene 'svc'/'svcs'.
+    Si no aparece en las primeras 'search_rows' filas, usa fila 5 (índice 4)."""
+    for i in range(min(search_rows, len(raw))):
+        vals = (
+            raw.iloc[i]
+               .astype(str)
+               .str.replace(r"\s+", " ", regex=True)
+               .str.strip()
+               .str.lower()
+        )
+        if any(v in ("svc", "svcs", "svc ") for v in vals):
+            return i
+    return 4  # fallback: encabezado en fila 5
+
+def _apply_header_from_row(raw: pd.DataFrame, hdr_idx: int) -> pd.DataFrame:
+    """Usa la fila hdr_idx como header y devuelve el body con columnas normalizadas."""
+    hdr = (
+        raw.iloc[hdr_idx]
+           .astype(str)
+           .str.replace(r"[\r\n]+", " ", regex=True)
+           .str.replace(r"\s+", " ", regex=True)
+           .str.strip()
+           .str.lower()
+           .tolist()
+    )
+    hdr = [h if h else f"col_{i+1}" for i, h in enumerate(hdr)]
+    body = raw.iloc[hdr_idx + 1 :].copy()
+    body.columns = hdr
+    body = body.dropna(how="all", axis=1).reset_index(drop=True)
+    return body
+
+# --- SRM loader robusto (reemplaza tu load_srm actual por este) ---
 def load_srm() -> pd.DataFrame:
-    # SRM puede tener encabezado en fila 5 y muchísimas columnas.
+    # 1) Leemos tal cual (sin header_row)
     raw = read_ws(SHEET_ID, "SRM")
-    # detectamos fila header (primera fila que tenga alguna celda "svc")
-    header_row = None
-    for i in range(min(10, len(raw))):
-        row = [str(x).strip().lower() for x in raw.iloc[i].tolist()]
-        if any("svc" == x for x in row):
-            header_row = i
+
+    # 2) Detectamos la fila de encabezados por presencia de 'svc'
+    hdr_idx = _find_header_row_by_svc_df(raw)
+    df = _apply_header_from_row(raw, hdr_idx)
+
+    # 3) Normaliza nombres
+    df = df.rename(columns={c: (str(c).strip().lower()) for c in df.columns})
+
+    # 4) Localiza columna SVC
+    svc_col = None
+    for c in ("svc", "svcs", "svc "):
+        if c in df.columns:
+            svc_col = c
             break
-    if header_row is None:
-        # fallback: usamos fila 5 (0-based = 4)
-        header_row = 4
+    if not svc_col:
+        raise ValueError("SRM: no se encontró columna 'SVC' en el encabezado detectado.")
 
-    df = read_ws(SHEET_ID, "SRM", header_row=header_row)  # si tu util soporta header_row
-    df = _lower_cols(df)
+    df["svc"] = df[svc_col].astype(str).str.strip().str.upper()
 
-    if "svc" not in df.columns:
-        # buscar variantes
-        cand = [c for c in df.columns if "svc" in c]
-        if not cand: raise ValueError("SRM: no se encontró columna 'SVC'.")
-        df = df.rename(columns={cand[0]:"svc"})
-
-    df["svc"] = SSTRIP(df["svc"]).str.upper()
-
-    # sumar todas columnas que contengan 'sdd' y 'spot'
-    sdd_cols  = [c for c in df.columns if ("sdd" in c and "total" in c) or c.endswith("sdd")]
-    spot_cols = [c for c in df.columns if ("spot" in c and "total" in c) or c.endswith("spot")]
+    # 5) Detecta columnas SDD y SPOT (muy flexible; soporta cientos de columnas)
+    cols = list(df.columns)
+    sdd_cols  = [c for c in cols if "sdd"  in c]
+    spot_cols = [c for c in cols if "spot" in c]
 
     if not sdd_cols and not spot_cols:
-        # si no hay "total", suma cualquier columna que contenga sdd/spot
-        sdd_cols  = [c for c in df.columns if "sdd" in c]
-        spot_cols = [c for c in df.columns if "spot" in c]
+        raise ValueError(f"SRM: no se hallaron columnas con 'sdd' o 'spot'. Encabezados: {cols[:40]}")
 
-    for c in sdd_cols + spot_cols:
-        df[c] = _to_num(df[c]).fillna(0.0)
+    # 6) Suma segura (coerción numérica) por fila
+    def _sum_cols(clist):
+        if not clist:
+            return pd.Series(0, index=df.index)
+        tmp = df[clist].apply(_to_num, axis=0).fillna(0)
+        return tmp.sum(axis=1)
 
-    out = df[["svc"]].copy()
-    out["sdd_routes_max"]  = df[sdd_cols].sum(axis=1) if sdd_cols else 0.0
-    out["spot_routes_max"] = df[spot_cols].sum(axis=1) if spot_cols else 0.0
-    out = out.groupby("svc", as_index=False)[["sdd_routes_max","spot_routes_max"]].max()
+    df["_sdd"]  = _sum_cols(sdd_cols)
+    df["_spot"] = _sum_cols(spot_cols)
+
+    # 7) Agrega por SVC y devuelve capacidades diarias máximas en rutas
+    out = (df.groupby("svc", as_index=False)[["_sdd", "_spot"]]
+             .sum()
+             .rename(columns={"_sdd": "sdd_routes_max", "_spot": "spot_routes_max"}))
+
+    out[["sdd_routes_max", "spot_routes_max"]] = (
+        out[["sdd_routes_max", "spot_routes_max"]].round(0).astype(int)
+    )
     return out
+
 
 
 def load_rentals_by_vehicle() -> pd.DataFrame:
