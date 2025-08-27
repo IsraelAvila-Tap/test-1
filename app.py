@@ -118,22 +118,51 @@ def load_capacity() -> pd.DataFrame:
 @st.cache_data(ttl=300)
 def load_srm() -> pd.DataFrame:
     """
-    Lectura rápida de SRM limitando el rango para evitar cuelgues.
-    Ajusta SRM_RANGE si tu SRM ocupa más filas/columnas.
+    Lectura rápida y dinámica de SRM.
+    - Usa rango A{HEADER_ROW}:{LASTCOL}{HEADER_ROW+MAX_ROWS}
+    - Detecta columna SVC y suma columnas con 'sdd' y/o 'spot' (cualquier nombre que las contenga).
+    Ajusta SRM_MAX_ROWS/HEADER_ROW por env si lo necesitas.
     """
+    # ----- parámetros (puedes ajustar por env en Streamlit Secrets/Vars) -----
+    HEADER_ROW = int(os.getenv("SRM_HEADER_ROW", "5"))          # fila donde está el header (típicamente 5)
+    MAX_ROWS   = int(os.getenv("SRM_MAX_ROWS", "2000"))         # cuántas filas max leer desde el header
+    MAX_COLS   = int(os.getenv("SRM_MAX_COLS", "1600"))         # seguridad para tope de columnas (1550 -> ok)
+
+    # helper: número de columna -> letra A1
+    def _col_to_a1(n: int) -> str:
+        s = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            s = chr(65 + r) + s
+        return s
+
     gc = _client()
     sh = gc.open_by_key(SHEET_ID)
     ws = sh.worksheet("SRM")
 
-    # --- Ajusta este rango si necesitas más (anchura o filas) ---
-    SRM_RANGE = os.getenv("SRM_RANGE", "A5:AZ500")   # header en A5, hasta col AZ y 500 filas
-    cells = ws.get(SRM_RANGE, value_render_option="UNFORMATTED_VALUE")
-    if not cells:
-        raise ValueError("SRM: rango vacío.")
+    # Determinar último índice de columna a leer (dinámico, con tope)
+    try:
+        col_count = int(ws.col_count or 0)
+    except Exception:
+        col_count = 0
+    if col_count <= 0:
+        col_count = MAX_COLS
+    col_count = min(col_count, MAX_COLS)
+
+    last_col = _col_to_a1(col_count)
+    start_row = HEADER_ROW
+    end_row = HEADER_ROW + MAX_ROWS  # lee MAX_ROWS líneas de datos después del header
+
+    rng = f"A{start_row}:{last_col}{end_row}"
+
+    cells = ws.get(rng, value_render_option="UNFORMATTED_VALUE")
+    if not cells or len(cells) < 2:
+        raise ValueError(f"SRM: rango vacío en {rng}")
 
     header = cells[0]
     rows = cells[1:]
-    # normaliza encabezados, evita duplicados
+
+    # Normalizar encabezados y evitar duplicados
     seen = {}
     headers = []
     for j, h in enumerate(header):
@@ -148,32 +177,38 @@ def load_srm() -> pd.DataFrame:
         seen[name] = True
         headers.append(name)
 
-    import pandas as pd
     df = pd.DataFrame(rows, columns=headers)
     df.columns = [c.strip().lower() for c in df.columns]
 
-    # detectar SVC + columnas sdd/spot
+    # Detectar columna SVC (cualquier variante que contenga 'svc')
     svc_cols = [c for c in df.columns if "svc" in c.replace(" ", "")]
     if not svc_cols:
         raise ValueError(f"SRM: no se encontró columna SVC en {list(df.columns)}")
     svc_col = svc_cols[0]
 
-    sdd_cols  = [c for c in df.columns if "sdd" in c]
+    # Columnas SDD / SPOT (todas las que contengan 'sdd' / 'spot', no solo 'total')
+    sdd_cols  = [c for c in df.columns if "sdd"  in c]
     spot_cols = [c for c in df.columns if "spot" in c]
     if not sdd_cols and not spot_cols:
         raise ValueError(f"SRM: no hay columnas con 'sdd' o 'spot' en {list(df.columns)}")
 
-    # a números seguros
+    # A números seguros
     for c in sdd_cols + spot_cols:
         df[c] = _to_num(df[c]).fillna(0)
 
     out = df[[svc_col] + sdd_cols + spot_cols].copy()
     out = out.rename(columns={svc_col: "svc"})
     out["svc"] = out["svc"].astype(str).str.strip().str.upper()
+
     out["sdd_routes_max"]  = out[sdd_cols].sum(axis=1) if sdd_cols else 0
     out["spot_routes_max"] = out[spot_cols].sum(axis=1) if spot_cols else 0
+
     out = (out.groupby("svc", as_index=False)[["sdd_routes_max","spot_routes_max"]].sum())
-    st.caption(f"SRM leído rápido en rango {SRM_RANGE} · SVC='{svc_col}' · SDD={len(sdd_cols)} · SPOT={len(spot_cols)}")
+
+    st.caption(
+        f"SRM leído en rango {rng} · columnas={col_count} (tope={MAX_COLS}) · "
+        f"SVC='{svc_col}' · SDD={len(sdd_cols)} · SPOT={len(spot_cols)}"
+    )
     return out
 
 
