@@ -396,18 +396,37 @@ def compute_crowd_share(capacity: pd.DataFrame) -> pd.DataFrame:
 
 # ------------- CROWD CAP POR DÍA -------------
 def map_crowd_capacity_by_date(target_days: pd.DataFrame, crowd_caps: pd.DataFrame) -> pd.DataFrame:
+    # target_days: FECHA×SVC
     def cap_for(row):
         s, d = row["svc"], row["fecha"]
-        dow = _weekday(d)
+        dow = _weekday(d)  # 0-4 wd, 5 sab, 6 dom
         r = crowd_caps.loc[crowd_caps["svc"]==s]
         if r.empty:
-            return pd.Series({"crowd_base_routes":0,"crowd_e1_routes":0})
+            return pd.Series({"crowd_base_routes": 0.0, "crowd_e1_routes": 0.0})
         r = r.iloc[0]
-        if dow <= 4: base, e1 = r["base_wd"], r["e1_wd"]
-        elif dow == 5: base, e1 = r["base_sa"], r["e1_sa"]
-        else: base, e1 = r["base_su"], r["e1_su"]
-        return pd.Series({"crowd_base_routes":int(base), "crowd_e1_routes":int(e1)})
+        if dow <= 4:
+            base, e1 = r.get("base_wd", 0), r.get("e1_wd", 0)
+        elif dow == 5:
+            base, e1 = r.get("base_sa", 0), r.get("e1_sa", 0)
+        else:
+            base, e1 = r.get("base_su", 0), r.get("e1_su", 0)
+
+        # saneo numérico -> 0 si NaN/inf
+        base = pd.to_numeric(base, errors="coerce")
+        e1   = pd.to_numeric(e1,   errors="coerce")
+        base = 0.0 if not np.isfinite(base) else float(base)
+        e1   = 0.0 if not np.isfinite(e1)   else float(e1)
+
+        return pd.Series({"crowd_base_routes": base, "crowd_e1_routes": e1})
+
     tmp = target_days.apply(cap_for, axis=1)
+    out = pd.concat([target_days.reset_index(drop=True), tmp], axis=1)
+
+    # cast final seguro (por si algo quedó float)
+    out["crowd_base_routes"] = _to_intsafe(out["crowd_base_routes"])
+    out["crowd_e1_routes"]   = _to_intsafe(out["crowd_e1_routes"])
+    return out
+
     return pd.concat([target_days.reset_index(drop=True), tmp], axis=1)
 
 # ------------- SCHEDULER MLP DESCANSOS -------------
