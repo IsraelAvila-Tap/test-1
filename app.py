@@ -185,7 +185,8 @@ def load_srm() -> pd.DataFrame:
         df[c] = _to_num(df[c]).fillna(0)
 
     out = df[[svc_col]+sdd_cols+spot_cols].copy().rename(columns={svc_col:"svc"})
-    out["svc"] = out["svc"].astype(str).strip().str.upper()
+   
+    out["svc"] = out["svc"].astype(str).str.strip().str.upper()
     out["sdd_routes_max"]  = out[sdd_cols].sum(axis=1) if sdd_cols else 0
     out["spot_routes_max"] = out[spot_cols].sum(axis=1) if spot_cols else 0
     out = out.groupby("svc", as_index=False)[["sdd_routes_max","spot_routes_max"]].sum()
