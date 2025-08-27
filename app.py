@@ -107,35 +107,117 @@ def load_rentals() -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def load_crowd_caps() -> pd.DataFrame:
-    df = _norm_cols(read_ws(SHEET_ID, "Crowd"))
-    if "svc" not in df.columns:
-        # modo compacto: col_2 es svc, 'base' y 'e1' con wd/sa/su en filas
-        # pero para operatividad exigimos layout detallado:
-        raise ValueError("Crowd: falta columna 'svc'. Usa layout detallado con columnas base/e1 por día (entre semana/sábado/domingo).")
-    # localizar columnas
-    def pick(*opts):
+    """
+    Devuelve capacidad Crowd por SVC con 6 columnas:
+      base_wd, base_sa, base_su, e1_wd, e1_sa, e1_su
+    Soporta:
+      1) Layout detallado (columnas ya separadas por día)
+      2) Layout compacto (col 'dia' o similar + columnas 'base' y 'e1')
+    """
+    df_raw = read_ws(SHEET_ID, "Crowd")
+    df = df_raw.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    # ---- detectar columna SVC (flexible) ----
+    svc_col = None
+    for c in df.columns:
+        c2 = c.replace(" ", "")
+        if "svc" in c2:            # svc, svcs, svc_, etc.
+            svc_col = c
+            break
+    if svc_col is None:
+        # último intento: si existe una columna que luzca como código (3–5 chars alfanum)
         for c in df.columns:
-            for o in opts:
-                if o in c:
+            sample = str(df[c].dropna().astype(str).head(10).tolist())
+            if any(len(s.strip()) in (3,4,5) for s in sample.split(",")):
+                svc_col = c
+                break
+    if svc_col is None:
+        raise ValueError("Crowd: no se encontró columna de SVC. Renombra el encabezado a 'SVC' o 'SVCS'.")
+
+    # Normalizar SVC
+    df["svc"] = df[svc_col].astype(str).str.strip().str.upper()
+
+    # ---- intentar layout DETALLADO: buscar las 6 columnas por patrones ----
+    def pick_one(cands):
+        for c in df.columns:
+            name = c.lower()
+            for a,b in cands:
+                if a in name and b in name:
                     return c
         return None
-    c_base_wd = pick("base entre")
-    c_base_sa = pick("base sab")
-    c_base_su = pick("base domingo","base dom")
-    c_e1_wd   = pick("holgura entre","e1 entre")
-    c_e1_sa   = pick("holgura sab","e1 sab")
-    c_e1_su   = pick("holgura domingo","e1 dom")
 
-    need_cols = [c_base_wd,c_base_sa,c_base_su,c_e1_wd,c_e1_sa,c_e1_su]
-    if any(c is None for c in need_cols):
-        raise ValueError("Crowd: no se encontraron columnas esperadas: base entre semana, base sábado, base domingo, E1 entre semana, E1 sábado, E1 domingo.")
+    base_wd = pick_one([("base","entre"),("base","sem")])                 # base entre semana
+    base_sa = pick_one([("base","sab")])                                   # base sábado
+    base_su = pick_one([("base","dom")])                                   # base domingo
+    e1_wd   = pick_one([("holgura","entre"),("e1","entre"),("holgura","sem"),("e1","sem")])
+    e1_sa   = pick_one([("holgura","sab"),("e1","sab")])
+    e1_su   = pick_one([("holgura","dom"),("e1","dom")])
 
-    for c in need_cols:
-        df[c] = _to_num(df[c]).fillna(0).astype(int)
+    detailed_ok = all([base_wd, base_sa, base_su, e1_wd, e1_sa, e1_su])
 
-    out = df[["svc", c_base_wd,c_base_sa,c_base_su,c_e1_wd,c_e1_sa,c_e1_su]].copy()
-    out.columns = ["svc","base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]
-    return out
+    if detailed_ok:
+        out = df[["svc", base_wd, base_sa, base_su, e1_wd, e1_sa, e1_su]].copy()
+        out.columns = ["svc","base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]
+        for c in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
+        return out
+
+    # ---- intentar layout COMPACTO: 'dia' + 'base' + 'e1' (o 'holgura') ----
+    # buscamos una columna de día/categoría
+    dia_col = None
+    for c in df.columns:
+        name = c.lower()
+        if any(k in name for k in ["dia","día","categoria","categoría","tipo","semana","sabado","sábado","domingo","entre"]):
+            dia_col = c
+            break
+
+    base_col = None
+    e1_col   = None
+    for c in df.columns:
+        name = c.lower()
+        if "base" in name and base_col is None:
+            base_col = c
+        if (("e1" in name) or ("holgura" in name)) and e1_col is None:
+            e1_col = c
+
+    if dia_col and base_col and e1_col:
+        tmp = df[[ "svc", dia_col, base_col, e1_col ]].copy()
+        tmp.columns = ["svc","dia","base","e1"]
+        tmp["dia"]  = tmp["dia"].astype(str).str.lower()
+
+        # mapear a wd/sa/su
+        def tag(x):
+            x = x.lower()
+            if "entre" in x or "sem" in x: return "wd"
+            if "sab"   in x:               return "sa"
+            if "dom"   in x:               return "su"
+            return None
+
+        tmp["dtag"] = tmp["dia"].apply(tag)
+        tmp = tmp[tmp["dtag"].notna()].copy()
+
+        # pivotear -> columnas base_wd, base_sa, base_su; e1_wd, e1_sa, e1_su
+        base_pivot = (tmp.pivot_table(index="svc", columns="dtag", values="base", aggfunc="sum")
+                         .rename(columns={"wd":"base_wd","sa":"base_sa","su":"base_su"}))
+        e1_pivot   = (tmp.pivot_table(index="svc", columns="dtag", values="e1",   aggfunc="sum")
+                         .rename(columns={"wd":"e1_wd","sa":"e1_sa","su":"e1_su"}))
+
+        out = base_pivot.join(e1_pivot, how="outer").reset_index()
+        for c in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
+            if c not in out.columns: out[c] = 0
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
+        return out[["svc","base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]]
+
+    # Si nada de lo anterior funcionó:
+    raise ValueError(
+        "Crowd: no se reconoció el layout. "
+        "Opciones:\n"
+        "  • Usa columnas (detallado): 'SVC', 'Base entre semana', 'Base sábado', 'Base domingo', "
+        "'Holgura entre semana', 'Holgura sábado', 'Holgura domingo'.\n"
+        "  • O usa un layout compacto con columnas: 'SVC', una columna de día ('Entre semana'/'Sábado'/'Domingo'), "
+        "más 'base' y 'e1/holgura' para pivotear."
+    )
 
 # --- SRM dinámico (muchas columnas) ---
 @st.cache_data(ttl=300)
