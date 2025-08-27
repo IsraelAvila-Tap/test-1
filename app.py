@@ -117,39 +117,26 @@ def load_capacity() -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def load_srm() -> pd.DataFrame:
-    # Lectura cruda para detectar header real
+    """
+    Lectura rápida de SRM limitando el rango para evitar cuelgues.
+    Ajusta SRM_RANGE si tu SRM ocupa más filas/columnas.
+    """
     gc = _client()
     sh = gc.open_by_key(SHEET_ID)
     ws = sh.worksheet("SRM")
-    values = ws.get_all_values()
-    if not values:
-        raise ValueError("SRM: hoja vacía.")
 
-    # Detectar la fila de encabezado
-    header_idx = None
-    best_score, best_i = -1, None
-    for i, row in enumerate(values[:100]):
-        row_lower = [c.strip().lower() for c in row]
-        nonempty = sum(1 for c in row_lower if c)
-        alphas   = sum(1 for c in row_lower if any(ch.isalpha() for ch in c))
-        has_svc  = any("svc"  in c for c in row_lower)
-        has_sdd  = any("sdd"  in c for c in row_lower)
-        has_spot = any("spot" in c for c in row_lower)
-        has_tot  = any("total" in c for c in row_lower)
-        score = (2 if has_svc else 0) + (1 if has_sdd else 0) + (1 if has_spot else 0) \
-                + (1 if has_tot else 0) + (1 if nonempty >= 4 else 0) + (1 if alphas >= 3 else 0)
-        if score > best_score:
-            best_score, best_i = score, i
-        if has_svc and (has_sdd or has_spot) and nonempty >= 4:
-            header_idx = i
-            break
-    if header_idx is None:
-        header_idx = best_i if best_i is not None else 0
+    # --- Ajusta este rango si necesitas más (anchura o filas) ---
+    SRM_RANGE = os.getenv("SRM_RANGE", "A5:AZ500")   # header en A5, hasta col AZ y 500 filas
+    cells = ws.get(SRM_RANGE, value_render_option="UNFORMATTED_VALUE")
+    if not cells:
+        raise ValueError("SRM: rango vacío.")
 
-    # Saneamos headers
-    headers_raw = values[header_idx]
-    seen, headers = {}, []
-    for j, h in enumerate(headers_raw):
+    header = cells[0]
+    rows = cells[1:]
+    # normaliza encabezados, evita duplicados
+    seen = {}
+    headers = []
+    for j, h in enumerate(header):
         base = (h or "").replace("\n", " ").strip()
         if not base:
             base = f"col_{j+1}"
@@ -161,48 +148,34 @@ def load_srm() -> pd.DataFrame:
         seen[name] = True
         headers.append(name)
 
-    rows = values[header_idx + 1 :]
+    import pandas as pd
     df = pd.DataFrame(rows, columns=headers)
     df.columns = [c.strip().lower() for c in df.columns]
 
-    # Detectar columna SVC
+    # detectar SVC + columnas sdd/spot
     svc_cols = [c for c in df.columns if "svc" in c.replace(" ", "")]
     if not svc_cols:
-        import re
-        pat = re.compile(r"^[A-Za-z]{2,4}\d{1,2}$")
-        best, best_c = -1, None
-        for c in df.columns:
-            hits = (df[c].astype(str).str.strip().str.upper().str.match(pat, na=False)).sum()
-            if hits > best:
-                best, best_c = hits, c
-        if best >= 3:
-            svc_cols = [best_c]
-    if not svc_cols:
-        raise ValueError(f"SRM: no se encontró columna SVC. Encabezados detectados: {list(df.columns)}")
+        raise ValueError(f"SRM: no se encontró columna SVC en {list(df.columns)}")
     svc_col = svc_cols[0]
 
-    # Columnas SDD / SPOT
-    sdd_cols  = [c for c in df.columns if ("sdd"  in c)]
-    spot_cols = [c for c in df.columns if ("spot" in c)]
-    sdd_total  = [c for c in sdd_cols  if "total" in c] or sdd_cols
-    spot_total = [c for c in spot_cols if "total" in c] or spot_cols
-    if not sdd_total and not spot_total:
-        raise ValueError(f"SRM: no se hallaron columnas con 'sdd' o 'spot'. Encabezados: {list(df.columns)}")
+    sdd_cols  = [c for c in df.columns if "sdd" in c]
+    spot_cols = [c for c in df.columns if "spot" in c]
+    if not sdd_cols and not spot_cols:
+        raise ValueError(f"SRM: no hay columnas con 'sdd' o 'spot' en {list(df.columns)}")
 
-    out = df[[svc_col] + list(set(sdd_total + spot_total))].copy()
+    # a números seguros
+    for c in sdd_cols + spot_cols:
+        df[c] = _to_num(df[c]).fillna(0)
+
+    out = df[[svc_col] + sdd_cols + spot_cols].copy()
     out = out.rename(columns={svc_col: "svc"})
-
-    for c in out.columns:
-        if c != "svc":
-            out[c] = _to_float0(out[c])
-
-    out["sdd_routes_max"]  = out[[c for c in out.columns if c != "svc" and "sdd"  in c]].sum(axis=1)
-    out["spot_routes_max"] = out[[c for c in out.columns if c != "svc" and "spot" in c]].sum(axis=1)
-
-    out = (out.groupby("svc", as_index=False)[["sdd_routes_max","spot_routes_max"]].sum())
     out["svc"] = out["svc"].astype(str).str.strip().str.upper()
-    st.caption(f"SRM: header en fila {header_idx+1}. SVC='{svc_col}'. SDD cols={len(sdd_total)} · SPOT cols={len(spot_total)}")
+    out["sdd_routes_max"]  = out[sdd_cols].sum(axis=1) if sdd_cols else 0
+    out["spot_routes_max"] = out[spot_cols].sum(axis=1) if spot_cols else 0
+    out = (out.groupby("svc", as_index=False)[["sdd_routes_max","spot_routes_max"]].sum())
+    st.caption(f"SRM leído rápido en rango {SRM_RANGE} · SVC='{svc_col}' · SDD={len(sdd_cols)} · SPOT={len(spot_cols)}")
     return out
+
 
 @st.cache_data(ttl=300)
 def load_rentals() -> pd.DataFrame:
