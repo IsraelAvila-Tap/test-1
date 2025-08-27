@@ -617,6 +617,68 @@ spr_mode = st.radio("SPR objetivo", ["promedio","peak","plan"], index=0, horizon
 
 try:
     plan = compute_plan(spr_mode, sel_svcs)
+    # ======= VISTAS AGRUPADAS POR DELIVERY MODEL =======
+st.subheader("Vistas agrupadas por Delivery Model")
+
+# 1) FCST (base)  -----------------------------------
+fcst_tbl = (plan.groupby(["fecha","svc"], as_index=False)["shipments"].sum()
+                 .sort_values(["fecha","svc"]))
+
+# 2) Capacity → Shipments por Delivery Model --------
+cap_all = load_capacity()
+if sel_svcs:
+    cap_all = cap_all[cap_all["svc"].isin(sel_svcs)]
+cap_ship = cap_all[cap_all["tipo"].str.lower().eq("shipments")].copy()
+
+cap_dm = (cap_ship.groupby(["fecha","svc","delivery model"], as_index=False)["cantidad"]
+                 .sum())
+cap_dm_pivot = (cap_dm.pivot_table(index=["fecha","svc"],
+                                   columns="delivery model",
+                                   values="cantidad",
+                                   aggfunc="sum",
+                                   fill_value=0)
+                      .reset_index())
+cap_dm_pivot.columns = [c if isinstance(c, str) else str(c) for c in cap_dm_pivot.columns]
+
+# 3) PLAN → Shipments por Delivery Model -------------
+plan_ship_dm = plan.assign(
+    shp_crowd   = plan["routes_crowd_alloc"]   * plan["spr_objetivo"],
+    shp_rentals = plan["routes_rentals_alloc"] * plan["spr_objetivo"],
+    shp_mlp     = plan["routes_mlp_alloc"]     * plan["spr_objetivo"],
+)[["fecha","svc","shp_crowd","shp_rentals","shp_mlp"]] \
+ .groupby(["fecha","svc"], as_index=False).sum() \
+ .sort_values(["fecha","svc"])
+
+# 4) PLAN → Rutas por Delivery Model ----------------
+plan_routes_dm = plan.rename(columns={
+    "routes_crowd_alloc":   "crowd_routes",
+    "routes_rentals_alloc": "rentals_routes",
+    "routes_mlp_alloc":     "mlp_routes",
+})[["fecha","svc","crowd_routes","rentals_routes","mlp_routes"]] \
+  .groupby(["fecha","svc"], as_index=False).sum() \
+  .sort_values(["fecha","svc"])
+
+# 5) Mostrar en tabs --------------------------------
+t1, t2, t3, t4 = st.tabs([
+    "FCST (shipments)",
+    "Capacity → Shipments por DM",
+    "PLAN → Shipments por DM",
+    "PLAN → Rutas por DM"
+])
+
+with t1:
+    st.dataframe(fcst_tbl, use_container_width=True, hide_index=True)
+
+with t2:
+    st.dataframe(cap_dm_pivot, use_container_width=True, hide_index=True)
+
+with t3:
+    st.dataframe(plan_ship_dm, use_container_width=True, hide_index=True)
+
+with t4:
+    st.dataframe(plan_routes_dm, use_container_width=True, hide_index=True)
+# ======= FIN VISTAS AGRUPADAS ======================
+
     st.dataframe(plan, use_container_width=True, hide_index=True)
 
     st.subheader("Riesgos por fecha")
