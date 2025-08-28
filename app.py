@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from math import ceil
 from datetime import timedelta, date, datetime
+from typing import List, Optional
 import streamlit as st
 
 # ---------------------------------------------------------------------
@@ -60,7 +61,7 @@ def _to_num(s) -> pd.Series:
     s = s.str.replace(",", "", regex=False).str.replace("%", "", regex=False).str.strip()
     return pd.to_numeric(s, errors="coerce")
 
-def _safe_to_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+def _safe_to_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     """Convierte a numérico sólo si la columna existe; evita usar 'c' fuera de scope."""
     for col in cols:
         if col in df.columns:
@@ -110,11 +111,10 @@ def load_fcst() -> pd.DataFrame:
     header_row = None
     ship_tokens = {"shipments","shipment","fcst","forecast","envios","envíos","q","qty","cantidad","volume","volumen","ship","demand"}
     date_tokens = {"fecha","date","día","dia","day"}
-    svc_tokens  = {"svc","svcs","svc "}
 
     for i in range(min(10, len(raw))):
         row = [str(x).strip().lower() for x in raw.iloc[i].tolist()]
-        has_svc   = any(tok in row for tok in svc_tokens)
+        has_svc   = any(("svc" in cell) for cell in row)
         has_ship  = any(any(tok in cell for tok in ship_tokens) for cell in row)
         has_date  = any(any(tok in cell for tok in date_tokens) for cell in row)
         if has_svc and has_ship and has_date:
@@ -167,25 +167,47 @@ def load_fcst() -> pd.DataFrame:
 
 def load_spr_real() -> pd.DataFrame:
     df = _read("SPR")
-    # tolera encabezados variados
-    svc = "svc" if "svc" in df.columns else None
-    if not svc:
-        # a veces la hoja es por columnas con svcs como headers: no soportado aquí
+    # Detectar columnas flexibles
+    svc_col = "svc" if "svc" in df.columns else ("svcs" if "svcs" in df.columns else None)
+    if not svc_col:
         raise ValueError("SPR: falta columna 'svc'.")
+
     date_col = "fecha" if "fecha" in df.columns else ("date" if "date" in df.columns else None)
-    spr_col  = "spr" if "spr" in df.columns else None
-    miss = [x for x in ["fecha","spr"] if (x=="fecha" and not date_col) or (x=="spr" and not spr_col)]
-    if miss:
-        raise ValueError(f"SPR: faltan columnas {miss}")
-    df = df.rename(columns={date_col:"fecha"})
+    if not date_col:
+        # intenta detectar por tokens
+        for c in df.columns:
+            if any(tok in c for tok in ["fecha","date","día","dia","day"]):
+                date_col = c; break
+    if not date_col:
+        raise ValueError("SPR: falta columna de fecha ('fecha' o 'date').")
+
+    spr_col = None
+    for c in df.columns:
+        if "spr" in c.lower():
+            spr_col = c; break
+    if not spr_col:
+        raise ValueError("SPR: no se encontró columna con 'spr' en el nombre.")
+
+    # Renombres
+    if svc_col != "svc":
+        df = df.rename(columns={svc_col: "svc"})
+    if date_col != "fecha":
+        df = df.rename(columns={date_col: "fecha"})
+    if spr_col != "spr":
+        df = df.rename(columns={spr_col: "spr"})
+
+    # Tipados
     df = _norm_date_col(df, "fecha")
     df["spr"] = _to_num(df["spr"])
     df = df.dropna(subset=["fecha","svc","spr"])
+    df["svc"] = _ensure_series(df["svc"]).astype(str).str.upper().str.strip()
+
     df["dow"] = df["fecha"].apply(_weekday)
     iso = df["fecha"].apply(lambda d: pd.Timestamp(d).isocalendar())
     df["iso_year"] = [int(x.year) for x in iso]
     df["iso_week"] = [int(x.week) for x in iso]
     return df[["fecha","svc","spr","dow","iso_year","iso_week"]]
+
 
 def load_capacity() -> pd.DataFrame:
     raw = _read("Capacity")
@@ -216,7 +238,7 @@ def load_capacity() -> pd.DataFrame:
         df = _lower_cols(raw)
 
     # --- 2) Resolver nombres por sinónimos
-    def find_col(tokens: list[str]) -> str | None:
+    def find_col(tokens: List[str]) -> Optional[str]:
         for c in df.columns:
             cc = c.strip().lower()
             if any(tok in cc for tok in tokens):
@@ -256,7 +278,7 @@ def load_capacity() -> pd.DataFrame:
     # Salida consistente
     return df[["fecha", "svc", "delivery model", "tipo", "cantidad"]].dropna(subset=["fecha","svc"])
 
-def _safe_to_numeric_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+def _safe_to_numeric_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     """Convierte a numérico (robusto) sólo las columnas presentes."""
     for col in cols:
         if col in df.columns:
@@ -269,18 +291,17 @@ def load_srm() -> pd.DataFrame:
     Lee la pestaña SRM (encabezado puede estar en fila 5 y con muchas columnas).
     Detecta columnas SDD/SPOT por nombre y agrega por SVC.
     """
-    raw = _read_sheet("SRM")  # usa tu wrapper que ya normaliza fechas/strings
+    raw = _read("SRM")  # wrapper que ya normaliza columnas a minúsculas y trim
 
     # Detectar fila de encabezado (primera que contenga 'svc')
     header_row = None
     for i in range(min(10, len(raw))):
         row = [str(x).strip().lower() for x in raw.iloc[i].tolist()]
-        if any(x == "svc" for x in row):
+        if any(x == "svc" or x == "svcs" for x in row):
             header_row = i
             break
     if header_row is None:
-        # fallback clásico: encabezado en fila 5 (0-based = 4)
-        header_row = 4
+        header_row = 4  # fallback
 
     # Aplicar encabezados
     cols = [str(x).strip().lower() for x in raw.iloc[header_row].tolist()]
@@ -299,13 +320,12 @@ def load_srm() -> pd.DataFrame:
         first_cols = list(df.columns)[:30]
         raise ValueError(f"SRM: no se hallaron columnas con 'sdd' o 'spot'. Encabezados: {first_cols}")
 
-    # Numéricos robustos (sin usar 'c' suelta)
+    # Numéricos robustos
     num_cols = list(set(sdd_cols + spot_cols))
     df = _safe_to_numeric_cols(df, num_cols)
 
     # Agregación por SVC
     g = df.copy()
-    # _ensure_series ya existe en tu archivo; si no, crea uno simple.
     g["svc"] = _ensure_series(g[svc_col]).astype(str).str.upper().str.strip()
 
     agg = g.groupby("svc", as_index=False)[num_cols].sum()
@@ -323,10 +343,10 @@ def load_rentals() -> pd.DataFrame:
     # columna unidades (cualquier que empiece con 'unidades')
     qty_col = None
     for c in df.columns:
-        if c.startswith("unidades"):
+        if str(c).lower().startswith("unidades"):
             qty_col = c; break
     if not qty_col:
-        raise ValueError("Rentals: falta columna de unidades disponibles.")
+        raise ValueError("Rentals: falta columna de unidades disponibles (que empiece por 'unidades').")
     df["rentals_routes_max"] = _to_num(df[qty_col]).fillna(0.0).astype(float)
     out = (df.groupby(svc_col, as_index=False)["rentals_routes_max"]
              .sum()
@@ -341,9 +361,9 @@ def load_crowd_caps() -> pd.DataFrame:
     if not svc_col:
         raise ValueError("Crowd: falta columna 'svc'.")
     # layout detallado
-    def _pick(patterns):
+    def _pick(patterns: List[str]) -> Optional[str]:
         for c in df.columns:
-            cc = c.lower()
+            cc = str(c).lower()
             if any(p in cc for p in patterns):
                 return c
         return None
@@ -361,8 +381,8 @@ def load_crowd_caps() -> pd.DataFrame:
             svc_col:"svc", c_base_wd:"base_wd", c_base_sa:"base_sa", c_base_su:"base_su",
             c_e1_wd:"e1_wd", c_e1_sa:"e1_sa", c_e1_su:"e1_su"
         })
-        for c in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
-            out[c] = _to_num(out[c]).fillna(0.0).astype(float)
+        for coln in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
+            out[coln] = _to_num(out[coln]).fillna(0.0).astype(float)
         out["svc"] = _ensure_series(out["svc"]).astype(str).str.upper().str.strip()
         return out
 
@@ -374,20 +394,19 @@ def load_crowd_caps() -> pd.DataFrame:
         e1,e2,e3 = e1_cols
         out = df[[svc_col,b1,b2,b3,e1,e2,e3]].copy()
         out.columns = ["svc","base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]
-        for c in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
-            out[c] = _to_num(out[c]).fillna(0.0).astype(float)
+        for coln in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
+            out[coln] = _to_num(out[coln]).fillna(0.0).astype(float)
         out["svc"] = _ensure_series(out["svc"]).astype(str).str.upper().str.strip()
         return out
 
     # último intento: una 'base' y un 'e1' (mismo valor para todos los días)
     if ("base" in df.columns) and ("e1" in df.columns):
         out = df[[svc_col,"base","e1"]].copy()
-        for c in ["base","e1"]:
-            out[c] = _to_num(out[c]).fillna(0.0).astype(float)
-        out = out.rename(columns={"base":"base_wd"})
+        for coln in ["base","e1"]:
+            out[coln] = _to_num(out[coln]).fillna(0.0).astype(float)
+        out = out.rename(columns={"base":"base_wd", "e1":"e1_wd"})
         out["base_sa"] = out["base_wd"]
         out["base_su"] = out["base_wd"]
-        out = out.rename(columns={"e1":"e1_wd"})
         out["e1_sa"] = out["e1_wd"]
         out["e1_su"] = out["e1_wd"]
         out["svc"] = _ensure_series(out["svc"]).astype(str).str.upper().str.strip()
@@ -453,7 +472,10 @@ def compute_crowd_share(capacity: pd.DataFrame) -> pd.DataFrame:
     cap = capacity.copy()
     cap["tipo"] = _ensure_series(cap["tipo"]).astype(str).str.lower().str.strip()
     cap["delivery model"] = _ensure_series(cap["delivery model"]).astype(str).str.lower().str.strip()
-    cap["tipo dm"] = _ensure_series(cap.get("tipo dm", "")).astype(str).str.lower().str.strip()
+    if "tipo dm" in cap.columns:
+        cap["tipo dm"] = _ensure_series(cap["tipo dm"]).astype(str).str.lower().str.strip()
+    else:
+        cap["tipo dm"] = ""  # asegurar columna para filtros
 
     # Solo 'Shipments' para el share
     m_ship = cap["tipo"].eq("shipments")
@@ -470,7 +492,9 @@ def compute_crowd_share(capacity: pd.DataFrame) -> pd.DataFrame:
 
     # DC / SP para restar del FCST
     is_dc = ship["tipo dm"].str.contains("dc", case=False) | ship["delivery model"].str.contains("dc", case=False)
-    is_sp = ship["tipo dm"].str.contains("sp", case=False) | ship["delivery model"].str.contains("service partner", case=False) | ship["delivery model"].str.contains("sp", case=False)
+    is_sp = (ship["tipo dm"].str.contains("sp", case=False) |
+             ship["delivery model"].str.contains("service partner", case=False) |
+             ship["delivery model"].str.contains("sp", case=False))
 
     dc = ship.loc[is_dc].groupby(["fecha","svc"], as_index=False)["cantidad"].sum().rename(columns={"cantidad":"ship_dc"})
     sp = ship.loc[is_sp].groupby(["fecha","svc"], as_index=False)["cantidad"].sum().rename(columns={"cantidad":"ship_sp"})
@@ -536,7 +560,7 @@ def schedule_mlp_rest(df_day: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------
 # 9) Motor principal
 # ---------------------------------------------------------------------
-def compute_plan(spr_mode: str, sel_svcs: list[str] | None = None) -> pd.DataFrame:
+def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
     # Lecturas
     fcst       = load_fcst()
     spr_real   = load_spr_real()
@@ -568,11 +592,11 @@ def compute_plan(spr_mode: str, sel_svcs: list[str] | None = None) -> pd.DataFra
          )
 
     # Limpieza
-    for c in ["share_crowd_obj","crowd_base_routes","crowd_e1_routes","sdd_routes_max","spot_routes_max","rentals_routes_max","ship_dc","ship_sp"]:
-        if c in df.columns:
-            df[c] = _to_num(df[c]).fillna(0.0)
+    for coln in ["share_crowd_obj","crowd_base_routes","crowd_e1_routes","sdd_routes_max","spot_routes_max","rentals_routes_max","ship_dc","ship_sp"]:
+        if coln in df.columns:
+            df[coln] = _to_num(df[coln]).fillna(0.0)
         else:
-            df[c] = 0.0
+            df[coln] = 0.0
     df["spr_objetivo"] = _to_num(df["spr_objetivo"])
 
     # FCST neto (descuenta DC/SP)
@@ -690,4 +714,3 @@ agg_cols = [
 ]
 vista = (plan.groupby(["svc","fecha"], as_index=False)[agg_cols].sum())
 st.dataframe(vista.sort_values(["svc","fecha"]), use_container_width=True, hide_index=True)
-
