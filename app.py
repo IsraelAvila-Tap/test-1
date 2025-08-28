@@ -97,19 +97,66 @@ def _read(tab: str) -> pd.DataFrame:
     return _lower_cols(df)
 
 def load_fcst() -> pd.DataFrame:
-    df = _read("FCST")
-    # esperados: svc, fecha, shipments
-    # tolera variantes de nombre
-    svc_col = "svc" if "svc" in df.columns else ("svcs" if "svcs" in df.columns else None)
-    ship_col = "shipments" if "shipments" in df.columns else None
-    date_col = "fecha" if "fecha" in df.columns else ("date" if "date" in df.columns else None)
-    miss = [x for x in ["svc","fecha","shipments"] if (x=="svc" and not svc_col) or (x=="fecha" and not date_col) or (x=="shipments" and not ship_col)]
-    if miss:
-        raise ValueError(f"FCST: faltan columnas {miss}")
-    df = df.rename(columns={svc_col:"svc", ship_col:"shipments", date_col:"fecha"})
+    raw = _read("FCST")
+
+    # --- 1) Detectar fila de header en las primeras 10 filas
+    header_row = None
+    ship_tokens = {"shipments","shipment","fcst","forecast","envios","envíos","q","qty","cantidad","volume","volumen","ship","demand"}
+    date_tokens = {"fecha","date","día","dia","day"}
+    svc_tokens  = {"svc","svcs","svc "}
+
+    for i in range(min(10, len(raw))):
+        row = [str(x).strip().lower() for x in raw.iloc[i].tolist()]
+        has_svc   = any(tok in row for tok in svc_tokens)
+        has_ship  = any(any(tok in cell for tok in ship_tokens) for cell in row)
+        has_date  = any(any(tok in cell for tok in date_tokens) for cell in row)
+        if has_svc and has_ship and has_date:
+            header_row = i
+            break
+
+    # --- 2) Fijar encabezados y limpiar
+    if header_row is not None:
+        df = raw.copy()
+        df.columns = [str(x).strip().lower() for x in raw.iloc[header_row].tolist()]
+        df = df.iloc[header_row+1:].reset_index(drop=True)
+        df = _lower_cols(df)
+    else:
+        df = _lower_cols(raw)
+
+    # --- 3) Detectar columnas por sinónimos
+    # svc
+    svc_col = None
+    for c in df.columns:
+        if "svc" in c:
+            svc_col = c; break
+
+    # fecha
+    date_col = None
+    for c in df.columns:
+        cc = c.lower()
+        if any(tok in cc for tok in ("fecha","date","día","dia","day")):
+            date_col = c; break
+
+    # shipments / forecast / envíos / cantidad...
+    ship_col = None
+    for c in df.columns:
+        cc = c.lower()
+        if any(tok in cc for tok in ship_tokens):
+            ship_col = c; break
+
+    if not (svc_col and date_col and ship_col):
+        cols = list(df.columns)[:30]
+        raise ValueError(f"FCST: faltan columnas ['svc','fecha','shipments']. Detectadas: {cols}")
+
+    # --- 4) Normalizar nombres y tipos
+    df = df.rename(columns={svc_col:"svc", date_col:"fecha", ship_col:"shipments"})
     df = _norm_date_col(df, "fecha")
+    df["svc"] = _ensure_series(df["svc"]).astype(str).str.upper().str.strip()
     df["shipments"] = _to_num(df["shipments"]).fillna(0.0)
-    return df[["fecha","svc","shipments"]].dropna(subset=["fecha","svc"])
+
+    out = df[["fecha","svc","shipments"]].dropna(subset=["fecha","svc"])
+    return out
+
 
 def load_spr_real() -> pd.DataFrame:
     df = _read("SPR")
