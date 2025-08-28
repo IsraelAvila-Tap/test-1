@@ -265,8 +265,6 @@ def load_spr() -> pd.DataFrame:
     out["FECHA"] = date.today()
     return _finalize(out, ["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"])
 
-def _norm_text(s): return _canon_name(str(s))
-
 def load_capacity_caps() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
     if df.empty:
@@ -290,23 +288,31 @@ def load_capacity_caps() -> pd.DataFrame:
     else:
         df["FECHA"] = hoy
 
-    dm = df["DELIVERY_MODEL"].map(_norm_text)
-    tipo = df["TIPO"].map(_norm_text)
-    tipodm = df["TIPO_DM"].map(_norm_text)
+    # Normaliza a minúsculas antes de contains
+    dm_norm    = df["DELIVERY_MODEL"].fillna("").astype(str).str.lower()
+    tipo_norm  = df["TIPO"].fillna("").astype(str).str.lower()
+    tipodm_norm= df["TIPO_DM"].fillna("").astype(str).str.lower()
 
-    df["IS_RENTALS"]     = dm.str.contains("rent")
-    df["IS_CROWD_ROUTES"]= dm.str.contains("crowd") & (tipo.str_contains("route") | tipodm.str_contains("route"))
-    # pandas Series no tiene str_contains; usamos str.contains:
-    df["IS_CROWD_ROUTES"]= dm.str.contains("crowd") & (tipo.str.contains("route") | tipodm.str.contains("route"))
-    df["IS_MLP_SPOT"]    = dm.str.contains("mlp") & (tipodm.str.contains("spot"))
-    df["IS_MLP_SDD"]     = dm.str.contains("mlp") & (~df["IS_MLP_SPOT"]) & (tipodm.str.contains("mlp") | tipodm.str.contains("sdd") | tipodm.eq(""))
+    df["IS_RENTALS"]      = dm_norm.str.contains("rent",  regex=False)
+    df["IS_CROWD_ROUTES"] = dm_norm.str.contains("crowd", regex=False) & (
+                                tipo_norm.str.contains("route",  regex=False) |
+                                tipodm_norm.str.contains("route", regex=False)
+                            )
+    df["IS_MLP_SPOT"]     = dm_norm.str.contains("mlp",   regex=False) & tipodm_norm.str.contains("spot", regex=False)
+    df["IS_MLP_SDD"]      = dm_norm.str.contains("mlp",   regex=False) & (~df["IS_MLP_SPOT"]) & (
+                                tipodm_norm.str.contains("mlp",  regex=False) |
+                                tipodm_norm.str.contains("sdd",  regex=False) |
+                                (tipodm_norm == "")
+                            )
 
-    agg = df.groupby(["FECHA","SVC"]).agg(
-        RUTAS_MLP_SDD=("CANT", lambda s: s[df["IS_MLP_SDD"].reindex(s.index, fill_value=False)].sum()),
-        RUTAS_MLP_SPOT=("CANT", lambda s: s[df["IS_MLP_SPOT"].reindex(s.index, fill_value=False)].sum()),
-        RUTAS_RENTALS=("CANT", lambda s: s[df["IS_RENTALS"].reindex(s.index, fill_value=False)].sum()),
-        RUTAS_CROWD_CAP=("CANT", lambda s: s[df["IS_CROWD_ROUTES"].reindex(s.index, fill_value=False)].sum()),
-    ).reset_index()
+    mask = df.groupby(["FECHA","SVC"]).ngroup()  # índice de grupo para alinear máscaras
+    g = df.groupby(["FECHA","SVC"])["CANT"]
+    agg = pd.DataFrame({
+        "RUTAS_MLP_SDD":   g.apply(lambda s: s[df.loc[s.index, "IS_MLP_SDD"]].sum()),
+        "RUTAS_MLP_SPOT":  g.apply(lambda s: s[df.loc[s.index, "IS_MLP_SPOT"]].sum()),
+        "RUTAS_RENTALS":   g.apply(lambda s: s[df.loc[s.index, "IS_RENTALS"]].sum()),
+        "RUTAS_CROWD_CAP": g.apply(lambda s: s[df.loc[s.index, "IS_CROWD_ROUTES"]].sum()),
+    }).reset_index()
 
     return _finalize(agg, ["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP"])
 
@@ -322,10 +328,8 @@ def load_rentals_fallback() -> pd.DataFrame:
 
 def load_crowd_caps() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
-    # Si no hay datos, devuelve estructura vacía
     if df.empty:
         return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1_CAP"])
-    # Intenta mapear SVC; si no queda, devolvemos vacío (evita KeyError en groupby)
     try:
         find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", True, "Crowd")
     except Exception:
@@ -352,10 +356,8 @@ def load_crowd_caps() -> pd.DataFrame:
         if c not in df.columns: df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # Capacidad E1: máxima holgura disponible
     df["CROWD_E1_CAP"] = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
 
-    # Si por algún motivo SVC desapareció, devolvemos estructura vacía segura
     if "SVC" not in df.columns:
         return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1_CAP"])
 
@@ -521,9 +523,10 @@ except Exception as e:
 
 with st.expander("ℹ️ Notas de esta versión"):
     st.markdown(textwrap.dedent("""
-    - Autodetección de encabezado (busca `SVC`).
-    - Encabezado de 2 filas (Crowd con “Base/E1/Spot/Back Up”).
-    - Si Crowd no trae `SVC` (vista/filtro raro), devolvemos DF vacío seguro → sin KeyError.
+    - Fix: uso de `str.contains` (no `str_contains`) y normalización segura a minúsculas.
+    - Autodetección de encabezado (busca `SVC`) y soporte de 2 filas (Crowd).
+    - Si Crowd no trae `SVC` (vista/filtro), devolvemos DF vacío seguro → sin KeyError.
     - Tabs: FCST, SPR, Capacity, Rentals, Crowd.
     - Filtro inicial: SGD1, SMT1, SMX9, SPB1 y auto-run.
     """))
+
