@@ -1,9 +1,8 @@
 # app.py
 # =============================================================================
 # Mel-IA — Plan táctico (diario por SVC)
-# Carga estable con gspread, saneo URL/ID, headers únicos, soporte a headers combinados,
-# normalización de columnas y pipeline:
-# FCST − DC − SP → SPR → Rentals → Crowd base → MLP SDD/Spot → Crowd E1
+# Carga estable (gspread), headers únicos, soporte a encabezados combinados (2 filas),
+# normalización de columnas y pipeline robusto (sin caídas por columnas faltantes).
 # =============================================================================
 import os, json, re, unicodedata, textwrap, traceback
 from datetime import date
@@ -23,10 +22,7 @@ elif "gcp_service_account" in st.secrets:
 
 SERVICE_EMAIL = "planificacion@planificacion.iam.gserviceaccount.com"
 
-# 👉 SVCs preseleccionados
 DEFAULT_SVCS = ["SGD1", "SMT1", "SMX9", "SPB1"]
-
-# 👉 Tu Sheet por defecto (puedes pegar otro en la barra lateral)
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1UBjU3-ftGCow3EzTD0NB6UaYwMUYUARbn9QjD7SlxtY/edit?gid=148917403#gid=148917403"
 
 def sanitize_sheet_id(text: str | None) -> str | None:
@@ -45,7 +41,7 @@ SHEET_ID = sanitize_sheet_id(
     or DEFAULT_SHEET_URL
 )
 
-# Tabs FIJAS (si cambian en tu libro, puedes override en Secrets)
+# Tabs FIJAS (overrideables en Secrets)
 SHEET_TABS = {
     "fcst":     st.secrets.get("TAB_FCST", "FCST"),
     "dc":       st.secrets.get("TAB_DC", "DC"),
@@ -72,8 +68,7 @@ def find_and_rename(df: pd.DataFrame, candidates: List[str], new_name: str,
         key = _canon_name(cand)
         if key in cmap:
             real = cmap[key]
-            if real != new_name:
-                df.rename(columns={real: new_name}, inplace=True)
+            if real != new_name: df.rename(columns={real: new_name}, inplace=True)
             return new_name
     if required:
         raise ValueError(f"{source_label}: falta columna equivalente a {candidates}. Encabezados: {list(df.columns)}")
@@ -88,7 +83,7 @@ def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFram
 _NUM_SEP_RE = re.compile(r"[ ,\u00A0]")  # espacio, NBSP, coma
 
 def _maybe_to_numeric(series_like):
-    """Soporta Series o DataFrame (cuando hay encabezados duplicados)."""
+    """Soporta Series o DataFrame (por si hay headers duplicados)."""
     import pandas as pd
     if isinstance(series_like, pd.DataFrame):
         for sub in series_like.columns:
@@ -142,13 +137,11 @@ def show_exception(e: Exception, title: str):
         st.code("".join(traceback.format_exception(None, e, e.__traceback__)))
 
 # -----------------------------------------------------------------------------
-# 2) Helpers: headers únicos + soporte encabezados combinados (2 filas)
+# 2) Headers únicos + encabezados combinados (2 filas)
 # -----------------------------------------------------------------------------
 def _make_unique_headers(headers):
-    """Devuelve headers únicos y no vacíos: 'SVC', 'SVC__2', 'col_3', etc."""
     clean = [(h or "").strip() for h in headers]
-    out = []
-    seen = {}
+    out, seen = [], {}
     for i, h in enumerate(clean, start=1):
         base = h if h else f"col_{i}"
         if base in seen:
@@ -160,7 +153,6 @@ def _make_unique_headers(headers):
     return out
 
 def _combine_two_header_rows(r1: List[str], r2: List[str]) -> List[str]:
-    """Une fila1 y fila2 para construir encabezados cuando hay merges."""
     n = max(len(r1), len(r2))
     out = []
     for i in range(n):
@@ -178,10 +170,7 @@ def _get_gspread_client():
     from google.oauth2.service_account import Credentials
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw:
-        raise RuntimeError(
-            "Faltan credenciales en GOOGLE_SERVICE_ACCOUNT_JSON. "
-            "Copia tu JSON completo en Secrets como GOOGLE_SERVICE_ACCOUNT_JSON."
-        )
+        raise RuntimeError("Faltan credenciales en GOOGLE_SERVICE_ACCOUNT_JSON.")
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets.readonly",
         "https://www.googleapis.com/auth/drive.readonly",
@@ -192,7 +181,7 @@ def _get_gspread_client():
 @st.cache_data(show_spinner=False, ttl=300)
 def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     """Lee una pestaña. Si detecta encabezados combinados (fila1 con muchos vacíos),
-    usa fila1+fila2 para armar header. Siempre hace headers únicos."""
+    usa fila1+fila2 para armar header. Siempre hace headers únicos y coerciona números."""
     gc = _get_gspread_client()
     sh = gc.open_by_key(sanitize_sheet_id(sheet_id))
     ws = sh.worksheet(tab_name)
@@ -200,11 +189,11 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     if not values:
         return pd.DataFrame()
 
-    # Heurística: si la fila 1 tiene muchos vacíos y hay al menos 2 filas, combinamos fila1+fila2
+    # Detecta encabezados combinados
     if len(values) >= 2:
         r1 = values[0]
         empty_ratio = sum(1 for x in r1 if not x.strip()) / max(1, len(r1))
-        if empty_ratio > 0.4:  # muchos vacíos ⇒ típico de merges
+        if empty_ratio > 0.4:
             header = _combine_two_header_rows(values[0], values[1])
             data_rows = values[2:]
         else:
@@ -231,16 +220,22 @@ def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
     return out
 
 # -----------------------------------------------------------------------------
-# 4) Loaders (normalización + defaults)
+# 4) Loaders (garantizan FECHA y columnas presentes)
 # -----------------------------------------------------------------------------
+def _finalize(df: pd.DataFrame, wanted: List[str]) -> pd.DataFrame:
+    """Asegura FECHA y SVC existan; devuelve solo columnas existentes para evitar KeyError."""
+    df = ensure_columns(df, {"FECHA": pd.NaT, "SVC": None})
+    cols = [c for c in wanted if c in df.columns]
+    return df[cols].copy() if cols else pd.DataFrame(columns=wanted)
+
 def load_fcst() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["fcst"])
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","FCST"])
     coerce_date_column(df, ["FECHA","DATE","OP_DT","SHP_DATE_DISPATCHED_ID"], "FECHA", "FCST", required=False)
     find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID","CENTRO","FACILITY","LC"], "SVC", False, "FCST")
     find_and_rename(df, ["FCST","FORECAST","PRONOSTICO","PRONÓSTICO","VOLUMEN_PLAN","PLAN","VOL_PLAN"], "FCST", False, "FCST")
-    df = ensure_columns(df, {"SVC":None, "FCST":0})
-    return df[["FECHA","SVC","FCST"]].copy()
+    df = ensure_columns(df, {"FCST":0})
+    return _finalize(df, ["FECHA","SVC","FCST"])
 
 def load_dc() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["dc"])
@@ -248,8 +243,8 @@ def load_dc() -> pd.DataFrame:
     coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "DC", required=False)
     find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, "DC")
     find_and_rename(df, ["DC","AJUSTE","CORRECCION","CORRECCIÓN","DEMAND_CORRECTION"], "DC", False, "DC")
-    df = ensure_columns(df, {"SVC":None, "DC":0})
-    return df[["FECHA","SVC","DC"]].copy()
+    df = ensure_columns(df, {"DC":0})
+    return _finalize(df, ["FECHA","SVC","DC"])
 
 def load_sp() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["sp"])
@@ -257,8 +252,8 @@ def load_sp() -> pd.DataFrame:
     coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "SP", required=False)
     find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, "SP")
     find_and_rename(df, ["SP","SERVICE_PARTNER","CAP_SP","CAPACIDAD_SP","CAPACITY_SP"], "SP", False, "SP")
-    df = ensure_columns(df, {"SVC":None, "SP":0})
-    return df[["FECHA","SVC","SP"]].copy()
+    df = ensure_columns(df, {"SP":0})
+    return _finalize(df, ["FECHA","SVC","SP"])
 
 def load_spr() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["spr"])
@@ -268,8 +263,7 @@ def load_spr() -> pd.DataFrame:
     find_and_rename(df, ["SPR","SPR_OBJ","SPR objetivo","SPR plan","OBJ_SPR"], "SPR_OBJ", False, "SPR")
     find_and_rename(df, ["SPR_PEAK","SPR_PICO","PICO"], "SPR_PEAK", False, "SPR")
     find_and_rename(df, ["SPR_PROM","SPR_AVG","SPR_PROMEDIO","PROMEDIO"], "SPR_PROM", False, "SPR")
-    df = ensure_columns(df, {"SVC":None, "SPR_OBJ":np.nan, "SPR_PEAK":np.nan, "SPR_PROM":np.nan})
-    return df[["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"]].copy()
+    return _finalize(df, ["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"])
 
 def load_rentals() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
@@ -277,21 +271,19 @@ def load_rentals() -> pd.DataFrame:
     coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "Rentals", required=False)
     find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID","FACILITY","LC","CENTRO"], "SVC", False, "Rentals")
     find_and_rename(df, ["RUTAS","RUTAS_PLAN","ROUTES_PLAN","CAP_RUTAS","RENTALS_ROUTES","RUTAS_RENTALS"], "RUTAS_RENTALS", False, "Rentals")
-    df = ensure_columns(df, {"SVC":None, "RUTAS_RENTALS":0})
-    return df[["FECHA","SVC","RUTAS_RENTALS"]].copy()
+    df = ensure_columns(df, {"RUTAS_RENTALS":0})
+    return _finalize(df, ["FECHA","SVC","RUTAS_RENTALS"])
 
 def load_crowd() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","CROWD_BASE_PCT"])
-    # 👇 crowd trae headers combinados → ya lo maneja read_sheet() con 2 filas.
     coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "Crowd", required=False)
     find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID","CENTRO","FACILITY","LC"], "SVC", False, "Crowd")
     find_and_rename(df, ["CROWD_BASE","CROWD_BASE_%","%CROWD","CROWD_PCT_PLAN","CROWD","BASE_CROWD","PCT_CROWD"], "CROWD_BASE_PCT", False, "Crowd")
     df["CROWD_BASE_PCT"] = pd.to_numeric(df.get("CROWD_BASE_PCT", 0), errors="coerce").fillna(0)
     if (df["CROWD_BASE_PCT"] > 1).mean() > 0.7:
         df["CROWD_BASE_PCT"] = (df["CROWD_BASE_PCT"]/100).clip(0,1)
-    df = ensure_columns(df, {"SVC":None})
-    return df[["FECHA","SVC","CROWD_BASE_PCT"]].copy()
+    return _finalize(df, ["FECHA","SVC","CROWD_BASE_PCT"])
 
 def load_mlp_sdd() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["mlp_sdd"])
@@ -300,8 +292,8 @@ def load_mlp_sdd() -> pd.DataFrame:
     find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID","CENTRO","FACILITY","LC"], "SVC", False, "MLP_SDD")
     find_and_rename(df, ["SDD","RUTAS_SDD","MLP_SDD","RUTAS_MLP_SDD"], "RUTAS_MLP_SDD", False, "MLP_SDD")
     find_and_rename(df, ["SPOT","RUTAS_SPOT","MLP_SPOT","RUTAS_MLP_SPOT"], "RUTAS_MLP_SPOT", False, "MLP_SDD")
-    df = ensure_columns(df, {"SVC":None, "RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0})
-    return df[["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT"]].copy()
+    df = ensure_columns(df, {"RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0})
+    return _finalize(df, ["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT"])
 
 def load_crowd_e1() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd_e1"])
@@ -309,8 +301,8 @@ def load_crowd_e1() -> pd.DataFrame:
     coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "Crowd_E1", required=False)
     find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID","CENTRO","FACILITY","LC"], "SVC", False, "Crowd_E1")
     find_and_rename(df, ["E1","CROWD_E1","CROWD_SUPLEMENTO","CROWD_EXTRA","EXTRA"], "CROWD_E1", False, "Crowd_E1")
-    df = ensure_columns(df, {"SVC":None, "CROWD_E1":0})
-    return df[["FECHA","SVC","CROWD_E1"]].copy()
+    df = ensure_columns(df, {"CROWD_E1":0})
+    return _finalize(df, ["FECHA","SVC","CROWD_E1"])
 
 # -----------------------------------------------------------------------------
 # 5) Cálculo del plan
@@ -492,8 +484,8 @@ except Exception as e:
 with st.expander("ℹ️ Notas de esta versión"):
     st.markdown(textwrap.dedent("""
     - Carga estable con gspread + saneo de URL/ID.
-    - 🔒 Headers únicos y soporte a encabezados combinados (fila1+fila2) — **útil para Crowd**.
+    - Headers únicos y soporte a encabezados combinados (fila1+fila2) — útil para Crowd.
     - Normalización de columnas; coerción de números/porcentajes/fechas.
-    - Defaults para evitar caídas si falta alguna columna.
+    - Fix: todos los loaders garantizan **FECHA** y devuelven solo columnas existentes (adiós `KeyError: ['FECHA']`).
     - Filtro inicial: **SGD1, SMT1, SMX9, SPB1** y auto-run al inicio.
     """))
