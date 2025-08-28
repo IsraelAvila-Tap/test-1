@@ -60,6 +60,13 @@ def _to_num(s) -> pd.Series:
     s = s.str.replace(",", "", regex=False).str.replace("%", "", regex=False).str.strip()
     return pd.to_numeric(s, errors="coerce")
 
+def _safe_to_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """Convierte a numérico sólo si la columna existe; evita usar 'c' fuera de scope."""
+    for col in cols:
+        if col in df.columns:
+            df[col] = _to_num(df[col]).fillna(0.0)
+    return df
+
 def _lower_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     # normaliza nombres únicos (si hay duplicados, agrega sufijo)
@@ -294,12 +301,19 @@ def load_srm() -> pd.DataFrame:
         except Exception:
             df[c] = 0.0
 
-    g = df.copy()
-    g["svc"] = _ensure_series(g[svc_col]).astype(str).str.upper().str.strip()
-    out = g.groupby("svc", as_index=False)[list(set(sdd_cols+spot_cols))].sum()
-    out["sdd_routes_max"]  = out[sdd_cols].sum(axis=1)  if sdd_cols else 0.0
-    out["spot_routes_max"] = out[spot_cols].sum(axis=1) if spot_cols else 0.0
-    return out[["svc","sdd_routes_max","spot_routes_max"]]
+ # tipado seguro y agregación
+num_cols = list(set(sdd_cols + spot_cols))
+df = _safe_to_numeric(df, num_cols)  # <- usa la utilidad nueva
+
+g = df.copy()
+g["svc"] = _ensure_series(g[svc_col]).astype(str).str.upper().str.strip()
+
+agg = g.groupby("svc", as_index=False)[num_cols].sum()
+agg["sdd_routes_max"]  = agg[sdd_cols].sum(axis=1)  if sdd_cols  else 0
+agg["spot_routes_max"] = agg[spot_cols].sum(axis=1) if spot_cols else 0
+
+return agg[["svc", "sdd_routes_max", "spot_routes_max"]]
+
 
 def load_rentals() -> pd.DataFrame:
     df = _read("Rentals")
