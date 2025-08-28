@@ -61,12 +61,24 @@ def _to_num(s) -> pd.Series:
     s = s.str.replace(",", "", regex=False).str.replace("%", "", regex=False).str.strip()
     return pd.to_numeric(s, errors="coerce")
 
+# --- PARCHE: reemplaza estas dos funciones ---
+
+from typing import List
+
 def _safe_to_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """Convierte a numérico sólo si la columna existe; evita usar 'c' fuera de scope."""
+    """Convierte a numérico solo si la columna existe (sin usar 'c')."""
     for col in cols:
         if col in df.columns:
             df[col] = _to_num(df[col]).fillna(0.0)
     return df
+
+def _safe_to_numeric_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """Idéntica a la anterior; algunas llamadas usan este nombre."""
+    for col in cols:
+        if col in df.columns:
+            df[col] = _to_num(df[col]).fillna(0.0)
+    return df
+
 
 def _lower_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
