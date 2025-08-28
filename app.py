@@ -80,7 +80,7 @@ def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFram
             df[c] = v
     return df
 
-_NUM_SEP_RE = re.compile(r"[ ,\u00A0]")  # espacio, NBSP, coma
+_NUM_SEP_RE = re.compile(r"[ ,\u00A0]")
 
 def _maybe_to_numeric(series_like):
     """Soporta Series o DataFrame (por si hay headers duplicados)."""
@@ -89,23 +89,17 @@ def _maybe_to_numeric(series_like):
         for sub in series_like.columns:
             series_like[sub] = _maybe_to_numeric(series_like[sub])
         return series_like
-
     s = series_like
     if getattr(s, "dtype", None) is not None and s.dtype.kind in "iufc":
         return s
-
     sample = s.dropna().astype(str).head(60) if hasattr(s, "dropna") else []
     if len(sample) == 0:
-        try:
-            return pd.to_numeric(s, errors="coerce")
-        except Exception:
-            return s
-
+        try:    return pd.to_numeric(s, errors="coerce")
+        except Exception: return s
     looks_numeric = 0
     for v in sample:
         v2 = _NUM_SEP_RE.sub("", v).replace("%","").replace("−","-")
-        if re.fullmatch(r"-?\d+(\.\d+)?", v2):
-            looks_numeric += 1
+        if re.fullmatch(r"-?\d+(\.\d+)?", v2): looks_numeric += 1
     if looks_numeric / max(1, len(sample)) >= 0.75:
         s2 = s.astype(str).str.replace("%","", regex=False)
         s2 = s2.str.replace("−","-", regex=False)
@@ -169,8 +163,7 @@ def _get_gspread_client():
     import gspread
     from google.oauth2.service_account import Credentials
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not raw:
-        raise RuntimeError("Faltan credenciales en GOOGLE_SERVICE_ACCOUNT_JSON.")
+    if not raw: raise RuntimeError("Faltan credenciales en GOOGLE_SERVICE_ACCOUNT_JSON.")
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets.readonly",
         "https://www.googleapis.com/auth/drive.readonly",
@@ -280,9 +273,17 @@ def load_crowd() -> pd.DataFrame:
     coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "Crowd", required=False)
     find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID","CENTRO","FACILITY","LC"], "SVC", False, "Crowd")
     find_and_rename(df, ["CROWD_BASE","CROWD_BASE_%","%CROWD","CROWD_PCT_PLAN","CROWD","BASE_CROWD","PCT_CROWD"], "CROWD_BASE_PCT", False, "Crowd")
-    df["CROWD_BASE_PCT"] = pd.to_numeric(df.get("CROWD_BASE_PCT", 0), errors="coerce").fillna(0)
+
+    # 🔧 FIX: si no existe la columna, creamos una Serie de ceros con el mismo índice
+    if "CROWD_BASE_PCT" in df.columns:
+        base_series = df["CROWD_BASE_PCT"]
+    else:
+        base_series = pd.Series(0, index=df.index, dtype="float64")
+
+    df["CROWD_BASE_PCT"] = pd.to_numeric(base_series, errors="coerce").fillna(0)
     if (df["CROWD_BASE_PCT"] > 1).mean() > 0.7:
-        df["CROWD_BASE_PCT"] = (df["CROWD_BASE_PCT"]/100).clip(0,1)
+        df["CROWD_BASE_PCT"] = (df["CROWD_BASE_PCT"] / 100).clip(0, 1)
+
     return _finalize(df, ["FECHA","SVC","CROWD_BASE_PCT"])
 
 def load_mlp_sdd() -> pd.DataFrame:
@@ -431,7 +432,6 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
 st.title("Mel-IA — Plan táctico (diario por SVC)")
 spr_mode = st.radio("SPR objetivo", options=["promedio","peak","plan"], horizontal=True, index=0)
 
-# Previene NameError y fija defaults de SVC
 run_btn = False
 auto_run = False
 sel_svcs: List[str] = []
@@ -457,7 +457,6 @@ with st.expander("▶️ Cargando datos...", expanded=True):
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
 
-# Auto-run 1a vez
 if 'auto_run_once' not in st.session_state:
     st.session_state['auto_run_once'] = True
     auto_run = True
@@ -486,6 +485,6 @@ with st.expander("ℹ️ Notas de esta versión"):
     - Carga estable con gspread + saneo de URL/ID.
     - Headers únicos y soporte a encabezados combinados (fila1+fila2) — útil para Crowd.
     - Normalización de columnas; coerción de números/porcentajes/fechas.
-    - Fix: todos los loaders garantizan **FECHA** y devuelven solo columnas existentes (adiós `KeyError: ['FECHA']`).
+    - Fix: creación segura de `CROWD_BASE_PCT` como Serie cuando la columna falte.
     - Filtro inicial: **SGD1, SMT1, SMX9, SPB1** y auto-run al inicio.
     """))
