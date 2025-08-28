@@ -1,11 +1,11 @@
 # app.py
 # =============================================================================
 # Mel-IA — Plan táctico (diario por SVC)
-# Ajustado a tus pestañas reales: FCST, SPR, Capacity, Rentals, Crowd.
-# Robusto ante encabezados combinados, columnas vacías/variantes y pestañas faltantes.
+# Ajustado a pestañas: FCST, SPR, Capacity, Rentals, Crowd.
+# Encabezado autodetectado (busca SVC) + encabezado de 2 filas (Base/E1, etc.).
 # =============================================================================
 import os, json, re, unicodedata, textwrap, traceback
-from datetime import date, datetime
+from datetime import date
 from typing import Optional, List, Dict
 
 import numpy as np
@@ -41,7 +41,6 @@ SHEET_ID = sanitize_sheet_id(
     or DEFAULT_SHEET_URL
 )
 
-# Pestañas (las de tus capturas)
 SHEET_TABS = {
     "fcst":     "FCST",
     "spr":      "SPR",
@@ -127,7 +126,7 @@ def show_exception(e: Exception, title: str):
         st.code("".join(traceback.format_exception(None, e, e.__traceback__)))
 
 # -----------------------------------------------------------------------------
-# 2) Headers únicos + encabezados combinados (2 filas)
+# 2) Headers únicos + encabezados combinados (2 filas) + AUTODETECCIÓN
 # -----------------------------------------------------------------------------
 def _make_unique_headers(headers):
     clean = [(h or "").strip() for h in headers]
@@ -152,8 +151,14 @@ def _combine_two_header_rows(r1: List[str], r2: List[str]) -> List[str]:
         out.append(name)
     return out
 
+def _looks_group_header(row_lower: List[str]) -> bool:
+    # detecta encabezados tipo "Base / E1 / Spot / Back Up ..."
+    words = ("base", "e1", "spot", "back", "up", "sdd")
+    hits = sum(1 for c in row_lower if any(w in c for w in words))
+    return hits >= max(2, len(row_lower)//6)
+
 # -----------------------------------------------------------------------------
-# 3) Carga ESTABLE desde Google Sheets
+# 3) Carga ESTABLE desde Google Sheets con header autodetectado
 # -----------------------------------------------------------------------------
 def _get_gspread_client():
     import gspread
@@ -169,8 +174,11 @@ def _get_gspread_client():
 
 @st.cache_data(show_spinner=False, ttl=300)
 def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
-    """Lee una pestaña. Si detecta encabezados combinados (fila1 con muchos vacíos),
-    usa fila1+fila2 para armar header. Devuelve DF vacío si la pestaña no existe."""
+    """Lee una pestaña:
+      - busca la fila de encabezados donde aparezca 'SVC' (primeras 50 filas)
+      - soporta encabezado de 2 filas (p. ej. Crowd: 'Base'/'E1' + detalles)
+      - devuelve DF vacío si la pestaña no existe
+    """
     import gspread
     gc = _get_gspread_client()
     sh = gc.open_by_key(sanitize_sheet_id(sheet_id))
@@ -182,16 +190,34 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     values = ws.get_all_values()
     if not values: return pd.DataFrame()
 
-    if len(values) >= 2:
-        r1 = values[0]
-        empty_ratio = sum(1 for x in r1 if not x.strip()) / max(1, len(r1))
-        if empty_ratio > 0.4:
-            header = _combine_two_header_rows(values[0], values[1])
-            data_rows = values[2:]
-        else:
-            header = values[0]; data_rows = values[1:]
+    # 1) buscar fila de encabezados (SVC)
+    header_idx = None
+    limit = min(50, len(values))
+    for i in range(limit):
+        row_lower = [c.strip().lower() for c in values[i]]
+        if any(c == "svc" for c in row_lower):
+            header_idx = i
+            break
+    if header_idx is None:
+        header_idx = 0  # fallback (igual coercion abajo nos salva)
+
+    r1 = values[header_idx]
+    r1_lower = [c.strip().lower() for c in r1]
+
+    # 2) ¿encabezado de 2 filas?
+    combine = False
+    if header_idx + 1 < len(values):
+        r2 = values[header_idx + 1]
+        r2_nonempty = sum(1 for x in r2 if x.strip())
+        if _looks_group_header(r1_lower) and r2_nonempty >= max(2, len(r2)//4):
+            combine = True
+
+    if combine:
+        header = _combine_two_header_rows(values[header_idx], values[header_idx+1])
+        data_rows = values[header_idx+2:]
     else:
-        header = values[0]; data_rows = values[1:]
+        header = values[header_idx]
+        data_rows = values[header_idx+1:]
 
     header = _make_unique_headers(header)
     df = pd.DataFrame(data_rows, columns=header)
@@ -210,14 +236,13 @@ def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
     return out
 
 # -----------------------------------------------------------------------------
-# 4) Loaders (garantizan FECHA y columnas presentes)
+# 4) Loaders
 # -----------------------------------------------------------------------------
 def _finalize(df: pd.DataFrame, wanted: List[str]) -> pd.DataFrame:
     df = ensure_columns(df, {"FECHA": pd.NaT, "SVC": None})
     cols = [c for c in wanted if c in df.columns]
     return df[cols].copy() if cols else pd.DataFrame(columns=wanted)
 
-# FCST: (SVC, Fecha, Shipments)
 def load_fcst() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["fcst"])
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","FCST"])
@@ -225,17 +250,16 @@ def load_fcst() -> pd.DataFrame:
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "FCST")
     find_and_rename(df, ["Shipments","SHIPMENTS","FCST","Forecast","PLAN"], "FCST", False, "FCST")
     df = ensure_columns(df, {"FCST":0})
-    # Toma la última fecha disponible por SVC (o ≤ hoy)
     hoy = date.today()
-    df = df.dropna(subset=["SVC"])
-    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
-    df = df[df["FECHA"].notna()]
-    df = df[df["FECHA"] <= hoy] if (df["FECHA"] <= hoy).any() else df
-    idx = df.groupby("SVC")["FECHA"].idxmax()
-    df = df.loc[idx]
+    if "FECHA" in df.columns:
+        df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
+        df = df[df["FECHA"].notna()]
+        df = df[df["FECHA"] <= hoy] if (df["FECHA"] <= hoy).any() else df
+        if not df.empty:
+            idx = df.groupby("SVC")["FECHA"].idxmax()
+            df = df.loc[idx]
     return _finalize(df, ["FECHA","SVC","FCST"])
 
-# SPR: (SVC, FECHA, SPR) -> agregados por SVC
 def load_spr() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["spr"])
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"])
@@ -243,28 +267,18 @@ def load_spr() -> pd.DataFrame:
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "SPR")
     find_and_rename(df, ["SPR","Spr"], "SPR_VAL", False, "SPR")
     df = ensure_columns(df, {"SPR_VAL": np.nan})
-    # usa últimos 120 días si hay fecha
-    hoy = date.today()
-    if "FECHA" in df.columns and df["FECHA"].notna().any():
-        df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
-        lim = hoy
-        df = df[df["FECHA"].notna()]
-        df = df[df["FECHA"] >= (hoy.replace(year=hoy.year-1))]  # 1 año
     g = df.groupby("SVC")["SPR_VAL"]
     out = g.agg(SPR_PROM="mean", SPR_PEAK=lambda x: np.nanpercentile(x.dropna(), 95) if x.notna().any() else np.nan).reset_index()
     out["SPR_OBJ"] = out["SPR_PROM"]
-    out["FECHA"] = hoy
+    out["FECHA"] = date.today()
     return _finalize(out, ["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"])
 
-# Capacity → MLP/Spot/Rentals/Crowd caps
-def _norm_text(s):
-    return _canon_name(str(s))
+def _norm_text(s): return _canon_name(str(s))
 
 def load_capacity_caps() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
     if df.empty:
         return pd.DataFrame(columns=["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP"])
-    # Mapear columnas
     find_and_rename(df, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "Capacity")
     find_and_rename(df, ["Tipo","Type","Category"], "TIPO", False, "Capacity")
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Capacity")
@@ -274,7 +288,6 @@ def load_capacity_caps() -> pd.DataFrame:
     df = ensure_columns(df, {"DELIVERY_MODEL":"", "TIPO":"", "TIPO_DM":"", "SVC":None, "FECHA": pd.NaT, "CANT":0})
     df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
 
-    # Fecha objetivo (hoy o la última ≤ hoy; si no, la más reciente)
     hoy = date.today()
     df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
     if df["FECHA"].notna().any():
@@ -285,15 +298,14 @@ def load_capacity_caps() -> pd.DataFrame:
     else:
         df["FECHA"] = hoy
 
-    # Normaliza texto
     dm = df["DELIVERY_MODEL"].map(_norm_text)
     tipo = df["TIPO"].map(_norm_text)
     tipodm = df["TIPO_DM"].map(_norm_text)
 
-    df["IS_RENTALS"] = dm.str.contains("rent")
-    df["IS_CROWD_ROUTES"] = dm.str.contains("crowd") & (tipo.str.contains("route") | tipodm.str.contains("route"))
-    df["IS_MLP_SPOT"] = dm.str.contains("mlp") & (tipodm.str.contains("spot"))
-    df["IS_MLP_SDD"]  = dm.str.contains("mlp") & (~df["IS_MLP_SPOT"]) & (tipodm.str.contains("mlp") | tipodm.str.contains("sdd") | tipodm.eq(""))
+    df["IS_RENTALS"]     = dm.str.contains("rent")
+    df["IS_CROWD_ROUTES"]= dm.str.contains("crowd") & (tipo.str.contains("route") | tipodm.str.contains("route"))
+    df["IS_MLP_SPOT"]    = dm.str.contains("mlp") & (tipodm.str.contains("spot"))
+    df["IS_MLP_SDD"]     = dm.str.contains("mlp") & (~df["IS_MLP_SPOT"]) & (tipodm.str.contains("mlp") | tipodm.str.contains("sdd") | tipodm.eq(""))
 
     agg = df.groupby(["FECHA","SVC"]).agg(
         RUTAS_MLP_SDD=("CANT", lambda s: s[df["IS_MLP_SDD"].reindex(s.index, fill_value=False)].sum()),
@@ -304,7 +316,6 @@ def load_capacity_caps() -> pd.DataFrame:
 
     return _finalize(agg, ["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP"])
 
-# Rentals (fallback si no hay Capacity)
 def load_rentals_fallback() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","RUTAS_RENTALS"])
@@ -315,15 +326,10 @@ def load_rentals_fallback() -> pd.DataFrame:
     out["FECHA"] = date.today()
     return _finalize(out, ["FECHA","SVC","RUTAS_RENTALS"])
 
-# Crowd: base y E1 (holguras) desde la hoja Crowd con encabezados combinados
 def load_crowd_caps() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1_CAP"])
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Crowd")
-    # Columnas esperadas en tus capturas:
-    # "Base entre semana", "Base sabado", "Base domingo",
-    # "Holgura entre semana", "Holgura sabado", "Holgura domingo"
-    # (con posibles variaciones por acento y mayúsculas)
     base_sem_keys = ["Base entre semana","Base entre sem","Base semana","Base entre sem."]
     base_sab_keys = ["Base sabado","Base sábado"]
     base_dom_keys = ["Base domingo"]
@@ -345,11 +351,7 @@ def load_crowd_caps() -> pd.DataFrame:
         if c not in df.columns: df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # Tomamos E1 como holgura de lunes a viernes (HOLG_SEM). Si no, usamos la máxima holgura disponible.
-    df["CROWD_E1_CAP"] = df["HOLG_SEM"]
-    alt = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
-    df["CROWD_E1_CAP"] = df["CROWD_E1_CAP"].where(df["CROWD_E1_CAP"] > 0, alt)
-
+    df["CROWD_E1_CAP"] = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
     out = df.groupby("SVC", as_index=False)["CROWD_E1_CAP"].max()
     out["FECHA"] = date.today()
     return _finalize(out, ["FECHA","SVC","CROWD_E1_CAP"])
@@ -366,7 +368,6 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
 
     hoy = date.today()
 
-    # Base SVCs
     bases = []
     for d in [fcst, spr, caps, crowdc, rents_fb]:
         if "SVC" in d.columns and not d.empty:
@@ -375,57 +376,45 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     out = base.copy()
     out["FECHA"] = hoy
 
-    # FCST
     if not fcst.empty:
         out = safe_merge(out, fcst[["SVC","FCST"]], ["SVC"])
-
-    # SPR
     if not spr.empty:
         out = safe_merge(out, spr[["SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"]], ["SVC"])
+
     spr_mode_col = {"promedio":"SPR_PROM", "peak":"SPR_PEAK", "plan":"SPR_OBJ"}.get(spr_mode, "SPR_PROM")
     out = ensure_columns(out, {"SPR_OBJ":np.nan, "SPR_PEAK":np.nan, "SPR_PROM":np.nan})
     spr_usado = out[spr_mode_col].where(out[spr_mode_col].notna(), out["SPR_OBJ"]).fillna(20)
     out["SPR_USADO"] = pd.to_numeric(spr_usado, errors="coerce").fillna(20).clip(lower=1)
 
-    # Capacity caps
     if not caps.empty:
         out = safe_merge(out, caps[["SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP"]], ["SVC"])
     else:
         out = ensure_columns(out, {"RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0, "RUTAS_CROWD_CAP":0})
 
-    # Rentals fallback si cap no lo trae
     if "RUTAS_RENTALS" not in out.columns or out["RUTAS_RENTALS"].isna().all():
         if not rents_fb.empty:
             out = safe_merge(out, rents_fb[["SVC","RUTAS_RENTALS"]], ["SVC"])
     out = ensure_columns(out, {"RUTAS_RENTALS":0})
 
-    # Crowd E1 cap (extra)
     if not crowdc.empty:
         out = safe_merge(out, crowdc[["SVC","CROWD_E1_CAP"]], ["SVC"])
     out = ensure_columns(out, {"CROWD_E1_CAP":0})
 
-    # Defaults para que nada truene
     out = ensure_columns(out, {"FCST":0})
     for c in ["RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","CROWD_E1_CAP"]:
         out[c] = pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0)
 
-    # Demanda y rutas base por SPR
     out["DEMANDA_AJUSTADA"] = (pd.to_numeric(out["FCST"], errors="coerce").fillna(0)).clip(lower=0)
     out["RUTAS_SPR_BASE"]   = np.ceil(out["DEMANDA_AJUSTADA"] / out["SPR_USADO"]).astype(int)
 
-    # Resta Rentals
     out["RUTAS_POST_RENTALS"] = (out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"]).clip(lower=0)
+    out["RUTAS_CROWD_BASE"]   = np.minimum(out["RUTAS_POST_RENTALS"], out["RUTAS_CROWD_CAP"]).astype(int)
+    out["RUTAS_RESTANTES"]    = (out["RUTAS_POST_RENTALS"] - out["RUTAS_CROWD_BASE"]).clip(lower=0)
 
-    # Usa Crowd cap directo (si existe); si no hay cap pero existiera porcentaje algún día, se podría usar
-    out["RUTAS_CROWD_BASE"] = np.minimum(out["RUTAS_POST_RENTALS"], out["RUTAS_CROWD_CAP"]).astype(int)
-    out["RUTAS_RESTANTES"]  = (out["RUTAS_POST_RENTALS"] - out["RUTAS_CROWD_BASE"]).clip(lower=0)
-
-    # Resta MLP SDD + SPOT
     out["RUTAS_POST_MLP"] = (out["RUTAS_RESTANTES"]
                              - out["RUTAS_MLP_SDD"]
                              - out["RUTAS_MLP_SPOT"]).clip(lower=0)
 
-    # E1 (Crowd extra / holgura)
     out["RUTAS_CROWDE1_USADAS"] = np.minimum(out["RUTAS_POST_MLP"], out["CROWD_E1_CAP"]).astype(int)
     out["RUTAS_FALTANTES"]      = (out["RUTAS_POST_MLP"] - out["RUTAS_CROWDE1_USADAS"]).clip(lower=0)
 
@@ -485,7 +474,6 @@ with st.expander("▶️ Cargando datos...", expanded=True):
             st.warning("Falta `SHEET_ID`. Pégalo en la barra lateral.")
             svc_list = []
         else:
-            # Usa todas las fuentes sin romper si alguna pestaña falta
             fcst_svcs    = load_fcst()[["SVC"]]
             cap_svcs     = load_capacity_caps()[["SVC"]]
             crowd_svcs   = load_crowd_caps()[["SVC"]]
@@ -526,13 +514,14 @@ except Exception as e:
 
 with st.expander("ℹ️ Notas de esta versión"):
     st.markdown(textwrap.dedent("""
-    - Tabs reales: **FCST, SPR, Capacity, Rentals, Crowd**. Sin `WorksheetNotFound`.
-    - `read_sheet()` devuelve DF vacío si no existe la pestaña.
-    - Headers únicos y soporte a encabezados combinados (fila1+fila2) — útil para **Crowd**.
-    - FCST: usa última fecha disponible por SVC.
-    - SPR: calcula **PROM**, **PEAK(p95)** y **OBJ** a partir de `SPR`.
-    - Capacity: extrae **MLP SDD / MLP Spot / Rentals / Crowd routes cap**; Rentals cae a `Rentals` si falta.
-    - Crowd: toma holguras como **E1** (`CROWD_E1_CAP`).
-    - Pipeline no falla con vacíos, columnas variantes ni pestañas ausentes.
-    - Filtro inicial: **SGD1, SMT1, SMX9, SPB1** y auto-run al inicio.
+    - Autodetección de encabezado (busca `SVC` en las primeras filas).
+    - Encabezado de 2 filas (p. ej., Crowd con “Base/E1/Spot/Back Up”).
+    - Tabs reales: FCST, SPR, Capacity, Rentals, Crowd (sin WorksheetNotFound).
+    - FCST: usa última fecha por SVC ≤ hoy si existe.
+    - SPR: calcula PROM, PEAK (p95) y OBJ desde `SPR`.
+    - Capacity: MLP SDD / MLP Spot / Rentals / Crowd routes cap.
+    - Rentals: fallback si Capacity no trae rentals.
+    - Crowd: holguras → `CROWD_E1_CAP` (capacidad extra E1).
+    - Robusto ante vacíos, nombres variantes y pestañas ausentes.
+    - Filtro inicial: SGD1, SMT1, SMX9, SPB1 y auto-run.
     """))
