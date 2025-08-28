@@ -1,20 +1,11 @@
 # app.py
 # =============================================================================
 # Mel-IA — Plan táctico (diario por SVC)
-# Pipeline: FCST − DC − SP → SPR → Rentals → Crowd base → MLP SDD/Spot → Crowd E1
-# Incluye:
-# - Normalización de encabezados (SVC/SVCs/SHP_LG_FACILITY_ID/LOGISTIC_CENTER_ID → SVC)
-# - Coerción numérica robusta (comas/espacios/%/guiones, vacíos, no numéricos)
-# - Coerción de fechas flexible (intenta dayfirst si falla)
-# - No-crash: defaults si faltan pestañas/columnas
-# - Fix NameError (vars UI siempre definidas)
-# - Cache de lectura (ttl=300) y purge cuando cambia el Sheet
-# - Acepta URL o ID de Google Sheet (sanitize_sheet_id)
-# - Healthcheck de acceso con gspread
+# FCST − DC − SP → SPR → Rentals → Crowd base → MLP SDD/Spot → Crowd E1
 # =============================================================================
 import os, json, re, unicodedata, textwrap, traceback
 from datetime import date
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -31,16 +22,12 @@ elif "gcp_service_account" in st.secrets:
 SERVICE_EMAIL = "planificacion@planificacion.iam.gserviceaccount.com"
 
 def sanitize_sheet_id(text: str | None) -> str | None:
-    """Acepta ID o URL de Google Sheets y devuelve el ID limpio."""
-    if not text:
-        return None
+    if not text: return None
     text = text.strip()
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", text)
-    if m:
-        return m.group(1)
-    if re.fullmatch(r"[a-zA-Z0-9-_]{20,}", text):
-        return text
-    return text  # gspread fallará con mensaje claro si no es válido
+    if m: return m.group(1)
+    if re.fullmatch(r"[a-zA-Z0-9-_]{20,}", text): return text
+    return text
 
 SHEET_ID = sanitize_sheet_id(
     st.secrets.get("SHEET_ID")
@@ -49,15 +36,16 @@ SHEET_ID = sanitize_sheet_id(
     or st.secrets.get("PROJECT_SHEET_ID")
 )
 
-SHEET_TABS = {
-    "fcst":     st.secrets.get("TAB_FCST", "FCST"),
-    "dc":       st.secrets.get("TAB_DC", "DC"),
-    "sp":       st.secrets.get("TAB_SP", "SP"),
-    "spr":      st.secrets.get("TAB_SPR", "SPR"),
-    "rentals":  st.secrets.get("TAB_RENTALS", "Rentals"),
-    "crowd":    st.secrets.get("TAB_CROWD", "Crowd"),
-    "mlp_sdd":  st.secrets.get("TAB_MLP_SDD", "MLP_SDD"),
-    "crowd_e1": st.secrets.get("TAB_CROWD_E1", "Crowd_E1"),
+# Aliases de pestañas (en tu libro pueden estar con otros nombres)
+TAB_ALIASES: Dict[str, List[str]] = {
+    "fcst":     ["FCST", "Forecast", "Pronostico", "Pronóstico", "Demanda", "Demanda FCST", "FCST diario"],
+    "dc":       ["DC", "Ajuste", "Demand Correction", "Correccion", "Corrección"],
+    "sp":       ["SP", "Service Partner", "Capacidad SP", "Cap_SP", "Partners"],
+    "spr":      ["SPR", "SPR objetivo", "SPR plan", "SPR obj", "Objetivo SPR"],
+    "rentals":  ["Rentals", "Rentas", "Rutas Rentals", "Cap Rentals", "MM Rentals"],
+    "crowd":    ["Crowd", "Base Crowd", "Crowd base", "% Crowd plan", "Crowd %"],
+    "mlp_sdd":  ["MLP_SDD", "MLP SDD", "SDD", "Rutas MLP", "MLP"],
+    "crowd_e1": ["Crowd_E1", "E1", "Crowd extra", "Crowd suplemento", "Suplemento E1"],
 }
 
 # -----------------------------------------------------------------------------
@@ -67,6 +55,31 @@ def _canon_name(s: str) -> str:
     if s is None: return ""
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii","ignore").decode("ascii")
     return re.sub(r"[ \-_/\.]", "", s).lower()
+
+def _col_heuristic_match(col: str, bucket: str) -> bool:
+    """Heurística por palabras clave según bucket destino (svc, fecha, fcst, rentals, crowd_pct, etc.)."""
+    c = _canon_name(col)
+    if bucket == "SVC":
+        return any(k in c for k in ["svc","svcs","facility","centro","logistic","lc"])
+    if bucket == "FECHA":
+        return any(k in c for k in ["fecha","date","opdt","dia","day","dispatch"])
+    if bucket == "FCST":
+        return any(k in c for k in ["fcst","forecast","pronostic","demanda","volumenplan","planvol"])
+    if bucket == "DC":
+        return any(k in c for k in ["dc","correction","ajuste","corr"])
+    if bucket == "SP":
+        return any(k in c for k in ["sp","servicepartner","capsp","partner"])
+    if bucket in {"SPR_OBJ","SPR_PEAK","SPR_PROM"}:
+        return "spr" in c or "objetivo" in c or "avg" in c or "prom" in c or "peak" in c or "pico" in c
+    if bucket == "RUTAS_RENTALS":
+        return any(k in c for k in ["renta","rentals","routes","rutas","caprutas"])
+    if bucket in {"RUTAS_MLP_SDD","RUTAS_MLP_SPOT"}:
+        return any(k in c for k in ["sdd","spot","mlp"])
+    if bucket == "CROWD_BASE_PCT":
+        return any(k in c for k in ["crowd","%","pct","porc","base"])
+    if bucket == "CROWD_E1":
+        return any(k in c for k in ["e1","extra","suplemento"])
+    return False
 
 def find_and_rename(df: pd.DataFrame, candidates: List[str], new_name: str,
                     required: bool = True, source_label: str = "") -> Optional[str]:
@@ -78,8 +91,14 @@ def find_and_rename(df: pd.DataFrame, candidates: List[str], new_name: str,
             if real != new_name:
                 df.rename(columns={real: new_name}, inplace=True)
             return new_name
+    # Heurística si no se encontró
+    for col in df.columns:
+        if _col_heuristic_match(col, new_name):
+            if col != new_name:
+                df.rename(columns={col: new_name}, inplace=True)
+            return new_name
     if required:
-        raise ValueError(f"{source_label}: falta columna equivalente a {candidates}. Encabezados: {list(df.columns)}")
+        raise ValueError(f"{source_label}: falta columna equivalente a {candidates} → '{new_name}'. Encabezados: {list(df.columns)}")
     return None
 
 def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFrame:
@@ -88,12 +107,12 @@ def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFram
             df[c] = v
     return df
 
-_NUM_SEP_RE = re.compile(r"[ ,\u00A0]")  # espacio, NBSP, coma
+_NUM_SEP_RE = re.compile(r"[ ,\u00A0]")
 
 def _maybe_to_numeric(s: pd.Series) -> pd.Series:
     if s.dtype.kind in "iufc":
         return s
-    sample = s.dropna().astype(str).head(50)
+    sample = s.dropna().astype(str).head(60)
     if sample.empty:
         return pd.to_numeric(s, errors="coerce")
     looks_numeric = 0
@@ -101,7 +120,7 @@ def _maybe_to_numeric(s: pd.Series) -> pd.Series:
         v2 = _NUM_SEP_RE.sub("", v).replace("%","").replace("−","-")
         if re.fullmatch(r"-?\d+(\.\d+)?", v2):
             looks_numeric += 1
-    if looks_numeric / max(1, len(sample)) >= 0.8:
+    if looks_numeric / max(1, len(sample)) >= 0.75:
         s2 = s.astype(str).str.replace("%","", regex=False)
         s2 = s2.str.replace("−","-", regex=False)
         s2 = s2.apply(lambda x: _NUM_SEP_RE.sub("", x) if x is not None else x)
@@ -132,17 +151,14 @@ def show_exception(e: Exception, title: str):
         st.code("".join(traceback.format_exception(None, e, e.__traceback__)))
 
 # -----------------------------------------------------------------------------
-# 2) Google Sheets: cliente + lectura + healthcheck
+# 2) Google Sheets: cliente + lectura + autodiscovery de pestañas + healthcheck
 # -----------------------------------------------------------------------------
 def _get_gspread_client():
     import gspread
     from google.oauth2.service_account import Credentials
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw:
-        raise RuntimeError(
-            "Faltan credenciales en GOOGLE_SERVICE_ACCOUNT_JSON. "
-            "Copia tu JSON completo en Secrets como GOOGLE_SERVICE_ACCOUNT_JSON."
-        )
+        raise RuntimeError("Faltan credenciales en GOOGLE_SERVICE_ACCOUNT_JSON.")
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets.readonly",
         "https://www.googleapis.com/auth/drive.readonly",
@@ -151,14 +167,56 @@ def _get_gspread_client():
     return gspread.authorize(creds)
 
 @st.cache_data(show_spinner=False, ttl=300)
-def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
-    sheet_id = sanitize_sheet_id(sheet_id)
+def _list_worksheets(sheet_id: str) -> List[str]:
     gc = _get_gspread_client()
     sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(tab_name)
+    return [w.title for w in sh.worksheets()]
+
+def _open_ws(sheet_id: str, tab_name: str):
+    gc = _get_gspread_client()
+    sh = gc.open_by_key(sheet_id)
+    return sh.worksheet(tab_name)
+
+def _discover_tab(sheet_id: str, want: str, aliases: List[str], column_targets: Dict[str, List[str]]) -> Optional[str]:
+    """
+    Si la pestaña exacta no existe, escanea el libro:
+    - Primero prueba aliases.
+    - Si aún no, abre cada pestaña y mira si contiene columnas que mapean al bucket requerido.
+    """
+    titles = _list_worksheets(sheet_id)
+    # 1) Alias directo
+    for a in aliases:
+        if a in titles: return a
+    # 2) Heurística por columnas
+    for t in titles:
+        try:
+            ws = _open_ws(sheet_id, t)
+            vals = ws.get_all_values()
+            if not vals: 
+                continue
+            header = [h.strip() for h in (vals[0] if vals else [])]
+            df_head = pd.DataFrame(columns=header)
+            # Checa si esta pestaña tiene suficientes columnas que podamos mapear a las esperadas
+            hits = 0
+            total_buckets = len(column_targets)
+            for bucket, cands in column_targets.items():
+                ok = False
+                for h in header:
+                    if _canon_name(h) in {_canon_name(x) for x in cands} or _col_heuristic_match(h, bucket):
+                        ok = True; break
+                if ok: hits += 1
+            if hits >= max(2, total_buckets - 1):  # tolerante
+                return t
+        except Exception:
+            continue
+    return None
+
+@st.cache_data(show_spinner=False, ttl=300)
+def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
+    sheet_id = sanitize_sheet_id(sheet_id)
+    ws = _open_ws(sheet_id, tab_name)
     values = ws.get_all_values()
-    if not values:
-        return pd.DataFrame()
+    if not values: return pd.DataFrame()
     header, rows = values[0], values[1:]
     df = pd.DataFrame(rows, columns=header)
     return coerce_numeric_df(df)
@@ -167,100 +225,135 @@ def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
     sheet_id = sanitize_sheet_id(sheet_id)
     out = {"sheet_id": sheet_id or "", "ok": "false", "note": ""}
     try:
-        gc = _get_gspread_client()
-        sh = gc.open_by_key(sheet_id)
-        titles = [w.title for w in sh.worksheets()]
+        titles = _list_worksheets(sheet_id)
         out["ok"] = "true"
-        out["note"] = f"Pestañas: {', '.join(titles[:8])}" + ("…" if len(titles) > 8 else "")
+        out["note"] = f"Pestañas: {', '.join(titles[:10])}" + ("…" if len(titles) > 10 else "")
     except Exception as e:
         out["note"] = f"{e}"
     return out
 
 # -----------------------------------------------------------------------------
-# 3) Loaders (normalización + defaults)
+# 3) Resolución de pestañas (auto-discovery)
+# -----------------------------------------------------------------------------
+def resolve_tab(sheet_id: str, key: str) -> Optional[str]:
+    aliases = TAB_ALIASES.get(key, [key])
+    # columnas mínimas por dataset
+    targets: Dict[str, Dict[str, List[str]]] = {
+        "fcst":     {"SVC":["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "FECHA":["FECHA","DATE","OP_DT","SHP_DATE_DISPATCHED_ID"], "FCST":["FCST","FORECAST","PRONOSTICO","PRONÓSTICO","VOLUMEN_PLAN","PLAN"]},
+        "dc":       {"SVC":["SVC","LOGISTIC_CENTER_ID"], "FECHA":["FECHA","DATE","OP_DT"], "DC":["DC","AJUSTE","CORRECCION","CORRECCIÓN","DEMAND_CORRECTION"]},
+        "sp":       {"SVC":["SVC","LOGISTIC_CENTER_ID"], "FECHA":["FECHA","DATE","OP_DT"], "SP":["SP","SERVICE_PARTNER","CAP_SP","CAPACIDAD_SP"]},
+        "spr":      {"SVC":["SVC","LOGISTIC_CENTER_ID"], "FECHA":["FECHA","DATE","OP_DT"], "SPR_OBJ":["SPR","SPR_OBJ","SPR objetivo","SPR plan"], "SPR_PEAK":["SPR_PEAK","SPR_PICO"], "SPR_PROM":["SPR_PROM","SPR_AVG","SPR_PROMEDIO"]},
+        "rentals":  {"SVC":["SVC","SVCs","SVC/SVCs","LOGISTIC_CENTER_ID","SHP_LG_FACILITY_ID","FACILITY","LC"], "FECHA":["FECHA","DATE","OP_DT"], "RUTAS_RENTALS":["RUTAS","RUTAS_PLAN","ROUTES_PLAN","CAP_RUTAS","RENTALS_ROUTES"]},
+        "crowd":    {"SVC":["SVC","LOGISTIC_CENTER_ID"], "FECHA":["FECHA","DATE","OP_DT"], "CROWD_BASE_PCT":["CROWD_BASE","CROWD_BASE_%","%CROWD","CROWD_PCT_PLAN","CROWD"]},
+        "mlp_sdd":  {"SVC":["SVC","LOGISTIC_CENTER_ID"], "FECHA":["FECHA","DATE","OP_DT"], "RUTAS_MLP_SDD":["SDD","RUTAS_SDD","MLP_SDD","RUTAS_MLP_SDD"], "RUTAS_MLP_SPOT":["SPOT","RUTAS_SPOT","MLP_SPOT","RUTAS_MLP_SPOT"]},
+        "crowd_e1": {"SVC":["SVC","LOGISTIC_CENTER_ID"], "FECHA":["FECHA","DATE","OP_DT"], "CROWD_E1":["E1","CROWD_E1","CROWD_SUPLEMENTO","CROWD_EXTRA"]},
+    }
+    # 1) Si existe alias exacto
+    titles = _list_worksheets(sheet_id)
+    for a in aliases:
+        if a in titles: return a
+    # 2) Descubrir por encabezados
+    return _discover_tab(sheet_id, key, aliases, targets[key])
+
+# -----------------------------------------------------------------------------
+# 4) Loaders con normalización de columnas
 # -----------------------------------------------------------------------------
 def load_fcst() -> pd.DataFrame:
-    df = read_sheet(SHEET_ID, SHEET_TABS["fcst"])
+    tab = resolve_tab(SHEET_ID, "fcst")
+    if not tab: return pd.DataFrame(columns=["FECHA","SVC","FCST"])
+    df = read_sheet(SHEET_ID, tab)
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","FCST"])
-    coerce_date_column(df, ["FECHA","DATE","OP_DT","SHP_DATE_DISPATCHED_ID"], "FECHA", "FCST", required=False)
-    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, "FCST")
-    find_and_rename(df, ["FCST","FORECAST","PRONOSTICO","VOLUMEN_PLAN"], "FCST", False, "FCST")
+    coerce_date_column(df, ["FECHA","DATE","OP_DT","SHP_DATE_DISPATCHED_ID"], "FECHA", f"FCST[{tab}]", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID","CENTRO","FACILITY","LC"], "SVC", False, f"FCST[{tab}]")
+    find_and_rename(df, ["FCST","FORECAST","PRONOSTICO","PRONÓSTICO","VOLUMEN_PLAN","PLAN","VOL_PLAN"], "FCST", False, f"FCST[{tab}]")
     df = ensure_columns(df, {"SVC":None, "FCST":0})
     return df[["FECHA","SVC","FCST"]].copy()
 
 def load_dc() -> pd.DataFrame:
-    df = read_sheet(SHEET_ID, SHEET_TABS["dc"])
+    tab = resolve_tab(SHEET_ID, "dc")
+    if not tab: return pd.DataFrame(columns=["FECHA","SVC","DC"])
+    df = read_sheet(SHEET_ID, tab)
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","DC"])
-    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "DC", required=False)
-    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, "DC")
-    find_and_rename(df, ["DC","DESCARGA","DEMAND_CORRECTION","AJUSTE"], "DC", False, "DC")
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", f"DC[{tab}]", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, f"DC[{tab}]")
+    find_and_rename(df, ["DC","AJUSTE","CORRECCION","CORRECCIÓN","DEMAND_CORRECTION"], "DC", False, f"DC[{tab}]")
     df = ensure_columns(df, {"SVC":None, "DC":0})
     return df[["FECHA","SVC","DC"]].copy()
 
 def load_sp() -> pd.DataFrame:
-    df = read_sheet(SHEET_ID, SHEET_TABS["sp"])
+    tab = resolve_tab(SHEET_ID, "sp")
+    if not tab: return pd.DataFrame(columns=["FECHA","SVC","SP"])
+    df = read_sheet(SHEET_ID, tab)
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","SP"])
-    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "SP", required=False)
-    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, "SP")
-    find_and_rename(df, ["SP","SERVICE_PARTNER","CAP_SP","CAPACIDAD_SP"], "SP", False, "SP")
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", f"SP[{tab}]", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, f"SP[{tab}]")
+    find_and_rename(df, ["SP","SERVICE_PARTNER","CAP_SP","CAPACIDAD_SP","CAPACITY_SP"], "SP", False, f"SP[{tab}]")
     df = ensure_columns(df, {"SVC":None, "SP":0})
     return df[["FECHA","SVC","SP"]].copy()
 
 def load_spr() -> pd.DataFrame:
-    df = read_sheet(SHEET_ID, SHEET_TABS["spr"])
+    tab = resolve_tab(SHEET_ID, "spr")
+    if not tab: return pd.DataFrame(columns=["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"])
+    df = read_sheet(SHEET_ID, tab)
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"])
-    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "SPR", required=False)
-    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, "SPR")
-    find_and_rename(df, ["SPR","SPR_OBJ","SPR objetivo","SPR_plan"], "SPR_OBJ", False, "SPR")
-    find_and_rename(df, ["SPR_PEAK","SPR_PICO"], "SPR_PEAK", False, "SPR")
-    find_and_rename(df, ["SPR_PROM","SPR_AVG","SPR_PROMEDIO"], "SPR_PROM", False, "SPR")
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", f"SPR[{tab}]", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, f"SPR[{tab}]")
+    find_and_rename(df, ["SPR","SPR_OBJ","SPR objetivo","SPR plan","OBJ_SPR"], "SPR_OBJ", False, f"SPR[{tab}]")
+    find_and_rename(df, ["SPR_PEAK","SPR_PICO","PICO"], "SPR_PEAK", False, f"SPR[{tab}]")
+    find_and_rename(df, ["SPR_PROM","SPR_AVG","SPR_PROMEDIO","PROMEDIO"], "SPR_PROM", False, f"SPR[{tab}]")
     df = ensure_columns(df, {"SVC":None, "SPR_OBJ":np.nan, "SPR_PEAK":np.nan, "SPR_PROM":np.nan})
     return df[["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"]].copy()
 
 def load_rentals() -> pd.DataFrame:
-    df = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
+    tab = resolve_tab(SHEET_ID, "rentals")
+    if not tab: return pd.DataFrame(columns=["FECHA","SVC","RUTAS_RENTALS"])
+    df = read_sheet(SHEET_ID, tab)
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","RUTAS_RENTALS"])
-    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "Rentals", required=False)
-    find_and_rename(df,
-        ["SVC","SVCs","SVC/SVCs","SVC SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID","FACILITY","LC"],
-        "SVC", False, "Rentals")
-    find_and_rename(df, ["RUTAS","RUTAS_PLAN","ROUTES_PLAN","CAP_RUTAS","RENTALS_ROUTES"], "RUTAS_RENTALS", False, "Rentals")
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", f"Rentals[{tab}]", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID","FACILITY","LC","CENTRO"], "SVC", False, f"Rentals[{tab}]")
+    find_and_rename(df, ["RUTAS","RUTAS_PLAN","ROUTES_PLAN","CAP_RUTAS","RENTALS_ROUTES","RUTAS_RENTALS"], "RUTAS_RENTALS", False, f"Rentals[{tab}]")
     df = ensure_columns(df, {"SVC":None, "RUTAS_RENTALS":0})
     return df[["FECHA","SVC","RUTAS_RENTALS"]].copy()
 
 def load_crowd() -> pd.DataFrame:
-    df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
+    tab = resolve_tab(SHEET_ID, "crowd")
+    if not tab: return pd.DataFrame(columns=["FECHA","SVC","CROWD_BASE_PCT"])
+    df = read_sheet(SHEET_ID, tab)
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","CROWD_BASE_PCT"])
-    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "Crowd", required=False)
-    find_and_rename(df, ["SVC","svc","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, "Crowd")
-    find_and_rename(df, ["CROWD_BASE","CROWD_BASE_%","%CROWD","CROWD_PCT_PLAN"], "CROWD_BASE_PCT", False, "Crowd")
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", f"Crowd[{tab}]", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, f"Crowd[{tab}]")
+    find_and_rename(df, ["CROWD_BASE","CROWD_BASE_%","%CROWD","CROWD_PCT_PLAN","CROWD","BASE_CROWD","PCT_CROWD"], "CROWD_BASE_PCT", False, f"Crowd[{tab}]")
     df["CROWD_BASE_PCT"] = pd.to_numeric(df.get("CROWD_BASE_PCT", 0), errors="coerce").fillna(0)
-    if (df["CROWD_BASE_PCT"] > 1).mean() > 0.8:  # si viene en 0-100
+    if (df["CROWD_BASE_PCT"] > 1).mean() > 0.7:  # venía 0-100
         df["CROWD_BASE_PCT"] = (df["CROWD_BASE_PCT"]/100).clip(0,1)
     df = ensure_columns(df, {"SVC":None})
     return df[["FECHA","SVC","CROWD_BASE_PCT"]].copy()
 
 def load_mlp_sdd() -> pd.DataFrame:
-    df = read_sheet(SHEET_ID, SHEET_TABS["mlp_sdd"])
+    tab = resolve_tab(SHEET_ID, "mlp_sdd")
+    if not tab: return pd.DataFrame(columns=["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT"])
+    df = read_sheet(SHEET_ID, tab)
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT"])
-    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "MLP_SDD", required=False)
-    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, "MLP_SDD")
-    find_and_rename(df, ["SDD","RUTAS_SDD","MLP_SDD","RUTAS_MLP_SDD"], "RUTAS_MLP_SDD", False, "MLP_SDD")
-    find_and_rename(df, ["SPOT","RUTAS_SPOT","MLP_SPOT","RUTAS_MLP_SPOT"], "RUTAS_MLP_SPOT", False, "MLP_SDD")
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", f"MLP_SDD[{tab}]", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, f"MLP_SDD[{tab}]")
+    find_and_rename(df, ["SDD","RUTAS_SDD","MLP_SDD","RUTAS_MLP_SDD"], "RUTAS_MLP_SDD", False, f"MLP_SDD[{tab}]")
+    find_and_rename(df, ["SPOT","RUTAS_SPOT","MLP_SPOT","RUTAS_MLP_SPOT"], "RUTAS_MLP_SPOT", False, f"MLP_SDD[{tab}]")
     df = ensure_columns(df, {"SVC":None, "RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0})
     return df[["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT"]].copy()
 
 def load_crowd_e1() -> pd.DataFrame:
-    df = read_sheet(SHEET_ID, SHEET_TABS["crowd_e1"])
+    tab = resolve_tab(SHEET_ID, "crowd_e1")
+    if not tab: return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1"])
+    df = read_sheet(SHEET_ID, tab)
     if df.empty: return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1"])
-    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "Crowd_E1", required=False)
-    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, "Crowd_E1")
-    find_and_rename(df, ["E1","CROWD_E1","CROWD_SUPLEMENTO","CROWD_EXTRA"], "CROWD_E1", False, "Crowd_E1")
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", f"Crowd_E1[{tab}]", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, f"Crowd_E1[{tab}]")
+    find_and_rename(df, ["E1","CROWD_E1","CROWD_SUPLEMENTO","CROWD_EXTRA","EXTRA"], "CROWD_E1", False, f"Crowd_E1[{tab}]")
     df = ensure_columns(df, {"SVC":None, "CROWD_E1":0})
     return df[["FECHA","SVC","CROWD_E1"]].copy()
 
 # -----------------------------------------------------------------------------
-# 4) Cálculo del plan
+# 5) Cálculo del plan
 # -----------------------------------------------------------------------------
 def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
     fcst     = load_fcst()
@@ -351,7 +444,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     return out
 
 # -----------------------------------------------------------------------------
-# 5) UI Streamlit (resiliente) + Fallback de SHEET_ID
+# 6) UI Streamlit (resiliente) + Fallback de SHEET_ID
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="Mel-IA — Plan táctico (diario por SVC)", layout="wide")
 
@@ -400,6 +493,7 @@ with st.expander("▶️ Cargando datos...", expanded=True):
             st.warning("Falta `SHEET_ID`. Pégalo en la barra lateral.")
             svc_list = []
         else:
+            # usa autodiscovery; si alguna pestaña no existe, devuelve DF vacío pero no truena
             rentals_svcs = load_rentals()[["SVC"]]
             fcst_svcs    = load_fcst()[["SVC"]]
             crowd_svcs   = load_crowd()[["SVC"]]
@@ -440,11 +534,11 @@ except Exception as e:
     show_exception(e, "Traceback completo")
 
 with st.expander("ℹ️ Notas de esta versión"):
-    st.markdown(textwrap.dedent(f"""
-    - **Acepta URL o ID** de Google Sheet; extrae el ID automáticamente.
-    - **Estado de conexión** indica si falta compartir el Sheet con **{SERVICE_EMAIL}** o si el ID es inválido.
-    - Normalización de encabezados; coerción numérica/fechas; defaults para evitar caídas.
+    st.markdown(textwrap.dedent("""
+    - **Autodescubrimiento** de pestañas si no coinciden los nombres (aliases + escaneo de encabezados).
+    - **Normalización de encabezados** (SVC/SVCs/SHP_LG_FACILITY_ID/LOGISTIC_CENTER_ID → SVC, etc.) y **heurística** por palabras clave.
+    - Coerción robusta de números y fechas; porcentajes 0–1 o 0–100.
+    - Si un dataset/columna falta, se completa con 0/NaN y la app no se cae.
     - `SPR objetivo`: promedio→SPR_PROM, peak→SPR_PEAK, plan→SPR_OBJ; fallback a SPR_OBJ y luego 20.
     - Orden: SPR base → Rentals → Crowd base → MLP SDD/Spot → Crowd E1.
     """))
-
