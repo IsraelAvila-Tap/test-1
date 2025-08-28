@@ -157,37 +157,118 @@ def load_rentals() -> pd.DataFrame:
     return out
 
 def load_srm() -> pd.DataFrame:
+    """
+    Lee SRM aun cuando el header esté desplazado y los nombres de columnas sean raros.
+    Si no logra identificar columnas SDD/SPOT, regresa 0s en ambas capacidades.
+    """
     raw = read_ws(SHEET_ID, "SRM")
+
+    # Detecta fila de encabezado (busca la primera que contenga algo como 'svc')
     header_row = None
     for i in range(min(10, len(raw))):
-        row = [str(x).strip().lower() for x in raw.iloc[i,:].tolist()]
+        row = [str(x).strip().lower() for x in raw.iloc[i, :].tolist()]
         if any("svc" == x for x in row):
-            header_row = i; break
-    if header_row is None: header_row = 4
-    cols = [(str(x).strip().lower() if str(x).strip() else f"col_{j+1}")
-            for j,x in enumerate(raw.iloc[header_row,:].tolist())]
-    df = raw.iloc[header_row+1:].reset_index(drop=True)
+            header_row = i
+            break
+    if header_row is None:
+        header_row = 4  # fallback típico
+
+    # Re-etiqueta columnas
+    cols = [
+        (str(x).strip().lower() if str(x).strip() else f"col_{j+1}")
+        for j, x in enumerate(raw.iloc[header_row, :].tolist())
+    ]
+    df = raw.iloc[header_row + 1 :].reset_index(drop=True)
     df.columns = cols
     df = _lower_cols(df)
+    # Asegura que TODOS los nombres sean str
+    df.columns = [str(c) for c in df.columns]
+
+    # Localiza SVC
     svc_col = None
     for c in df.columns:
-        if c in ("svc","svcs"): svc_col = c; break
+        if c in ("svc", "svcs") or ("svc" in c):
+            svc_col = c
+            break
+
     if not svc_col:
-        cand = [c for c in df.columns if "svc" in c]
-        svc_col = cand[0] if cand else None
-    if not svc_col:
-        raise ValueError("SRM: no se encontró columna SVC.")
-    sdd_cols = [c for c in df.columns if ("total" in c and "sdd" in c)]
-    spot_cols = [c for c in df.columns if ("total" in c and "spot" in c)]
-    if not sdd_cols or not spot_cols:
-        raise ValueError("SRM: no se hallaron columnas con 'sdd' o 'spot'.")
-    for c in sdd_cols+spot_cols:
-        df[c] = _to_num(df[c]).fillna(0.0)
-    out = (df.assign(svc=_upper_series(df[svc_col]))
-             .groupby("svc", as_index=False)[sdd_cols+spot_cols].sum())
-    out["sdd_routes_max"]  = out[sdd_cols].sum(axis=1)
-    out["spot_routes_max"] = out[spot_cols].sum(axis=1)
-    return out[["svc","sdd_routes_max","spot_routes_max"]]
+        # Último fallback: 0s por SVC deducido
+        svc_ser = _upper_series(df.iloc[:, 0].astype(str))
+        return (
+            pd.DataFrame({"svc": svc_ser})
+            .dropna()
+            .drop_duplicates()
+            .assign(sdd_routes_max=0.0, spot_routes_max=0.0)
+        )
+
+    # Heurística para detectar columnas SDD / SPOT con múltiples variantes
+    def pick_cols(all_cols, *keys):
+        keys = [k.lower() for k in keys]
+        out = [c for c in all_cols if all(k in c for k in keys)]
+        # de-dup
+        out = list(dict.fromkeys(out))
+        return out
+
+    all_cols = list(df.columns)
+
+    # 1) Preferimos columnas que contengan 'sdd' / 'spot'
+    sdd_cols = pick_cols(all_cols, "sdd")
+    spot_cols = pick_cols(all_cols, "spot")
+
+    # 2) Alternativas con 'total sdd' / 'total spot'
+    if not sdd_cols:
+        sdd_cols = pick_cols(all_cols, "total", "sdd") or pick_cols(all_cols, "sdd", "total")
+    if not spot_cols:
+        spot_cols = pick_cols(all_cols, "total", "spot") or pick_cols(all_cols, "spot", "total")
+
+    # 3) Filtra sólo existentes (por si algo raro entra)
+    sdd_cols = [c for c in sdd_cols if c in df.columns]
+    spot_cols = [c for c in spot_cols if c in df.columns]
+
+    # Si aun así no encontramos nada, no truena: devuelve 0s
+    if not sdd_cols and not spot_cols:
+        svc_ser = _upper_series(df[svc_col])
+        return (
+            pd.DataFrame({"svc": svc_ser})
+            .dropna()
+            .drop_duplicates()
+            .assign(sdd_routes_max=0.0, spot_routes_max=0.0)
+        )
+
+    # Convierte a numérico, columna por columna (si alguna falla, la llenamos con 0)
+    for c in sdd_cols + spot_cols:
+        try:
+            def _to_num(s) -> pd.Series:
+    """
+    Convierte a numérico tolerando Series/array/list/escalares.
+    Si recibe DataFrame por accidente, intenta usar su primera columna.
+    """
+    if isinstance(s, pd.DataFrame):
+        # usa la primera columna de ese DF
+        if s.shape[1] == 0:
+            return pd.Series(dtype=float)
+        s = s.iloc[:, 0]
+
+    s = _ensure_series(s).astype(str)
+    s = (
+        s.str.replace(",", "", regex=False)
+         .str.replace("%", "", regex=False)
+         .str.strip()
+    )
+    return pd.to_numeric(s, errors="coerce")
+
+        except Exception:
+            df[c] = 0.0
+
+    # Agrega por SVC
+    g = df.assign(svc=_upper_series(df[svc_col]))
+    agg_cols = sdd_cols + spot_cols
+    out = g.groupby("svc", as_index=False)[agg_cols].sum()
+
+    out["sdd_routes_max"] = out[sdd_cols].sum(axis=1) if sdd_cols else 0.0
+    out["spot_routes_max"] = out[spot_cols].sum(axis=1) if spot_cols else 0.0
+    return out[["svc", "sdd_routes_max", "spot_routes_max"]]
+
 
 def load_crowd_caps() -> pd.DataFrame:
     raw = read_ws(SHEET_ID, "Crowd")
