@@ -38,6 +38,37 @@ CFG = load_cfg()
 PROJECT = list(CFG["projects"].keys())[0]
 SHEET_ID = CFG["projects"][PROJECT]["sheet_id"]
 
+
+import unicodedata
+
+def _canon_name(s: str) -> str:
+    """Normaliza nombres de columna: sin acentos, minúsculas, sin espacios/_/-/./'/'."""
+    if s is None: 
+        return ""
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
+    for ch in [" ", "_", "-", ".", "/"]:
+        s = s.replace(ch, "")
+    return s.lower()
+
+def find_and_rename(df, candidates, new_name, required=True, source_label=""):
+    """
+    Busca en df.columns cualquiera de los 'candidates' (acepta variantes como SVC/SVCs, svcs, etc.)
+    y renombra la primera que encuentre a `new_name`.
+    """
+    canon_map = {_canon_name(c): c for c in df.columns}
+    for cand in candidates:
+        cn = _canon_name(cand)
+        if cn in canon_map:
+            real = canon_map[cn]
+            if real != new_name:
+                df.rename(columns={real: new_name}, inplace=True)
+            return new_name
+    if required:
+        msg = f"{source_label}: falta columna '{'/'.join(candidates)}'."
+        raise ValueError(msg)
+    return None
+
+
 # ---------------------------------------------------------------------
 # 3) Utils robustas
 # ---------------------------------------------------------------------
