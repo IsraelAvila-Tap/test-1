@@ -1,59 +1,71 @@
 # app.py
 # =============================================================================
 # Mel-IA — Plan táctico (diario por SVC)
-# FCST − DC − SP → rutas (SPR) → Rentals → Crowd base → MLP SDD/Spot → Crowd E1
+# Pipeline: FCST − DC − SP → SPR → Rentals → Crowd base (% plan) → MLP SDD/Spot → Crowd E1
+# Blindado con:
+# - Normalización de columnas (SVC, fechas, modelos, etc.)
+# - Evita caídas: valida, completa faltantes, avisa y sigue
+# - Cache de lectura (Streamlit 1.49+)
+# - Parametrización por Secrets/ENV
 # =============================================================================
-import os, json, yaml
+import os, json, io, textwrap, unicodedata, traceback
+from datetime import datetime, date
+from typing import Optional, List, Dict
+
 import numpy as np
 import pandas as pd
-from datetime import timedelta, date
-from typing import List, Optional
 import streamlit as st
 
-# ---------------------------------------------------------------------
-# 0) Credenciales desde Secrets
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 0) Credenciales GCP desde Secrets o ENV (ambos soportados)
+# -----------------------------------------------------------------------------
 if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
     os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
 elif "gcp_service_account" in st.secrets:
     os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = json.dumps(dict(st.secrets["gcp_service_account"]))
-if "PROJECT_KEY" in st.secrets:
-    os.environ["PROJECT_KEY"] = st.secrets["PROJECT_KEY"]
 
-# ---------------------------------------------------------------------
-# 1) Imports locales
-# ---------------------------------------------------------------------
-from utils_gsheets import read_ws, _client, get_service_account_email
+# Sheet ID (obligatorio)
+SHEET_ID = (
+    st.secrets.get("SHEET_ID")
+    or os.environ.get("SHEET_ID")
+    or os.environ.get("PROJECT_SHEET_ID")
+    or st.secrets.get("PROJECT_SHEET_ID")
+)
 
-# ---------------------------------------------------------------------
-# 2) Config Streamlit
-# ---------------------------------------------------------------------
-st.set_page_config(page_title="Mel-IA — Plan táctico", layout="wide")
+# Nombre de worksheet por dataset (personalízalo si tus tabs tienen otros nombres)
+SHEET_TABS = {
+    "fcst": st.secrets.get("TAB_FCST", "FCST"),
+    "dc": st.secrets.get("TAB_DC", "DC"),
+    "sp": st.secrets.get("TAB_SP", "SP"),
+    "spr": st.secrets.get("TAB_SPR", "SPR"),
+    "rentals": st.secrets.get("TAB_RENTALS", "Rentals"),
+    "crowd": st.secrets.get("TAB_CROWD", "Crowd"),
+    "mlp_sdd": st.secrets.get("TAB_MLP_SDD", "MLP_SDD"),
+    "crowd_e1": st.secrets.get("TAB_CROWD_E1", "Crowd_E1"),
+}
 
-@st.cache_resource
-def load_cfg():
-    with open("config.yaml", "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-CFG = load_cfg()
-PROJECT = list(CFG["projects"].keys())[0]
-SHEET_ID = CFG["projects"][PROJECT]["sheet_id"]
-
-
-import unicodedata
-
+# -----------------------------------------------------------------------------
+# 1) Utilidades de normalización y renombres tolerantes
+# -----------------------------------------------------------------------------
 def _canon_name(s: str) -> str:
-    """Normaliza nombres de columna: sin acentos, minúsculas, sin espacios/_/-/./'/'."""
-    if s is None: 
+    """Normaliza nombres: sin acentos, minúsculas, sin espacios/_/-/./'/'."""
+    if s is None:
         return ""
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
     for ch in [" ", "_", "-", ".", "/"]:
         s = s.replace(ch, "")
     return s.lower()
 
-def find_and_rename(df, candidates, new_name, required=True, source_label=""):
+def find_and_rename(df: pd.DataFrame,
+                    candidates: List[str],
+                    new_name: str,
+                    required: bool = True,
+                    source_label: str = "") -> Optional[str]:
     """
     Busca en df.columns cualquiera de los 'candidates' (acepta variantes como SVC/SVCs, svcs, etc.)
-    y renombra la primera que encuentre a `new_name`.
+    y renombra la primera que encuentre a `new_name`. Si no encuentra:
+      - required=True: levanta ValueError (con etiqueta de fuente)
+      - required=False: no hace nada (devuelve None)
     """
     canon_map = {_canon_name(c): c for c in df.columns}
     for cand in candidates:
@@ -64,501 +76,359 @@ def find_and_rename(df, candidates, new_name, required=True, source_label=""):
                 df.rename(columns={real: new_name}, inplace=True)
             return new_name
     if required:
-        msg = f"{source_label}: falta columna '{'/'.join(candidates)}'."
+        msg = f"{source_label}: falta columna equivalente a '{'/'.join(candidates)}'. Columnas disponibles: {list(df.columns)}"
         raise ValueError(msg)
     return None
 
-
-# ---------------------------------------------------------------------
-# 3) Utils robustas
-# ---------------------------------------------------------------------
-def _ensure_series(x) -> pd.Series:
-    if isinstance(x, pd.Series): return x
-    if isinstance(x, pd.DataFrame):
-        if x.shape[1] == 0: return pd.Series(dtype=float)
-        return _ensure_series(x.iloc[:, 0])
-    if isinstance(x, (list, tuple, np.ndarray)): return pd.Series(x)
-    return pd.Series([x])
-
-def _to_num(s) -> pd.Series:
-    s = _ensure_series(s).astype(str)
-    s = s.str.replace(",", "", regex=False).str.replace("%", "", regex=False).str.strip()
-    return pd.to_numeric(s, errors="coerce")
-
-def _safe_to_numeric_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """Convierte a numérico solo las columnas presentes (sin variables fuera de scope)."""
-    for col in cols:
-        if col in df.columns:
-            df[col] = _to_num(df[col]).fillna(0.0)
+def ensure_columns(df: pd.DataFrame, cols: Dict[str, float | int | str]) -> pd.DataFrame:
+    """
+    Crea columnas que falten con un valor por defecto.
+    cols = {"RUTAS_PLAN": 0, "SPR_OBJ": np.nan, ...}
+    """
+    for c, v in cols.items():
+        if c not in df.columns:
+            df[c] = v
     return df
 
-def _lower_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    new, seen = [], {}
-    for col in df.columns:
-        base = str(col).strip().lower()
-        cnt = seen.get(base, 0); seen[base] = cnt + 1
-        new.append(base if cnt == 0 else f"{base}_{cnt}")
-    df.columns = new
-    return df
+def coerce_date_column(df: pd.DataFrame, candidates: List[str], new_name: str, source_label: str,
+                       required: bool = False) -> Optional[str]:
+    """
+    Renombra columna de fecha y la parsea a date. Admite varios nombres.
+    """
+    col = find_and_rename(df, candidates, new_name, required=required, source_label=source_label)
+    if col:
+        df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+    return col
 
-def _norm_date_col(df: pd.DataFrame, col: str = "fecha") -> pd.DataFrame:
-    if col in df.columns:
-        df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True).dt.date
-    return df
+def safe_merge(left: pd.DataFrame, right: pd.DataFrame, on: List[str], how: str = "left", suffixes=("_x", "_y")):
+    """Merge tolerante: si right está vacío, devuelve left intacto."""
+    if right is None or right.empty:
+        return left.copy()
+    return left.merge(right, how=how, on=on, suffixes=suffixes)
 
-def _weekday(d: date) -> int:
-    return pd.Timestamp(d).weekday()
+def show_exception(e: Exception, title: str = "Error"):
+    with st.expander(f"⚠️ {title}", expanded=False):
+        st.code("".join(traceback.format_exception(None, e, e.__traceback__)))
 
-def _iso_yw(d: date):
-    iso = pd.Timestamp(d).isocalendar()
-    return int(iso.year), int(iso.week)
+# -----------------------------------------------------------------------------
+# 2) Lectura Google Sheets (gspread + pandas)
+# -----------------------------------------------------------------------------
+def _get_gspread_client():
+    import gspread
+    from google.oauth2.service_account import Credentials
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        raise RuntimeError("No hay credenciales en GOOGLE_SERVICE_ACCOUNT_JSON.")
+    info = json.loads(raw)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
 
-def _safe_mean(vals):
-    x = [float(v) for v in vals if pd.notna(v)]
-    return float(np.mean(x)) if x else np.nan
-
-# ---------------------------------------------------------------------
-# 4) Lectura de pestañas
-# ---------------------------------------------------------------------
-def _read(tab: str) -> pd.DataFrame:
-    return _lower_cols(read_ws(SHEET_ID, tab))
-
-def load_fcst() -> pd.DataFrame:
-    raw = _read("FCST")
-
-    # 1) Detectar fila de encabezado en las primeras 10 filas
-    header_row = None
-    ship_tokens = {"shipments","shipment","fcst","forecast","envios","envíos","q","qty","cantidad","volume","volumen","ship","demand"}
-    date_tokens = {"fecha","date","día","dia","day"}
-
-    for i in range(min(10, len(raw))):
-        row = [str(x).strip().lower() for x in raw.iloc[i].tolist()]
-        has_svc  = any("svc" in cell for cell in row)
-        has_ship = any(any(tok in cell for tok in ship_tokens) for cell in row)
-        has_date = any(any(tok in cell for tok in date_tokens) for cell in row)
-        if has_svc and has_ship and has_date:
-            header_row = i
-            break
-
-    # 2) Fijar encabezados correctamente (SIN enumerate)
-    if header_row is not None:
-        df = raw.copy()
-        df.columns = [str(x).strip().lower() for x in raw.iloc[header_row].tolist()]
-        df = df.iloc[header_row+1:].reset_index(drop=True)
-        df = _lower_cols(df)
-    else:
-        df = _lower_cols(raw)
-
-    # 3) Detectar columnas por sinónimos
-    svc_col = next((c for c in df.columns if "svc" in c), None)
-    date_col = next((c for c in df.columns if any(tok in c for tok in ("fecha","date","día","dia","day"))), None)
-    ship_col = next((c for c in df.columns if any(tok in c for tok in ship_tokens)), None)
-
-    if not (svc_col and date_col and ship_col):
-        cols = list(df.columns)[:30]
-        raise ValueError(f"FCST: faltan columnas ['svc','fecha','shipments']. Detectadas: {cols}")
-
-    # 4) Normalizar nombres y tipos
-    df = df.rename(columns={svc_col:"svc", date_col:"fecha", ship_col:"shipments"})
-    df = _norm_date_col(df, "fecha")
-    df["svc"] = _ensure_series(df["svc"]).astype(str).str.upper().str.strip()
-    df["shipments"] = _to_num(df["shipments"]).fillna(0.0)
-
-    return df[["fecha","svc","shipments"]].dropna(subset=["fecha","svc"])
-
-
-def load_spr_real() -> pd.DataFrame:
-    df = _read("SPR")
-    svc_col = "svc" if "svc" in df.columns else ("svcs" if "svcs" in df.columns else None)
-    if not svc_col: raise ValueError("SPR: falta columna 'svc'.")
-    date_col = "fecha" if "fecha" in df.columns else ("date" if "date" in df.columns else None)
-    if not date_col:
-        date_col = next((c for c in df.columns if any(t in c for t in ["fecha","date","día","dia","day"])), None)
-    if not date_col: raise ValueError("SPR: falta columna de fecha.")
-    spr_col = next((c for c in df.columns if "spr" in c.lower()), None)
-    if not spr_col: raise ValueError("SPR: no se encontró columna con 'spr'.")
-    df = df.rename(columns={svc_col:"svc", date_col:"fecha", spr_col:"spr"})
-    df = _norm_date_col(df, "fecha")
-    df["spr"] = _to_num(df["spr"])
-    df = df.dropna(subset=["fecha","svc","spr"])
-    df["svc"] = _ensure_series(df["svc"]).astype(str).str.upper().str.strip()
-    df["dow"] = df["fecha"].apply(_weekday)
-    iso = df["fecha"].apply(lambda d: pd.Timestamp(d).isocalendar())
-    df["iso_year"] = [int(x.year) for x in iso]
-    df["iso_week"] = [int(x.week) for x in iso]
-    return df[["fecha","svc","spr","dow","iso_year","iso_week"]]
-
-def load_capacity() -> pd.DataFrame:
-    raw = _read("Capacity")
-
-    # 1) Detectar posible fila de encabezado
-    header_row = None
-    for i in range(min(10, len(raw))):
-        row = [str(x).strip().lower() for x in raw.iloc[i].tolist()]
-        has_dm    = any(("delivery" in c) or ("modelo" in c) or ("tipo dm" in c) or (c.strip()=="dm") for c in row)
-        has_tipo  = any(("tipo" in c) or ("type" in c) for c in row)
-        has_svc   = any("svc" in c for c in row)
-        has_fecha = any(any(t in c for t in ("fecha","date","día","dia","day")) for c in row)
-        has_qty   = any(any(t in c for t in ("cantidad","qty","quantity","capacidad","units","count","routes","rutas","volume","volumen")) for c in row)
-        if sum([has_dm,has_tipo,has_svc,has_fecha,has_qty]) >= 3:
-            header_row = i
-            break
-
-    # 2) Asignar encabezados correctamente (SIN enumerate)
-    if header_row is not None:
-        df = raw.copy()
-        df.columns = [str(x).strip().lower() for x in raw.iloc[header_row].tolist()]
-        df = df.iloc[header_row+1:].reset_index(drop=True)
-        df = _lower_cols(df)
-    else:
-        df = _lower_cols(raw)
-
-    # 3) Resolver nombres por sinónimos
-    def find_col(tokens: List[str]) -> Optional[str]:
+@st.cache_data(show_spinner=False, ttl=300)
+def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
+    """Lee una pestaña de Google Sheets a DataFrame."""
+    try:
+        gc = _get_gspread_client()
+        sh = gc.open_by_key(sheet_id)
+        ws = sh.worksheet(tab_name)
+        values = ws.get_all_values()
+        if not values:
+            return pd.DataFrame()
+        header, rows = values[0], values[1:]
+        df = pd.DataFrame(rows, columns=header)
+        # Try to infer numeric cols
         for c in df.columns:
-            cc = str(c).strip().lower()
-            if any(tok in cc for tok in tokens):
-                return c
-        return None
+            # Si toda la col es numérica o vacía, conviértela
+            if df[c].str.match(r"^-?\d+(\.\d+)?$").fillna(False).all():
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df
+    except Exception as e:
+        raise RuntimeError(f"Fallo al leer '{tab_name}': {e}")
 
-    dm_col    = find_col(["delivery model","delivery","modelo","modelo de entrega","tipo dm"," dm "])
-    tipo_col  = find_col(["tipo","type","categoria","category"])
-    svc_col   = find_col(["svc","svcs","svc "])
-    fecha_col = find_col(["fecha","date","día","dia","day"])
-    qty_col   = find_col(["cantidad","qty","quantity","capacidad","units","count","rutas","routes","volume","volumen"])
+# -----------------------------------------------------------------------------
+# 3) Loaders por dataset con normalización de columnas
+#    Todos devuelven al menos: ['FECHA','SVC', ...] cuando aplica
+# -----------------------------------------------------------------------------
+def load_fcst() -> pd.DataFrame:
+    df = read_sheet(SHEET_ID, SHEET_TABS["fcst"])
+    if df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","FCST"])
+    coerce_date_column(df, ["FECHA","DATE","OP_DT","SHP_DATE_DISPATCHED_ID"], "FECHA", "FCST", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", source_label="FCST")
+    # Pronóstico esperado en col FCST (o similar)
+    find_and_rename(df, ["FCST","FORECAST","PRONOSTICO","VOLUMEN_PLAN"], "FCST", required=False, source_label="FCST")
+    df = ensure_columns(df, {"FCST": 0})
+    return df[["FECHA","SVC","FCST"]].copy()
 
-    faltan = []
-    if not dm_col:    faltan.append("delivery model")
-    if not tipo_col:  faltan.append("tipo")
-    if not svc_col:   faltan.append("svc")
-    if not fecha_col: faltan.append("fecha")
-    if not qty_col:   faltan.append("cantidad")
-    if faltan:
-        raise ValueError(f"Capacity: faltan columnas {faltan}. Encabezados vistos: {list(df.columns)[:30]}")
+def load_dc() -> pd.DataFrame:
+    df = read_sheet(SHEET_ID, SHEET_TABS["dc"])
+    if df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","DC"])
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "DC", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", source_label="DC")
+    find_and_rename(df, ["DC","DESCARGA","DEMAND_CORRECTION","AJUSTE"], "DC", required=False, source_label="DC")
+    df = ensure_columns(df, {"DC": 0})
+    return df[["FECHA","SVC","DC"]].copy()
 
-    # 4) Normalizar y tipar
-    df = df.rename(columns={
-        dm_col: "delivery model",
-        tipo_col: "tipo",
-        svc_col: "svc",
-        fecha_col: "fecha",
-        qty_col: "cantidad",
-    })
-    df = _norm_date_col(df, "fecha")
-    df["svc"] = _ensure_series(df["svc"]).astype(str).str.upper().str.strip()
-    df["tipo"] = _ensure_series(df["tipo"]).astype(str).str.strip().str.lower()
-    df["delivery model"] = _ensure_series(df["delivery model"]).astype(str).str.strip().str.lower()
-    df["cantidad"] = _to_num(df["cantidad"]).fillna(0.0)
+def load_sp() -> pd.DataFrame:
+    df = read_sheet(SHEET_ID, SHEET_TABS["sp"])
+    if df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","SP"])
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "SP", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", source_label="SP")
+    find_and_rename(df, ["SP","SERVICE_PARTNER","CAP_SP","CAPACIDAD_SP"], "SP", required=False, source_label="SP")
+    df = ensure_columns(df, {"SP": 0})
+    return df[["FECHA","SVC","SP"]].copy()
 
-    return df[["fecha","svc","delivery model","tipo","cantidad"]].dropna(subset=["fecha","svc"])
-
-
-def load_srm() -> pd.DataFrame:
-    raw = _read("SRM")
-    header_row = None
-    for i in range(min(10, len(raw))):
-        row = [str(x).strip().lower() for x in raw.iloc[i].tolist()]
-        if any(x in ("svc","svcs") for x in row):
-            header_row = i; break
-    if header_row is None: header_row = 4
-    cols = [str(x).strip().lower() for x in raw.iloc[header_row].tolist()]
-    df = raw.iloc[header_row+1:].copy(); df.columns = cols
-    svc_col = "svc" if "svc" in df.columns else ("svcs" if "svcs" in df.columns else None)
-    if not svc_col: raise ValueError("SRM: no se encontró columna 'SVC/SVCs'.")
-    sdd_cols  = [col for col in df.columns if "sdd"  in col]
-    spot_cols = [col for col in df.columns if "spot" in col]
-    if not sdd_cols and not spot_cols:
-        raise ValueError(f"SRM: no hay columnas con 'sdd' o 'spot'. Vistos: {list(df.columns)[:30]}")
-    num_cols = list(set(sdd_cols + spot_cols))
-    df = _safe_to_numeric_cols(df, num_cols)
-    g = df.copy()
-    g["svc"] = _ensure_series(g[svc_col]).astype(str).str.upper().str.strip()
-    agg = g.groupby("svc", as_index=False)[num_cols].sum()
-    agg["sdd_routes_max"]  = agg[sdd_cols].sum(axis=1)  if sdd_cols  else 0.0
-    agg["spot_routes_max"] = agg[spot_cols].sum(axis=1) if spot_cols else 0.0
-    return agg[["svc","sdd_routes_max","spot_routes_max"]]
+def load_spr() -> pd.DataFrame:
+    df = read_sheet(SHEET_ID, SHEET_TABS["spr"])
+    if df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","SPR_OBJ"])
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "SPR", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", source_label="SPR")
+    find_and_rename(df, ["SPR","SPR_OBJ","SPR objetivo","SPR objetivo (plan)"], "SPR_OBJ", required=False, source_label="SPR")
+    df = ensure_columns(df, {"SPR_OBJ": np.nan})
+    return df[["FECHA","SVC","SPR_OBJ"]].copy()
 
 def load_rentals() -> pd.DataFrame:
-    df = _read("Rentals")
-    svc_col = "svc" if "svc" in df.columns else ("svcs" if "svcs" in df.columns else None)
-    if not svc_col: raise ValueError("Rentals: falta columna 'SVC/SVCs'.")
-    qty_col = next((col for col in df.columns if str(col).lower().startswith("unidades")), None)
-    if not qty_col: raise ValueError("Rentals: falta columna de unidades (prefijo 'unidades').")
-    df["rentals_routes_max"] = _to_num(df[qty_col]).fillna(0.0).astype(float)
-    out = (df.groupby(svc_col, as_index=False)["rentals_routes_max"].sum().rename(columns={svc_col:"svc"}))
-    out["svc"] = _ensure_series(out["svc"]).astype(str).str.upper().str.strip()
-    return out
+    df = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
+    if df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","RUTAS_RENTALS"])
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "Rentals", required=False)
+    find_and_rename(
+        df,
+        ["SVC","SVCs","SVC/SVCs","SVC SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID","FACILITY","LC","CENTRO_LOGISTICO"],
+        "SVC",
+        source_label="Rentals"
+    )
+    find_and_rename(df, ["RUTAS","RUTAS_PLAN","ROUTES_PLAN","CAP_RUTAS","RENTALS_ROUTES"], "RUTAS_RENTALS",
+                    required=False, source_label="Rentals")
+    df = ensure_columns(df, {"RUTAS_RENTALS": 0})
+    return df[["FECHA","SVC","RUTAS_RENTALS"]].copy()
 
-def load_crowd_caps() -> pd.DataFrame:
-    df = _read("Crowd")
-    svc_col = "svc" if "svc" in df.columns else ("svcs" if "svcs" in df.columns else None)
-    if not svc_col: raise ValueError("Crowd: falta columna 'svc'.")
-    def _pick(patterns: List[str]) -> Optional[str]:
-        for col in df.columns:
-            if any(p in str(col).lower() for p in patterns): return col
-        return None
-    c_base_wd = _pick(["base entre"])
-    c_base_sa = _pick(["base sab"])
-    c_base_su = _pick(["base dom"])
-    c_e1_wd   = _pick(["holgura entre","e1 entre"])
-    c_e1_sa   = _pick(["holgura sab","e1 sab"])
-    c_e1_su   = _pick(["holgura dom","e1 dom"])
-    if all(x is not None for x in [c_base_wd,c_base_sa,c_base_su,c_e1_wd,c_e1_sa,c_e1_su]):
-        out = df[[svc_col,c_base_wd,c_base_sa,c_base_su,c_e1_wd,c_e1_sa,c_e1_su]].copy()
-        out = out.rename(columns={svc_col:"svc", c_base_wd:"base_wd", c_base_sa:"base_sa", c_base_su:"base_su",
-                                  c_e1_wd:"e1_wd", c_e1_sa:"e1_sa", c_e1_su:"e1_su"})
-        for col in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
-            out[col] = _to_num(out[col]).fillna(0.0).astype(float)
-        out["svc"] = _ensure_series(out["svc"]).astype(str).str.upper().str.strip()
-        return out
-    base_cols = [col for col in df.columns if str(col).lower().startswith("base")]
-    e1_cols   = [col for col in df.columns if str(col).lower().startswith("e1") or "holgura" in str(col).lower()]
-    if len(base_cols)==3 and len(e1_cols)==3:
-        b1,b2,b3 = base_cols; e1a,e2,e3 = e1_cols
-        out = df[[svc_col,b1,b2,b3,e1a,e2,e3]].copy()
-        out.columns = ["svc","base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]
-        for col in ["base_wd","base_sa","base_su","e1_wd","e1_sa","e1_su"]:
-            out[col] = _to_num(out[col]).fillna(0.0).astype(float)
-        out["svc"] = _ensure_series(out["svc"]).astype(str).str.upper().str.strip()
-        return out
-    if ("base" in df.columns) and ("e1" in df.columns):
-        out = df[[svc_col,"base","e1"]].copy()
-        out["base"] = _to_num(out["base"]).fillna(0.0).astype(float)
-        out["e1"]   = _to_num(out["e1"]).fillna(0.0).astype(float)
-        out = out.rename(columns={"base":"base_wd","e1":"e1_wd"})
-        out["base_sa"] = out["base_wd"]; out["base_su"] = out["base_wd"]
-        out["e1_sa"] = out["e1_wd"];     out["e1_su"] = out["e1_wd"]
-        out["svc"] = _ensure_series(out["svc"]).astype(str).str.upper().str.strip()
-        return out
-    raise ValueError(f"Crowd: layout no reconocido. Encabezados: {list(df.columns)}")
+def load_crowd() -> pd.DataFrame:
+    df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
+    if df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","CROWD_BASE_PCT"])
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "Crowd", required=False)
+    find_and_rename(df, ["SVC","svc","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", source_label="Crowd")
+    find_and_rename(df, ["CROWD_BASE","CROWD_BASE_%","%CROWD","CROWD_PCT_PLAN"], "CROWD_BASE_PCT",
+                    required=False, source_label="Crowd")
+    df["CROWD_BASE_PCT"] = pd.to_numeric(df.get("CROWD_BASE_PCT", 0), errors="coerce").fillna(0).clip(0, 1)
+    return df[["FECHA","SVC","CROWD_BASE_PCT"]].copy()
 
-# ---------------------------------------------------------------------
-# 5) Cálculo de SPR objetivo
-# ---------------------------------------------------------------------
-def compute_spr_targets(fcst: pd.DataFrame, spr_real: pd.DataFrame, capacity: pd.DataFrame, mode: str) -> pd.DataFrame:
-    target = fcst[["fecha","svc"]].drop_duplicates().copy()
-    target["dow"] = target["fecha"].apply(_weekday)
-    target["iso_year"] = target["fecha"].apply(lambda d: int(pd.Timestamp(d).isocalendar().year))
-    spr_exec_map = spr_real.set_index(["fecha","svc"])["spr"]
+def load_mlp_sdd() -> pd.DataFrame:
+    df = read_sheet(SHEET_ID, SHEET_TABS["mlp_sdd"])
+    if df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT"])
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "MLP_SDD", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", source_label="MLP_SDD")
+    find_and_rename(df, ["SDD","RUTAS_SDD","MLP_SDD","RUTAS_MLP_SDD"], "RUTAS_MLP_SDD", required=False, source_label="MLP_SDD")
+    find_and_rename(df, ["SPOT","RUTAS_SPOT","MLP_SPOT","RUTAS_MLP_SPOT"], "RUTAS_MLP_SPOT", required=False, source_label="MLP_SDD")
+    df = ensure_columns(df, {"RUTAS_MLP_SDD": 0, "RUTAS_MLP_SPOT": 0})
+    return df[["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT"]].copy()
 
-    def avg_last4(row):
-        d, s = row["fecha"], row["svc"]
-        vals = []
-        for k in (7,14,21,28):
-            v = spr_exec_map.get((d - timedelta(days=k), s), np.nan)
-            if pd.notna(v): vals.append(float(v))
-        if not vals:
-            m = (spr_real["svc"].eq(s) & spr_real["fecha"].between(d - timedelta(days=28), d - timedelta(days=1)))
-            vals = list(spr_real.loc[m,"spr"])
-        return _safe_mean(vals)
+def load_crowd_e1() -> pd.DataFrame:
+    df = read_sheet(SHEET_ID, SHEET_TABS["crowd_e1"])
+    if df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1"])
+    coerce_date_column(df, ["FECHA","DATE","OP_DT"], "FECHA", "Crowd_E1", required=False)
+    find_and_rename(df, ["SVC","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", source_label="Crowd_E1")
+    find_and_rename(df, ["E1","CROWD_E1","CROWD_SUPLEMENTO","CROWD_EXTRA"], "CROWD_E1", required=False, source_label="Crowd_E1")
+    df = ensure_columns(df, {"CROWD_E1": 0})
+    return df[["FECHA","SVC","CROWD_E1"]].copy()
 
-    def avg_peak(row):
-        d, s, yr, dow = row["fecha"], row["svc"], row["iso_year"], row["dow"]
-        m = (spr_real["svc"].eq(s) & spr_real["iso_year"].eq(yr) &
-             spr_real["iso_week"].isin([20,21,22]) & spr_real["dow"].eq(dow))
-        vals = list(spr_real.loc[m,"spr"])
-        if not vals:
-            m = (spr_real["svc"].eq(s) & spr_real["iso_year"].eq(yr) &
-                 spr_real["iso_week"].between(19,23) & spr_real["dow"].eq(dow))
-            vals = list(spr_real.loc[m,"spr"])
-        return _safe_mean(vals)
-
-    if mode == "promedio":
-        target["spr_objetivo"] = target.apply(avg_last4, axis=1)
-    elif mode == "peak":
-        target["spr_objetivo"] = target.apply(avg_peak, axis=1)
-    else:
-        cap = capacity.copy()
-        m = _ensure_series(cap["tipo"]).astype(str).str.lower().str.strip().eq("spr")
-        plan = cap.loc[m, ["svc","fecha","cantidad"]].rename(columns={"cantidad":"spr_plan"})
-        if plan.empty:
-            by_svc = cap.loc[m].groupby("svc", as_index=False)["cantidad"].mean().rename(columns={"cantidad":"spr_plan"})
-            target = target.merge(by_svc, on="svc", how="left")
-        else:
-            target = target.merge(plan, on=["fecha","svc"], how="left")
-        target = target.rename(columns={"spr_plan":"spr_objetivo"})
-    return target[["fecha","svc","spr_objetivo"]]
-
-# ---------------------------------------------------------------------
-# 6) Share crowd objetivo
-# ---------------------------------------------------------------------
-def compute_crowd_share(capacity: pd.DataFrame) -> pd.DataFrame:
-    cap = capacity.copy()
-    cap["tipo"] = _ensure_series(cap["tipo"]).astype(str).str.lower().str.strip()
-    cap["delivery model"] = _ensure_series(cap["delivery model"]).astype(str).str.lower().str.strip()
-    cap["tipo dm"] = _ensure_series(cap["tipo dm"] if "tipo dm" in cap.columns else "").astype(str).str.lower().str.strip()
-
-    ship = cap.loc[cap["tipo"].eq("shipments"), ["fecha","svc","delivery model","tipo dm","cantidad"]].copy()
-    tot = ship.groupby(["fecha","svc"], as_index=False)["cantidad"].sum().rename(columns={"cantidad":"ship_total"})
-    is_crowd = ship["delivery model"].str.contains("crowd", case=False) | ship["tipo dm"].str.contains("crowd", case=False)
-    crw = ship.loc[is_crowd].groupby(["fecha","svc"], as_index=False)["cantidad"].sum().rename(columns={"cantidad":"ship_crowd"})
-    out = tot.merge(crw, on=["fecha","svc"], how="left").fillna({"ship_crowd":0.0})
-    out["share_crowd_obj"] = np.where(out["ship_total"]>0, (out["ship_crowd"]/out["ship_total"]).clip(0,1), 0.0)
-
-    is_dc = ship["tipo dm"].str.contains("dc", case=False) | ship["delivery model"].str_contains("dc", case=False)
-    # str_contains no existe en pandas; uso correcto:
-    is_dc = ship["tipo dm"].str.contains("dc", case=False) | ship["delivery model"].str.contains("dc", case=False)
-    is_sp = (ship["tipo dm"].str.contains("sp", case=False) |
-             ship["delivery model"].str.contains("service partner", case=False) |
-             ship["delivery model"].str.contains("sp", case=False))
-    dc = ship.loc[is_dc].groupby(["fecha","svc"], as_index=False)["cantidad"].sum().rename(columns={"cantidad":"ship_dc"})
-    sp = ship.loc[is_sp].groupby(["fecha","svc"], as_index=False)["cantidad"].sum().rename(columns={"cantidad":"ship_sp"})
-    out = out.merge(dc, on=["fecha","svc"], how="left").merge(sp, on=["fecha","svc"], how="left")
-    out[["ship_dc","ship_sp"]] = out[["ship_dc","ship_sp"]].fillna(0.0)
-    return out[["fecha","svc","share_crowd_obj","ship_total","ship_crowd","ship_dc","ship_sp"]]
-
-# ---------------------------------------------------------------------
-# 7) Map Crowd por fecha
-# ---------------------------------------------------------------------
-def map_crowd_by_date(target_days: pd.DataFrame, crowd_caps: pd.DataFrame) -> pd.DataFrame:
-    def f(row):
-        s, d = row["svc"], row["fecha"]
-        dow = _weekday(d)
-        r = crowd_caps.loc[crowd_caps["svc"]==s]
-        if r.empty: return pd.Series({"crowd_base_routes":0.0,"crowd_e1_routes":0.0})
-        r = r.iloc[0]
-        if dow <= 4: base, e1 = r["base_wd"], r["e1_wd"]
-        elif dow == 5: base, e1 = r["base_sa"], r["e1_sa"]
-        else: base, e1 = r["base_su"], r["e1_su"]
-        return pd.Series({"crowd_base_routes":float(base), "crowd_e1_routes":float(e1)})
-    tmp = target_days.apply(f, axis=1)
-    return pd.concat([target_days.reset_index(drop=True), tmp], axis=1)
-
-# ---------------------------------------------------------------------
-# 8) Scheduler MLP descansos
-# ---------------------------------------------------------------------
-def schedule_mlp_rest(df_day: pd.DataFrame) -> pd.DataFrame:
-    out = df_day.copy()
-    out["week_key"] = out["fecha"].apply(lambda d: f"{_iso_yw(d)[0]}-{_iso_yw(d)[1]:02d}")
-    out["sdd_trabaja"]  = 1
-    out["spot_trabaja"] = 1
-    def proc(g):
-        n = len(g)
-        need_days = int((g["routes_mlp_need"]>0).sum())
-        work_sdd = min(6, need_days); rest_sdd = max(n - work_sdd, 0)
-        work_spot = 6 if need_days >= 6 else (need_days if need_days < 5 else 5)
-        rest_spot = max(n - work_spot, 0)
-        g_sorted = g.sort_values(["routes_mlp_need","fecha"], ascending=[True,True])
-        if rest_sdd > 0: g.loc[g_sorted.head(rest_sdd).index, "sdd_trabaja"] = 0
-        g_sorted2 = g.sort_values(["routes_mlp_need","fecha"], ascending=[True,True])
-        if rest_spot > 0: g.loc[g_sorted2.head(rest_spot).index, "spot_trabaja"] = 0
-        return g
-    out = out.groupby(["svc","week_key"], group_keys=False).apply(proc)
-    return out.drop(columns=["week_key"])
-
-# ---------------------------------------------------------------------
-# 9) Motor principal
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 4) Lógica de cálculo de plan
+# -----------------------------------------------------------------------------
 def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
-    fcst       = load_fcst()
-    spr_real   = load_spr_real()
-    capacity   = load_capacity()
-    srm        = load_srm()
-    rentals    = load_rentals()
-    crowd_caps = load_crowd_caps()
+    """
+    spr_mode: 'promedio' | 'peak' | 'plan'
+    Junta datasets y calcula rutas objetivo por SVC.
+    """
+    # Carga datasets
+    fcst = load_fcst()
+    dc = load_dc()
+    sp = load_sp()
+    spr = load_spr()
+    rentals = load_rentals()
+    crowd = load_crowd()
+    mlp_sdd = load_mlp_sdd()
+    crowd_e1 = load_crowd_e1()
 
-    if sel_svcs:
-        fcst = fcst[fcst["svc"].isin(sel_svcs)]
+    # Día objetivo = hoy (ajusta si usas otra fecha en tus tabs)
+    hoy = date.today()
 
-    spr_tbl   = compute_spr_targets(fcst, spr_real, capacity, spr_mode)
-    share_tbl = compute_crowd_share(capacity)
+    # Filtra a hoy si FECHA existe
+    for df in [fcst, dc, sp, spr, rentals, crowd, mlp_sdd, crowd_e1]:
+        if "FECHA" in df.columns and not df.empty:
+            df.dropna(subset=["FECHA"], inplace=True)
+            df = df[df["FECHA"] <= hoy]  # permitir histórico <= hoy
+        # Reasigna al nombre original
+        if df is fcst: fcst = df
+        elif df is dc: dc = df
+        elif df is sp: sp = df
+        elif df is spr: spr = df
+        elif df is rentals: rentals = df
+        elif df is crowd: crowd = df
+        elif df is mlp_sdd: mlp_sdd = df
+        elif df is crowd_e1: crowd_e1 = df
 
-    days = fcst[["fecha","svc"]].drop_duplicates()
-    crowd_daily = map_crowd_by_date(days, crowd_caps)
+    # Base de SVC con FCST (si no hay, usa la union de lo que exista)
+    bases = [d[["SVC"]].drop_duplicates() for d in [fcst, rentals, crowd, mlp_sdd, crowd_e1] if not d.empty]
+    base = pd.concat(bases, axis=0).drop_duplicates() if bases else pd.DataFrame(columns=["SVC"])
 
-    df = (fcst
-          .merge(share_tbl, on=["fecha","svc"], how="left")
-          .merge(crowd_daily, on=["fecha","svc"], how="left")
-          .merge(srm, on="svc", how="left")
-          .merge(rentals, on="svc", how="left")
-          .merge(spr_tbl, on=["fecha","svc"], how="left"))
+    # Merge incremental
+    out = base.copy()
+    out["FECHA"] = hoy
+    out = safe_merge(out, fcst.groupby("SVC", as_index=False)["FCST"].sum(), on=["SVC"])
+    out = safe_merge(out, dc.groupby("SVC", as_index=False)["DC"].sum(), on=["SVC"])
+    out = safe_merge(out, sp.groupby("SVC", as_index=False)["SP"].sum(), on=["SVC"])
+    # SPR objetivo: según modo
+    spr_mode_col = {"promedio": "SPR_PROM", "peak": "SPR_PEAK", "plan": "SPR_OBJ"}[spr_mode]
+    # Si tu hoja solo trae SPR_OBJ, las otras se quedarán NaN y usaremos fallback
+    spr_tmp = spr.copy()
+    find_and_rename(spr_tmp, ["SPR_PEAK","SPR_PICO"], "SPR_PEAK", required=False, source_label="SPR")
+    find_and_rename(spr_tmp, ["SPR_PROM","SPR_AVG","SPR_PROMEDIO"], "SPR_PROM", required=False, source_label="SPR")
+    spr_tmp = spr_tmp.groupby("SVC", as_index=False).agg({"SPR_OBJ":"max","SPR_PEAK":"max","SPR_PROM":"max"})
+    out = safe_merge(out, spr_tmp, on=["SVC"])
 
-    for col in ["share_crowd_obj","crowd_base_routes","crowd_e1_routes","sdd_routes_max","spot_routes_max","rentals_routes_max","ship_dc","ship_sp"]:
-        if col in df.columns: df[col] = _to_num(df[col]).fillna(0.0)
-        else: df[col] = 0.0
-    df["spr_objetivo"] = _to_num(df["spr_objetivo"])
-    df["ship_fcst_neto"] = (df["shipments"] - df["ship_dc"] - df["ship_sp"]).clip(lower=0)
-    df["routes_need_total"] = np.where((df["ship_fcst_neto"]>0) & (df["spr_objetivo"]>0),
-                                       np.ceil(df["ship_fcst_neto"]/df["spr_objetivo"]).astype(int), 0)
-    df["alerta_spr_missing"] = ((df["ship_fcst_neto"]>0) & (df["spr_objetivo"].isna() | (df["spr_objetivo"]<=0)))
-    df["routes_crowd_target"] = np.ceil(df["routes_need_total"] * df["share_crowd_obj"]).astype(int)
-    df["routes_crowd_base"]   = np.minimum(df["routes_crowd_target"], df["crowd_base_routes"]).astype(int)
-    rem1 = (df["routes_need_total"] - df["routes_crowd_base"]).clip(lower=0)
-    df["routes_rentals_alloc"] = np.minimum(rem1, df["rentals_routes_max"]).astype(int)
-    rem2 = (rem1 - df["routes_rentals_alloc"]).clip(lower=0).astype(int)
-    rest_base = pd.DataFrame({
-        "fecha": df["fecha"], "svc": df["svc"], "routes_mlp_need": rem2,
-        "sdd_routes_max": df["sdd_routes_max"], "spot_routes_max": df["spot_routes_max"],
+    # Rentals, Crowd, MLP_SDD, Crowd E1
+    out = safe_merge(out, rentals.groupby("SVC", as_index=False)["RUTAS_RENTALS"].sum(), on=["SVC"])
+    out = safe_merge(out, crowd.groupby("SVC", as_index=False)["CROWD_BASE_PCT"].max(), on=["SVC"])
+    out = safe_merge(out, mlp_sdd.groupby("SVC", as_index=False)[["RUTAS_MLP_SDD","RUTAS_MLP_SPOT"]].sum(), on=["SVC"])
+    out = safe_merge(out, crowd_e1.groupby("SVC", as_index=False)["CROWD_E1"].sum(), on=["SVC"])
+
+    # Defaults
+    out = ensure_columns(out, {
+        "FCST": 0, "DC": 0, "SP": 0,
+        "SPR_OBJ": np.nan, "SPR_PEAK": np.nan, "SPR_PROM": np.nan,
+        "RUTAS_RENTALS": 0, "CROWD_BASE_PCT": 0, "RUTAS_MLP_SDD": 0, "RUTAS_MLP_SPOT": 0, "CROWD_E1": 0
     })
-    rest_sched = schedule_mlp_rest(rest_base)
-    df = df.merge(rest_sched[["fecha","svc","sdd_trabaja","spot_trabaja"]], on=["fecha","svc"], how="left")
-    df["routes_mlp_cap_day"] = (df["sdd_routes_max"]*df["sdd_trabaja"] + df["spot_routes_max"]*df["spot_trabaja"]).fillna(0).astype(int)
-    df["routes_mlp_alloc"]   = np.minimum(rem2, df["routes_mlp_cap_day"]).astype(int)
-    rem_def = (rem2 - df["routes_mlp_alloc"]).clip(lower=0).astype(int)
-    df["routes_crowd_e1"] = np.minimum(rem_def, df["crowd_e1_routes"]).astype(int)
-    df["routes_total_alloc"] = (df["routes_crowd_base"] + df["routes_rentals_alloc"] + df["routes_mlp_alloc"] + df["routes_crowd_e1"]).astype(int)
-    df["routes_deficit"]     = (df["routes_need_total"] - df["routes_total_alloc"]).clip(lower=0).astype(int)
-    df["shipments_plan"]     = np.where(df["spr_objetivo"]>0, df["routes_total_alloc"]*df["spr_objetivo"], 0.0)
-    df["spr_logrado"]        = np.where(df["routes_total_alloc"]>0, df["ship_fcst_neto"]/df["routes_total_alloc"], np.nan)
-    df["share_crowd_real"]   = np.where(df["routes_need_total"]>0, (df["routes_crowd_base"]+df["routes_crowd_e1"]) / df["routes_need_total"], 0.0)
-    df["risk_flag"]          = (df["routes_deficit"]>0) | df["alerta_spr_missing"]
-    cols = [
-        "fecha","svc","shipments","ship_dc","ship_sp","ship_fcst_neto","spr_objetivo",
-        "routes_need_total","rentals_routes_max","routes_rentals_alloc",
-        "crowd_base_routes","crowd_e1_routes","share_crowd_obj","routes_crowd_target","routes_crowd_base","routes_crowd_e1",
-        "sdd_routes_max","spot_routes_max","sdd_trabaja","spot_trabaja","routes_mlp_cap_day","routes_mlp_alloc",
-        "routes_total_alloc","routes_deficit","shipments_plan","spr_logrado","share_crowd_real",
-        "alerta_spr_missing","risk_flag",
-    ]
-    return df[cols].sort_values(["fecha","svc"]).reset_index(drop=True)
 
-# ---------------------------------------------------------------------
-# 10) UI
-# ---------------------------------------------------------------------
-with st.sidebar:
-    st.header("📂 Proyecto")
-    st.write(f"Sheet: `{SHEET_ID}`")
-    st.subheader("🔐 Credenciales")
-    svc_email = get_service_account_email()
-    if svc_email:
-        st.caption("Comparte el Sheet con:")
-        st.code(svc_email, language="text")
-    else:
-        st.warning("No se detectó Service Account.")
+    # Ajuste demanda base: FCST − DC − SP
+    out["DEMANDA_AJUSTADA"] = (out["FCST"] - out["DC"] - out["SP"]).clip(lower=0)
+
+    # Selección de SPR objetivo según modo, con fallback a SPR_OBJ
+    out["SPR_USADO"] = out[spr_mode_col].where(out[spr_mode_col].notna(), out["SPR_OBJ"])
+    # Si sigue NaN, asume 20 (fallback ultra conservador)
+    out["SPR_USADO"] = out["SPR_USADO"].fillna(20)
+
+    # Rutas base por SPR
+    out["RUTAS_SPR_BASE"] = np.ceil(out["DEMANDA_AJUSTADA"] / out["SPR_USADO"]).astype(int)
+
+    # Suma Rentals primero
+    out["RUTAS_POST_RENTALS"] = (out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"]).clip(lower=0)
+
+    # Aplicar base de Crowd como porcentaje del plan (sobre rutas restantes)
+    out["RUTAS_CROWD_BASE"] = np.ceil(out["RUTAS_POST_RENTALS"] * out["CROWD_BASE_PCT"]).astype(int)
+    out["RUTAS_RESTANTES"] = (out["RUTAS_POST_RENTALS"] - out["RUTAS_CROWD_BASE"]).clip(lower=0)
+
+    # MLP SDD y Spot (si están definidos, se sostienen con prioridad)
+    out["RUTAS_POST_MLP"] = (out["RUTAS_RESTANTES"] - out["RUTAS_MLP_SDD"] - out["RUTAS_MLP_SPOT"]).clip(lower=0)
+
+    # Crowd E1 como colchón final si sobran
+    out["RUTAS_CROWDE1_USADAS"] = np.minimum(out["RUTAS_POST_MLP"], out["CROWD_E1"]).astype(int)
+    out["RUTAS_FALTANTES"] = (out["RUTAS_POST_MLP"] - out["RUTAS_CROWDE1_USADAS"]).clip(lower=0)
+
+    # Resultado ordenado
+    out.fillna(0, inplace=True)
+    out = out[[
+        "SVC","FECHA",
+        "FCST","DC","SP","DEMANDA_AJUSTADA",
+        "SPR_USADO","RUTAS_SPR_BASE",
+        "RUTAS_RENTALS",
+        "CROWD_BASE_PCT","RUTAS_CROWD_BASE",
+        "RUTAS_MLP_SDD","RUTAS_MLP_SPOT",
+        "CROWD_E1","RUTAS_CROWDE1_USADAS",
+        "RUTAS_FALTANTES"
+    ]].sort_values("SVC")
+
+    # Filtrado por SVC (chips)
+    if sel_svcs:
+        out = out[out["SVC"].isin(sel_svcs)]
+
+    return out.reset_index(drop=True)
+
+# -----------------------------------------------------------------------------
+# 5) UI Streamlit
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="Mel-IA — Plan táctico (diario por SVC)", layout="wide")
+
+st.sidebar.markdown("## 🗂️ Proyecto")
+if SHEET_ID:
+    st.sidebar.markdown(f"**Sheet:** `{SHEET_ID}`")
+else:
+    st.sidebar.error("Configura `SHEET_ID` en Secrets/ENV.")
+
+st.sidebar.markdown("## 🔐 Credenciales")
+st.sidebar.code("Comparte el Sheet con:\nplanificacion@planificacion.iam.gserviceaccount.com")
 
 st.title("Mel-IA — Plan táctico (diario por SVC)")
-spr_mode = st.radio("SPR objetivo", ["promedio","peak","plan"], index=0, horizontal=True)
 
-with st.expander("▶ Cargando datos…", expanded=True):
+spr_mode = st.radio("SPR objetivo", options=["promedio","peak","plan"], horizontal=True, index=0)
+
+with st.expander("▶️ Cargando datos...", expanded=True):
     try:
-        fcst_preview = load_fcst()
-        all_svcs = sorted(fcst_preview["svc"].dropna().astype(str).str.upper().unique().tolist())
-        sel_svcs = st.multiselect("Filtrar SVC", all_svcs, default=all_svcs[:4])
-    except Exception as e:
-        st.exception(e)  # ← muestra stack completo
-        sel_svcs = []
+        # Cargar minimal para filtros (SVCs desde cualquiera)
+        rentals_svcs = load_rentals()[["SVC"]]
+        fcst_svcs = load_fcst()[["SVC"]]
+        crowd_svcs = load_crowd()[["SVC"]]
+        mlp_svcs = load_mlp_sdd()[["SVC"]]
+        base_svcs = pd.concat([rentals_svcs, fcst_svcs, crowd_svcs, mlp_svcs], axis=0).drop_duplicates()
+        svc_list = sorted(base_svcs["SVC"].dropna().unique().tolist())
+        default_sel = [s for s in ["SGD1","SMT1","SMX9","SPB1"] if s in svc_list] or svc_list[:4]
 
+        sel_svcs = st.multiselect("Filtrar SVC", options=svc_list, default=default_sel)
+
+        st.write(" ")
+        run_btn = st.button("Calcular plan", type="primary")
+    except Exception as e:
+        st.error("No se pudieron preparar los filtros.")
+        show_exception(e, "Detalles (filtros)")
+
+result_placeholder = st.empty()
+
+if 'auto_run_once' not in st.session_state:
+    st.session_state['auto_run_once'] = True
+    auto_run = True
+else:
+    auto_run = False
+
+if run_btn or auto_run:
     try:
         plan = compute_plan(spr_mode, sel_svcs or None)
-        st.success("Datos listos ✅")
+        if plan.empty:
+            st.warning("No hay datos para mostrar con los filtros seleccionados.")
+        else:
+            # Métricas rápidas
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("SVCs", value=plan["SVC"].nunique())
+            with col2:
+                st.metric("Demanda ajustada", value=int(plan["DEMANDA_AJUSTADA"].sum()))
+            with col3:
+                st.metric("Rutas (SPR base)", value=int(plan["RUTAS_SPR_BASE"].sum()))
+            with col4:
+                st.metric("Rutas faltantes", value=int(plan["RUTAS_FALTANTES"].sum()))
+
+            st.dataframe(plan, use_container_width=True, hide_index=True)
     except Exception as e:
-        st.exception(e)  # ← muestra stack completo
-        st.stop()
+        st.error(str(e))
+        show_exception(e, "Traceback completo")
 
-st.subheader("Tabla principal — (svc, fecha) × Delivery model")
-st.dataframe(plan, use_container_width=True, hide_index=True)
-
-st.subheader("Riesgos por fecha")
-resumen = (plan.groupby("fecha", as_index=False)
-           .agg(svcs_con_deficit=("routes_deficit", lambda s: int((s>0).sum())),
-                rutas_deficit=("routes_deficit","sum"),
-                svcs_sin_spr=("alerta_spr_missing","sum")))
-st.dataframe(resumen, use_container_width=True, hide_index=True)
-
-st.subheader("Vistas agrupadas por Delivery Model")
-agg_cols = ["routes_crowd_base","routes_crowd_e1","routes_rentals_alloc","routes_mlp_alloc","routes_deficit","routes_total_alloc"]
-vista = (plan.groupby(["svc","fecha"], as_index=False)[agg_cols].sum())
-st.dataframe(vista.sort_values(["svc","fecha"]), use_container_width=True, hide_index=True)
-
+# -----------------------------------------------------------------------------
+# 6) Notas / Ayuda
+# -----------------------------------------------------------------------------
+with st.expander("ℹ️ Notas de esta versión"):
+    st.markdown(textwrap.dedent("""
+    - **Normalización de columnas** automática para evitar errores por encabezados como `SVC/SVCs`, `SVCs`, `SHP_LG_FACILITY_ID`, etc.
+    - Si falta un dataset o una columna secundaria, se completa con `0`/`NaN` y **no se cae** la app.
+    - `SPR objetivo` usa: **promedio** → `SPR_PROM`, **peak** → `SPR_PEAK`, **plan** → `SPR_OBJ`.
+      Si no existe esa columna, hace *fallback* a `SPR_OBJ` y, si tampoco existe, usa `20`.
+    - El orden del pipeline es: **SPR base** → **Rentals** → **Crowd base** → **MLP SDD/Spot** → **Crowd E1**.
+    """))
 
