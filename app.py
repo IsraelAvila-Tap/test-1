@@ -256,61 +256,61 @@ def load_capacity() -> pd.DataFrame:
     # Salida consistente
     return df[["fecha", "svc", "delivery model", "tipo", "cantidad"]].dropna(subset=["fecha","svc"])
 
+def _safe_to_numeric_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """Convierte a numérico (robusto) sólo las columnas presentes."""
+    for col in cols:
+        if col in df.columns:
+            df[col] = _to_num(df[col]).fillna(0.0)
+    return df
+
 
 def load_srm() -> pd.DataFrame:
-    """SRM: detecta fila de header (busca 'svc' en primeras 10 filas) y suma SDD/SPOT."""
-    raw = _read("SRM")
+    """
+    Lee la pestaña SRM (encabezado puede estar en fila 5 y con muchas columnas).
+    Detecta columnas SDD/SPOT por nombre y agrega por SVC.
+    """
+    raw = _read_sheet("SRM")  # usa tu wrapper que ya normaliza fechas/strings
+
+    # Detectar fila de encabezado (primera que contenga 'svc')
     header_row = None
-    lim = min(10, len(raw))
-    for i in range(lim):
+    for i in range(min(10, len(raw))):
         row = [str(x).strip().lower() for x in raw.iloc[i].tolist()]
-        if any("svc" == x for x in row):
+        if any(x == "svc" for x in row):
             header_row = i
             break
     if header_row is None:
-        header_row = 4  # fallback fila 5 (0-based)
+        # fallback clásico: encabezado en fila 5 (0-based = 4)
+        header_row = 4
 
-    df = raw.copy()
-    df.columns = [str(x).strip().lower() for x in raw.iloc[header_row].tolist()]
-    df = df.iloc[header_row+1:].reset_index(drop=True)
-    df = _lower_cols(df)
+    # Aplicar encabezados
+    cols = [str(x).strip().lower() for x in raw.iloc[header_row].tolist()]
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = cols
 
-    # detecta columna SVC
-    svc_col = None
-    for c in df.columns:
-        if c.strip().lower() in ("svc","svcs","svc_1","svc_2","svc "):
-            svc_col = c; break
+    # Columna SVC
+    svc_col = "svc" if "svc" in df.columns else ("svcs" if "svcs" in df.columns else None)
     if not svc_col:
-        raise ValueError("SRM: no se encontró columna SVC.")
+        raise ValueError("SRM: no se encontró columna 'SVC/SVCs'.")
 
-    # columnas con SDD/SPOT totales (muy flexibles)
-    sdd_cols  = [c for c in df.columns if ("sdd" in c and "total" in c)]
-    spot_cols = [c for c in df.columns if ("spot" in c and "total" in c)]
-    # si no hay etiquetas 'total', intenta por bloques 'sdd' / 'spot'
-    if not sdd_cols:
-        sdd_cols = [c for c in df.columns if "sdd" in c]
-    if not spot_cols:
-        spot_cols = [c for c in df.columns if "spot" in c]
+    # Detectar columnas SDD y SPOT por patrón en el nombre
+    sdd_cols  = [c for c in df.columns if "sdd"  in c]
+    spot_cols = [c for c in df.columns if "spot" in c]
     if not sdd_cols and not spot_cols:
-        raise ValueError(f"SRM: no se hallaron columnas con 'sdd' o 'spot'. Encabezados: {list(df.columns)[:30]}")
+        first_cols = list(df.columns)[:30]
+        raise ValueError(f"SRM: no se hallaron columnas con 'sdd' o 'spot'. Encabezados: {first_cols}")
 
-    # conversión numérica robusta
-    for c in set(sdd_cols + spot_cols):
-        try:
-            df[c] = _to_num(df[c]).fillna(0.0)
-        except Exception:
-            df[c] = 0.0
-
-     # tipado seguro y agregación
+    # Numéricos robustos (sin usar 'c' suelta)
     num_cols = list(set(sdd_cols + spot_cols))
-    df = _safe_to_numeric(df, num_cols)  # <- usa la utilidad nueva
+    df = _safe_to_numeric_cols(df, num_cols)
 
+    # Agregación por SVC
     g = df.copy()
+    # _ensure_series ya existe en tu archivo; si no, crea uno simple.
     g["svc"] = _ensure_series(g[svc_col]).astype(str).str.upper().str.strip()
 
     agg = g.groupby("svc", as_index=False)[num_cols].sum()
-    agg["sdd_routes_max"]  = agg[sdd_cols].sum(axis=1)  if sdd_cols  else 0
-    agg["spot_routes_max"] = agg[spot_cols].sum(axis=1) if spot_cols else 0
+    agg["sdd_routes_max"]  = agg[sdd_cols].sum(axis=1)  if sdd_cols  else 0.0
+    agg["spot_routes_max"] = agg[spot_cols].sum(axis=1) if spot_cols else 0.0
 
     return agg[["svc", "sdd_routes_max", "spot_routes_max"]]
 
