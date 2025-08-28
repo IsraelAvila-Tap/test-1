@@ -181,20 +181,74 @@ def load_spr_real() -> pd.DataFrame:
     return df[["fecha","svc","spr","dow","iso_year","iso_week"]]
 
 def load_capacity() -> pd.DataFrame:
-    df = _read("Capacity")
-    need = {"delivery model","tipo","svc","fecha","cantidad"}
-    miss = need - set(df.columns)
-    if miss:
-        raise ValueError(f"Capacity: faltan columnas {sorted(miss)}")
+    raw = _read("Capacity")
+
+    # --- 1) Detectar encabezado en las primeras 10 filas
+    header_row = None
+    for i in range(min(10, len(raw))):
+        row = [str(x).strip().lower() for x in raw.iloc[i].tolist()]
+        has_dm    = any(("delivery" in c) or ("modelo" in c) or ("tipo dm" in c) or (c.strip() == "dm") for c in row)
+        has_tipo  = any(("tipo" in c) or ("type" in c) for c in row)
+        has_svc   = any("svc" in c for c in row)
+        has_fecha = any(("fecha" in c) or ("date" in c) or ("día" in c) or ("dia" in c) or ("day" in c) for c in row)
+        has_qty   = any(
+            ("cantidad" in c) or ("qty" in c) or ("quantity" in c) or ("capacidad" in c) or
+            ("units" in c) or ("count" in c) or ("routes" in c) or ("rutas" in c) or
+            ("volume" in c) or ("volumen" in c)
+        )
+        if sum([has_dm, has_tipo, has_svc, has_fecha, has_qty]) >= 3:
+            header_row = i
+            break
+
+    if header_row is not None:
+        df = raw.copy()
+        df.columns = [str(x).strip().lower() for x in raw.iloc[header_row].tolist()]
+        df = df.iloc[header_row + 1 :].reset_index(drop=True)
+        df = _lower_cols(df)
+    else:
+        df = _lower_cols(raw)
+
+    # --- 2) Resolver nombres por sinónimos
+    def find_col(tokens: list[str]) -> str | None:
+        for c in df.columns:
+            cc = c.strip().lower()
+            if any(tok in cc for tok in tokens):
+                return c
+        return None
+
+    dm_col    = find_col(["delivery model","delivery","modelo","modelo de entrega","tipo dm"," dm "])
+    tipo_col  = find_col(["tipo","type","categoria","category"])
+    svc_col   = find_col(["svc","svcs","svc "])
+    fecha_col = find_col(["fecha","date","día","dia","day"])
+    qty_col   = find_col(["cantidad","qty","quantity","capacidad","units","count","rutas","routes","volume","volumen"])
+
+    faltan = []
+    if not dm_col:    faltan.append("delivery model")
+    if not tipo_col:  faltan.append("tipo")
+    if not svc_col:   faltan.append("svc")
+    if not fecha_col: faltan.append("fecha")
+    if not qty_col:   faltan.append("cantidad")
+    if faltan:
+        raise ValueError(f"Capacity: faltan columnas {faltan}. Encabezados vistos: {list(df.columns)[:30]}")
+
+    # --- 3) Normalizar y tipar
+    df = df.rename(columns={
+        dm_col: "delivery model",
+        tipo_col: "tipo",
+        svc_col: "svc",
+        fecha_col: "fecha",
+        qty_col: "cantidad",
+    })
+
     df = _norm_date_col(df, "fecha")
+    df["svc"] = _ensure_series(df["svc"]).astype(str).str.upper().str.strip()
+    df["tipo"] = _ensure_series(df["tipo"]).astype(str).str.strip().str.lower()
+    df["delivery model"] = _ensure_series(df["delivery model"]).astype(str).str.strip().str.lower()
     df["cantidad"] = _to_num(df["cantidad"]).fillna(0.0)
 
-    # normaliza strings
-    df["tipo"] = _ensure_series(df["tipo"]).astype(str).str.lower().str.strip()
-    df["delivery model"] = _ensure_series(df["delivery model"]).astype(str).str.lower().str.strip()
-    df["tipo dm"] = _ensure_series(df.get("tipo dm", "")).astype(str).str.lower().str.strip()
+    # Salida consistente
+    return df[["fecha", "svc", "delivery model", "tipo", "cantidad"]].dropna(subset=["fecha","svc"])
 
-    return df
 
 def load_srm() -> pd.DataFrame:
     """SRM: detecta fila de header (busca 'svc' en primeras 10 filas) y suma SDD/SPOT."""
