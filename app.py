@@ -301,18 +301,18 @@ def load_srm() -> pd.DataFrame:
         except Exception:
             df[c] = 0.0
 
- # tipado seguro y agregación
-num_cols = list(set(sdd_cols + spot_cols))
-df = _safe_to_numeric(df, num_cols)  # <- usa la utilidad nueva
+     # tipado seguro y agregación
+    num_cols = list(set(sdd_cols + spot_cols))
+    df = _safe_to_numeric(df, num_cols)  # <- usa la utilidad nueva
 
-g = df.copy()
-g["svc"] = _ensure_series(g[svc_col]).astype(str).str.upper().str.strip()
+    g = df.copy()
+    g["svc"] = _ensure_series(g[svc_col]).astype(str).str.upper().str.strip()
 
-agg = g.groupby("svc", as_index=False)[num_cols].sum()
-agg["sdd_routes_max"]  = agg[sdd_cols].sum(axis=1)  if sdd_cols  else 0
-agg["spot_routes_max"] = agg[spot_cols].sum(axis=1) if spot_cols else 0
+    agg = g.groupby("svc", as_index=False)[num_cols].sum()
+    agg["sdd_routes_max"]  = agg[sdd_cols].sum(axis=1)  if sdd_cols  else 0
+    agg["spot_routes_max"] = agg[spot_cols].sum(axis=1) if spot_cols else 0
 
-return agg[["svc", "sdd_routes_max", "spot_routes_max"]]
+    return agg[["svc", "sdd_routes_max", "spot_routes_max"]]
 
 
 def load_rentals() -> pd.DataFrame:
