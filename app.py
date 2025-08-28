@@ -2,12 +2,8 @@
 # =============================================================================
 # Mel-IA — Plan táctico (diario por SVC)
 # FCST − DC − SP → SPR → Rentals → Crowd base → MLP SDD/Spot → Crowd E1
-# Aprendizajes incorporados:
-# - Normalización de encabezados tolerante (SVC, fechas, modelos…)
-# - Coerción numérica y de fechas robusta (vacíos, no numéricos, formatos variados)
-# - Errores amigables + la app nunca truena (defaults/NaN)
-# - Prevención de NameError (botones/flags siempre se definen)
-# - Cacheo de lecturas y parametrización por Secrets/ENV
+# Aprendizajes: normalización de encabezados, coerción numérica/fechas, mensajes claros,
+# no-crash (defaults), NameError prevenido, y AHORA: fallback UI para SHEET_ID + chequeo de acceso.
 # =============================================================================
 import os, json, re, unicodedata, textwrap, traceback
 from datetime import date
@@ -25,6 +21,7 @@ if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
 elif "gcp_service_account" in st.secrets:
     os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = json.dumps(dict(st.secrets["gcp_service_account"]))
 
+# Intenta tomar SHEET_ID de Secrets/ENV
 SHEET_ID = (
     st.secrets.get("SHEET_ID")
     or os.environ.get("SHEET_ID")
@@ -42,6 +39,8 @@ SHEET_TABS = {
     "mlp_sdd":  st.secrets.get("TAB_MLP_SDD", "MLP_SDD"),
     "crowd_e1": st.secrets.get("TAB_CROWD_E1", "Crowd_E1"),
 }
+
+SERVICE_EMAIL = "planificacion@planificacion.iam.gserviceaccount.com"
 
 # -----------------------------------------------------------------------------
 # 1) Utilidades de normalización / coerción
@@ -74,7 +73,6 @@ def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFram
 _NUM_SEP_RE = re.compile(r"[ ,\u00A0]")  # espacio, NBSP, coma
 
 def _maybe_to_numeric(s: pd.Series) -> pd.Series:
-    """Convierte serie a numérica si >80% de valores parecen numéricos; preserva strings reales."""
     if s.dtype.kind in "iufc":  # ya numérica
         return s
     sample = s.dropna().astype(str).head(50)
@@ -102,7 +100,6 @@ def coerce_date_column(df: pd.DataFrame, candidates: List[str], new_name: str,
     col = find_and_rename(df, candidates, new_name, required=required, source_label=source_label)
     if col:
         df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=False, infer_datetime_format=True).dt.date
-        # Si todo salió NaN, intenta dayfirst=True (casos 31/05/2025)
         if df[col].notna().sum() == 0:
             df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True, infer_datetime_format=True).dt.date
     return col
@@ -117,14 +114,17 @@ def show_exception(e: Exception, title: str):
         st.code("".join(traceback.format_exception(None, e, e.__traceback__)))
 
 # -----------------------------------------------------------------------------
-# 2) Lectura de Google Sheets
+# 2) Google Sheets: cliente + lectura + chequeo de acceso
 # -----------------------------------------------------------------------------
 def _get_gspread_client():
     import gspread
     from google.oauth2.service_account import Credentials
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw:
-        raise RuntimeError("Faltan credenciales en GOOGLE_SERVICE_ACCOUNT_JSON.")
+        raise RuntimeError(
+            "Faltan credenciales en GOOGLE_SERVICE_ACCOUNT_JSON. "
+            "Copia tu JSON completo en Secrets como GOOGLE_SERVICE_ACCOUNT_JSON."
+        )
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets.readonly",
         "https://www.googleapis.com/auth/drive.readonly",
@@ -134,18 +134,28 @@ def _get_gspread_client():
 
 @st.cache_data(show_spinner=False, ttl=300)
 def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
+    # NOTA: aquí NO silenciamo errores; si falla, se verá el detalle en UI.
+    gc = _get_gspread_client()
+    sh = gc.open_by_key(sheet_id)
+    ws = sh.worksheet(tab_name)
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+    header, rows = values[0], values[1:]
+    df = pd.DataFrame(rows, columns=header)
+    return coerce_numeric_df(df)
+
+def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
+    out = {"sheet_id": sheet_id or "", "ok": "false", "note": ""}
     try:
         gc = _get_gspread_client()
-        ws = gc.open_by_key(sheet_id).worksheet(tab_name)
-        values = ws.get_all_values()
-        if not values:
-            return pd.DataFrame()
-        header, rows = values[0], values[1:]
-        df = pd.DataFrame(rows, columns=header)
-        return coerce_numeric_df(df)
+        sh = gc.open_by_key(sheet_id)
+        titles = [w.title for w in sh.worksheets()]
+        out["ok"] = "true"
+        out["note"] = f"Pestañas: {', '.join(titles[:8])}" + ("…" if len(titles) > 8 else "")
     except Exception as e:
-        # devolvemos DF vacío para no tronarnos; el detalle se muestra en UI
-        return pd.DataFrame()
+        out["note"] = f"{e}"
+    return out
 
 # -----------------------------------------------------------------------------
 # 3) Loaders (normalizan columnas + defaults)
@@ -206,9 +216,7 @@ def load_crowd() -> pd.DataFrame:
     find_and_rename(df, ["SVC","svc","SVCs","SVC/SVCs","SHP_LG_FACILITY_ID","LOGISTIC_CENTER_ID"], "SVC", False, "Crowd")
     find_and_rename(df, ["CROWD_BASE","CROWD_BASE_%","%CROWD","CROWD_PCT_PLAN"], "CROWD_BASE_PCT", False, "Crowd")
     df["CROWD_BASE_PCT"] = pd.to_numeric(df.get("CROWD_BASE_PCT", 0), errors="coerce").fillna(0)
-    df["CROWD_BASE_PCT"] = df["CROWD_BASE_PCT"].clip(0, 1)  # si viene 0-1; si venía 0-100, lo ajustaremos abajo
-    # auto-ajuste si 80% >1 → asumimos 0-100
-    if (df["CROWD_BASE_PCT"] > 1).mean() > 0.8:
+    if (df["CROWD_BASE_PCT"] > 1).mean() > 0.8:  # si viene en 0-100
         df["CROWD_BASE_PCT"] = (df["CROWD_BASE_PCT"]/100).clip(0,1)
     df = ensure_columns(df, {"SVC":None})
     return df[["FECHA","SVC","CROWD_BASE_PCT"]].copy()
@@ -251,18 +259,15 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     for d in frames:
         if "FECHA" in d.columns and not d.empty:
             d = d.dropna(subset=["FECHA"])
-            # permitir histórico <= hoy (si usas futura, cambia aquí)
             d = d[d["FECHA"] <= hoy]
         fixed.append(d)
     fcst, dc, sp, spr, rentals, crowd, mlp_sdd, crowd_e1 = fixed
 
-    # base SVC
     bases = [x[["SVC"]].drop_duplicates() for x in fixed if "SVC" in x.columns and not x.empty]
     base = pd.concat(bases, axis=0).drop_duplicates() if bases else pd.DataFrame(columns=["SVC"])
     out = base.copy()
     out["FECHA"] = hoy
 
-    # merges
     if not fcst.empty:
         out = safe_merge(out, fcst.groupby("SVC", as_index=False)["FCST"].sum(), ["SVC"])
     if not dc.empty:
@@ -270,13 +275,11 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     if not sp.empty:
         out = safe_merge(out, sp.groupby("SVC", as_index=False)["SP"].sum(), ["SVC"])
 
-    # SPR (prom, peak, plan) con fallback
     spr_mode_col = {"promedio":"SPR_PROM", "peak":"SPR_PEAK", "plan":"SPR_OBJ"}[spr_mode]
     if not spr.empty:
         spr_tmp = spr.groupby("SVC", as_index=False).agg({"SPR_OBJ":"max","SPR_PEAK":"max","SPR_PROM":"max"})
         out = safe_merge(out, spr_tmp, ["SVC"])
 
-    # extras
     if not rentals.empty:
         out = safe_merge(out, rentals.groupby("SVC", as_index=False)["RUTAS_RENTALS"].sum(), ["SVC"])
     if not crowd.empty:
@@ -286,28 +289,24 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     if not crowd_e1.empty:
         out = safe_merge(out, crowd_e1.groupby("SVC", as_index=False)["CROWD_E1"].sum(), ["SVC"])
 
-    # defaults
     out = ensure_columns(out, {
         "FCST":0, "DC":0, "SP":0,
         "SPR_OBJ":np.nan, "SPR_PEAK":np.nan, "SPR_PROM":np.nan,
         "RUTAS_RENTALS":0, "CROWD_BASE_PCT":0, "RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0, "CROWD_E1":0
     })
 
-    # Demanda ajustada y SPR
     out["DEMANDA_AJUSTADA"] = (pd.to_numeric(out["FCST"], errors="coerce").fillna(0)
                                - pd.to_numeric(out["DC"], errors="coerce").fillna(0)
                                - pd.to_numeric(out["SP"], errors="coerce").fillna(0)).clip(lower=0)
 
-    spr_usado = out[spr_mode_col]
-    spr_usado = spr_usado.where(spr_usado.notna(), out["SPR_OBJ"])
-    spr_usado = spr_usado.fillna(20)  # fallback conservador
+    spr_usado = out[spr_mode_col].where(out[spr_mode_col].notna(), out["SPR_OBJ"]).fillna(20)
     out["SPR_USADO"] = pd.to_numeric(spr_usado, errors="coerce").fillna(20).clip(lower=1)
 
-    out["RUTAS_SPR_BASE"]   = np.ceil(out["DEMANDA_AJUSTADA"] / out["SPR_USADO"]).astype(int)
-    out["RUTAS_POST_RENTALS"] = (out["RUTAS_SPR_BASE"] - pd.to_numeric(out["RUTAS_RENTALS"], errors="coerce").fillna(0)).clip(lower=0)
+    out["RUTAS_SPR_BASE"]    = np.ceil(out["DEMANDA_AJUSTADA"] / out["SPR_USADO"]).astype(int)
+    out["RUTAS_POST_RENTALS"] = (out["RUTAS_SPR_BASE"]
+                                 - pd.to_numeric(out["RUTAS_RENTALS"], errors="coerce").fillna(0)).clip(lower=0)
 
     pct = pd.to_numeric(out["CROWD_BASE_PCT"], errors="coerce").fillna(0)
-    # si accidentalmente viniera 10→10%, cap a 1
     pct = np.where(pct > 1, pct/100.0, pct)
     pct = np.clip(pct, 0, 1)
     out["RUTAS_CROWD_BASE"] = np.ceil(out["RUTAS_POST_RENTALS"] * pct).astype(int)
@@ -333,74 +332,93 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     return out
 
 # -----------------------------------------------------------------------------
-# 5) UI Streamlit (resiliente)
+# 5) UI Streamlit (resiliente) + Fallback de SHEET_ID
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="Mel-IA — Plan táctico (diario por SVC)", layout="wide")
 
 st.sidebar.markdown("## 🗂️ Proyecto")
+if not SHEET_ID:
+    st.sidebar.error("Configura `SHEET_ID` en Secrets/ENV o pégalo aquí abajo.")
+SHEET_ID = st.sidebar.text_input("SHEET_ID (pega el ID si no está en Secrets)", value=SHEET_ID or "", placeholder="1AbCdefGhIJK...")
 if SHEET_ID:
     st.sidebar.markdown(f"**Sheet:** `{SHEET_ID}`")
-else:
-    st.sidebar.error("Configura `SHEET_ID` en Secrets/ENV.")
 
 st.sidebar.markdown("## 🔐 Credenciales")
-st.sidebar.code("Comparte el Sheet con:\nplanificacion@planificacion.iam.gserviceaccount.com")
+st.sidebar.code(f"Comparte el Sheet con:\n{SERVICE_EMAIL}")
+
+# Healthcheck (muestra problema exacto si no hay acceso)
+with st.sidebar.expander("Estado de conexión", expanded=False):
+    try:
+        if SHEET_ID:
+            hc = quick_healthcheck(SHEET_ID)
+            ok = hc.get("ok") == "true"
+            st.write("OK ✅" if ok else "Fallo ❌")
+            st.caption(hc.get("note", ""))
+        else:
+            st.info("Proporciona SHEET_ID para checar acceso.")
+    except Exception as e:
+        st.error("No se pudo validar acceso.")
+        st.caption(str(e))
 
 st.title("Mel-IA — Plan táctico (diario por SVC)")
-
 spr_mode = st.radio("SPR objetivo", options=["promedio","peak","plan"], horizontal=True, index=0)
 
-# Inicializa SIEMPRE estos para evitar NameError
+# Inicializa SIEMPRE para evitar NameError
 run_btn = False
 auto_run = False
 sel_svcs: List[str] = []
 
 with st.expander("▶️ Cargando datos...", expanded=True):
     try:
-        rentals_svcs = load_rentals()[["SVC"]]
-        fcst_svcs    = load_fcst()[["SVC"]]
-        crowd_svcs   = load_crowd()[["SVC"]]
-        mlp_svcs     = load_mlp_sdd()[["SVC"]]
-        base_svcs = pd.concat([rentals_svcs, fcst_svcs, crowd_svcs, mlp_svcs], axis=0).drop_duplicates()
-        svc_list = sorted(base_svcs["SVC"].dropna().astype(str).unique().tolist())
+        if not SHEET_ID:
+            st.warning("Falta `SHEET_ID`. Pégalo en la barra lateral.")
+            svc_list = []
+        else:
+            rentals_svcs = load_rentals()[["SVC"]]
+            fcst_svcs    = load_fcst()[["SVC"]]
+            crowd_svcs   = load_crowd()[["SVC"]]
+            mlp_svcs     = load_mlp_sdd()[["SVC"]]
+            base_svcs = pd.concat([rentals_svcs, fcst_svcs, crowd_svcs, mlp_svcs], axis=0).drop_duplicates()
+            svc_list = sorted(base_svcs["SVC"].dropna().astype(str).unique().tolist())
 
         default_sel = [s for s in ["SGD1","SMT1","SMX9","SPB1"] if s in svc_list] or svc_list[:4]
         sel_svcs = st.multiselect("Filtrar SVC", options=svc_list, default=default_sel)
-
         st.write(" ")
         run_btn = st.button("Calcular plan", type="primary")
     except Exception as e:
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
 
-# Auto-run una vez (si hay datos de SVC)
+# Auto-run una vez si hay SVCs
 if 'auto_run_once' not in st.session_state:
     st.session_state['auto_run_once'] = True
     auto_run = True and len(sel_svcs) > 0
 
 try:
     if run_btn or auto_run:
-        plan = compute_plan(spr_mode, sel_svcs or None)
-        if plan.empty:
-            st.warning("No hay datos para mostrar con los filtros seleccionados.")
+        if not SHEET_ID:
+            st.warning("Proporciona `SHEET_ID` para calcular.")
         else:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("SVCs", plan["SVC"].nunique())
-            c2.metric("Demanda ajustada", int(plan["DEMANDA_AJUSTADA"].sum()))
-            c3.metric("Rutas (SPR base)", int(plan["RUTAS_SPR_BASE"].sum()))
-            c4.metric("Rutas faltantes", int(plan["RUTAS_FALTANTES"].sum()))
-            st.dataframe(plan, use_container_width=True, hide_index=True)
+            plan = compute_plan(spr_mode, sel_svcs or None)
+            if plan.empty:
+                st.warning("No hay datos para mostrar con los filtros seleccionados.")
+            else:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("SVCs", plan["SVC"].nunique())
+                c2.metric("Demanda ajustada", int(plan["DEMANDA_AJUSTADA"].sum()))
+                c3.metric("Rutas (SPR base)", int(plan["RUTAS_SPR_BASE"].sum()))
+                c4.metric("Rutas faltantes", int(plan["RUTAS_FALTANTES"].sum()))
+                st.dataframe(plan, use_container_width=True, hide_index=True)
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
     show_exception(e, "Traceback completo")
 
 with st.expander("ℹ️ Notas de esta versión"):
-    st.markdown(textwrap.dedent("""
-    - Normalización automática de encabezados: `SVC/SVCs/SHP_LG_FACILITY_ID/LOGISTIC_CENTER_ID` → **SVC**.
-    - Coerción numérica robusta (maneja comas/espacios/“−”/“%”, vacíos y no numéricos).
-    - Coerción de fechas flexible; intenta `dayfirst` si el primer parseo da todo `NaN`.
-    - Si un dataset/columna falta, se completa con 0/NaN y no se cae la app.
-    - `SPR objetivo`: **promedio** → `SPR_PROM`, **peak** → `SPR_PEAK`, **plan** → `SPR_OBJ` (fallback a `SPR_OBJ`, luego **20**).
-    - Orden: **SPR base** → **Rentals** → **Crowd base** → **MLP SDD/Spot** → **Crowd E1**.
+    st.markdown(textwrap.dedent(f"""
+    - **Fallback UI de `SHEET_ID`**: si no está en Secrets/ENV, puedes pegarlo en la barra lateral.
+    - **Estado de conexión** te dice si falta compartir el Sheet con **{SERVICE_EMAIL}** o si el ID es inválido.
+    - Normalización de encabezados (SVC/SVCs/SHP_LG_FACILITY_ID/LOGISTIC_CENTER_ID → SVC), coerción numérica/fechas.
+    - Si un dataset/columna falta, se completa con 0/NaN y la app no se cae.
+    - SPR objetivo: promedio→SPR_PROM, peak→SPR_PEAK, plan→SPR_OBJ; fallback a SPR_OBJ y luego 20.
+    - Orden: SPR base → Rentals → Crowd base → MLP SDD/Spot → Crowd E1.
     """))
-
