@@ -1,8 +1,9 @@
 # app.py
 # =============================================================================
 # Mel-IA — Plan táctico (diario por SVC)
-# Ajustado a pestañas: FCST, SPR, Capacity, Rentals, Crowd.
-# Encabezado autodetectado (busca SVC) + encabezado de 2 filas (Base/E1, etc.).
+# Tabs: FCST, SPR, Capacity, Rentals, Crowd.
+# Encabezado autodetectado (busca SVC) + encabezado de 2 filas (Crowd).
+# Robusto ante vacíos/alias y pestañas ausentes.
 # =============================================================================
 import os, json, re, unicodedata, textwrap, traceback
 from datetime import date
@@ -126,7 +127,7 @@ def show_exception(e: Exception, title: str):
         st.code("".join(traceback.format_exception(None, e, e.__traceback__)))
 
 # -----------------------------------------------------------------------------
-# 2) Headers únicos + encabezados combinados (2 filas) + AUTODETECCIÓN
+# 2) Header único + 2 filas + AUTODETECCIÓN
 # -----------------------------------------------------------------------------
 def _make_unique_headers(headers):
     clean = [(h or "").strip() for h in headers]
@@ -152,13 +153,12 @@ def _combine_two_header_rows(r1: List[str], r2: List[str]) -> List[str]:
     return out
 
 def _looks_group_header(row_lower: List[str]) -> bool:
-    # detecta encabezados tipo "Base / E1 / Spot / Back Up ..."
     words = ("base", "e1", "spot", "back", "up", "sdd")
     hits = sum(1 for c in row_lower if any(w in c for w in words))
     return hits >= max(2, len(row_lower)//6)
 
 # -----------------------------------------------------------------------------
-# 3) Carga ESTABLE desde Google Sheets con header autodetectado
+# 3) Carga desde Google Sheets con header autodetectado
 # -----------------------------------------------------------------------------
 def _get_gspread_client():
     import gspread
@@ -174,11 +174,6 @@ def _get_gspread_client():
 
 @st.cache_data(show_spinner=False, ttl=300)
 def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
-    """Lee una pestaña:
-      - busca la fila de encabezados donde aparezca 'SVC' (primeras 50 filas)
-      - soporta encabezado de 2 filas (p. ej. Crowd: 'Base'/'E1' + detalles)
-      - devuelve DF vacío si la pestaña no existe
-    """
     import gspread
     gc = _get_gspread_client()
     sh = gc.open_by_key(sanitize_sheet_id(sheet_id))
@@ -190,7 +185,6 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     values = ws.get_all_values()
     if not values: return pd.DataFrame()
 
-    # 1) buscar fila de encabezados (SVC)
     header_idx = None
     limit = min(50, len(values))
     for i in range(limit):
@@ -198,13 +192,11 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
         if any(c == "svc" for c in row_lower):
             header_idx = i
             break
-    if header_idx is None:
-        header_idx = 0  # fallback (igual coercion abajo nos salva)
+    if header_idx is None: header_idx = 0
 
     r1 = values[header_idx]
     r1_lower = [c.strip().lower() for c in r1]
 
-    # 2) ¿encabezado de 2 filas?
     combine = False
     if header_idx + 1 < len(values):
         r2 = values[header_idx + 1]
@@ -303,6 +295,8 @@ def load_capacity_caps() -> pd.DataFrame:
     tipodm = df["TIPO_DM"].map(_norm_text)
 
     df["IS_RENTALS"]     = dm.str.contains("rent")
+    df["IS_CROWD_ROUTES"]= dm.str.contains("crowd") & (tipo.str_contains("route") | tipodm.str_contains("route"))
+    # pandas Series no tiene str_contains; usamos str.contains:
     df["IS_CROWD_ROUTES"]= dm.str.contains("crowd") & (tipo.str.contains("route") | tipodm.str.contains("route"))
     df["IS_MLP_SPOT"]    = dm.str.contains("mlp") & (tipodm.str.contains("spot"))
     df["IS_MLP_SDD"]     = dm.str.contains("mlp") & (~df["IS_MLP_SPOT"]) & (tipodm.str.contains("mlp") | tipodm.str.contains("sdd") | tipodm.eq(""))
@@ -328,8 +322,15 @@ def load_rentals_fallback() -> pd.DataFrame:
 
 def load_crowd_caps() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
-    if df.empty: return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1_CAP"])
-    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Crowd")
+    # Si no hay datos, devuelve estructura vacía
+    if df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1_CAP"])
+    # Intenta mapear SVC; si no queda, devolvemos vacío (evita KeyError en groupby)
+    try:
+        find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", True, "Crowd")
+    except Exception:
+        return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1_CAP"])
+
     base_sem_keys = ["Base entre semana","Base entre sem","Base semana","Base entre sem."]
     base_sab_keys = ["Base sabado","Base sábado"]
     base_dom_keys = ["Base domingo"]
@@ -351,7 +352,13 @@ def load_crowd_caps() -> pd.DataFrame:
         if c not in df.columns: df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
+    # Capacidad E1: máxima holgura disponible
     df["CROWD_E1_CAP"] = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
+
+    # Si por algún motivo SVC desapareció, devolvemos estructura vacía segura
+    if "SVC" not in df.columns:
+        return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1_CAP"])
+
     out = df.groupby("SVC", as_index=False)["CROWD_E1_CAP"].max()
     out["FECHA"] = date.today()
     return _finalize(out, ["FECHA","SVC","CROWD_E1_CAP"])
@@ -514,14 +521,9 @@ except Exception as e:
 
 with st.expander("ℹ️ Notas de esta versión"):
     st.markdown(textwrap.dedent("""
-    - Autodetección de encabezado (busca `SVC` en las primeras filas).
-    - Encabezado de 2 filas (p. ej., Crowd con “Base/E1/Spot/Back Up”).
-    - Tabs reales: FCST, SPR, Capacity, Rentals, Crowd (sin WorksheetNotFound).
-    - FCST: usa última fecha por SVC ≤ hoy si existe.
-    - SPR: calcula PROM, PEAK (p95) y OBJ desde `SPR`.
-    - Capacity: MLP SDD / MLP Spot / Rentals / Crowd routes cap.
-    - Rentals: fallback si Capacity no trae rentals.
-    - Crowd: holguras → `CROWD_E1_CAP` (capacidad extra E1).
-    - Robusto ante vacíos, nombres variantes y pestañas ausentes.
+    - Autodetección de encabezado (busca `SVC`).
+    - Encabezado de 2 filas (Crowd con “Base/E1/Spot/Back Up”).
+    - Si Crowd no trae `SVC` (vista/filtro raro), devolvemos DF vacío seguro → sin KeyError.
+    - Tabs: FCST, SPR, Capacity, Rentals, Crowd.
     - Filtro inicial: SGD1, SMT1, SMX9, SPB1 y auto-run.
     """))
