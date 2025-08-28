@@ -1,9 +1,16 @@
 # app.py
 # =============================================================================
 # Mel-IA — Plan táctico (diario por SVC)
-# FCST − DC − SP → SPR → Rentals → Crowd base → MLP SDD/Spot → Crowd E1
-# Aprendizajes: normalización de encabezados, coerción numérica/fechas, mensajes claros,
-# no-crash (defaults), NameError prevenido, y AHORA: fallback UI para SHEET_ID + chequeo de acceso.
+# Pipeline: FCST − DC − SP → SPR → Rentals → Crowd base → MLP SDD/Spot → Crowd E1
+# Incluye:
+# - Normalización de encabezados (SVC/SVCs/SHP_LG_FACILITY_ID/LOGISTIC_CENTER_ID → SVC)
+# - Coerción numérica robusta (comas/espacios/%/guiones, vacíos, no numéricos)
+# - Coerción de fechas flexible (intenta dayfirst si falla)
+# - No-crash: defaults si faltan pestañas/columnas
+# - Fix NameError (vars UI siempre definidas)
+# - Cache de lectura (ttl=300) y purge cuando cambia el Sheet
+# - Acepta URL o ID de Google Sheet (sanitize_sheet_id)
+# - Healthcheck de acceso con gspread
 # =============================================================================
 import os, json, re, unicodedata, textwrap, traceback
 from datetime import date
@@ -21,8 +28,21 @@ if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
 elif "gcp_service_account" in st.secrets:
     os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = json.dumps(dict(st.secrets["gcp_service_account"]))
 
-# Intenta tomar SHEET_ID de Secrets/ENV
-SHEET_ID = (
+SERVICE_EMAIL = "planificacion@planificacion.iam.gserviceaccount.com"
+
+def sanitize_sheet_id(text: str | None) -> str | None:
+    """Acepta ID o URL de Google Sheets y devuelve el ID limpio."""
+    if not text:
+        return None
+    text = text.strip()
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", text)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[a-zA-Z0-9-_]{20,}", text):
+        return text
+    return text  # gspread fallará con mensaje claro si no es válido
+
+SHEET_ID = sanitize_sheet_id(
     st.secrets.get("SHEET_ID")
     or os.environ.get("SHEET_ID")
     or os.environ.get("PROJECT_SHEET_ID")
@@ -39,8 +59,6 @@ SHEET_TABS = {
     "mlp_sdd":  st.secrets.get("TAB_MLP_SDD", "MLP_SDD"),
     "crowd_e1": st.secrets.get("TAB_CROWD_E1", "Crowd_E1"),
 }
-
-SERVICE_EMAIL = "planificacion@planificacion.iam.gserviceaccount.com"
 
 # -----------------------------------------------------------------------------
 # 1) Utilidades de normalización / coerción
@@ -73,7 +91,7 @@ def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFram
 _NUM_SEP_RE = re.compile(r"[ ,\u00A0]")  # espacio, NBSP, coma
 
 def _maybe_to_numeric(s: pd.Series) -> pd.Series:
-    if s.dtype.kind in "iufc":  # ya numérica
+    if s.dtype.kind in "iufc":
         return s
     sample = s.dropna().astype(str).head(50)
     if sample.empty:
@@ -114,7 +132,7 @@ def show_exception(e: Exception, title: str):
         st.code("".join(traceback.format_exception(None, e, e.__traceback__)))
 
 # -----------------------------------------------------------------------------
-# 2) Google Sheets: cliente + lectura + chequeo de acceso
+# 2) Google Sheets: cliente + lectura + healthcheck
 # -----------------------------------------------------------------------------
 def _get_gspread_client():
     import gspread
@@ -134,7 +152,7 @@ def _get_gspread_client():
 
 @st.cache_data(show_spinner=False, ttl=300)
 def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
-    # NOTA: aquí NO silenciamo errores; si falla, se verá el detalle en UI.
+    sheet_id = sanitize_sheet_id(sheet_id)
     gc = _get_gspread_client()
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
@@ -146,6 +164,7 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     return coerce_numeric_df(df)
 
 def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
+    sheet_id = sanitize_sheet_id(sheet_id)
     out = {"sheet_id": sheet_id or "", "ok": "false", "note": ""}
     try:
         gc = _get_gspread_client()
@@ -158,7 +177,7 @@ def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
     return out
 
 # -----------------------------------------------------------------------------
-# 3) Loaders (normalizan columnas + defaults)
+# 3) Loaders (normalización + defaults)
 # -----------------------------------------------------------------------------
 def load_fcst() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["fcst"])
@@ -339,14 +358,21 @@ st.set_page_config(page_title="Mel-IA — Plan táctico (diario por SVC)", layou
 st.sidebar.markdown("## 🗂️ Proyecto")
 if not SHEET_ID:
     st.sidebar.error("Configura `SHEET_ID` en Secrets/ENV o pégalo aquí abajo.")
-SHEET_ID = st.sidebar.text_input("SHEET_ID (pega el ID si no está en Secrets)", value=SHEET_ID or "", placeholder="1AbCdefGhIJK...")
+
+raw_input = st.sidebar.text_input("SHEET_ID (puede ser URL o ID)", value=SHEET_ID or "", placeholder="pega aquí la URL o el ID del Sheet")
+new_sheet_id = sanitize_sheet_id(raw_input)
+
+if new_sheet_id != SHEET_ID:
+    SHEET_ID = new_sheet_id
+    st.cache_data.clear()
+    st.session_state["sheet_id"] = SHEET_ID
+
 if SHEET_ID:
-    st.sidebar.markdown(f"**Sheet:** `{SHEET_ID}`")
+    st.sidebar.markdown(f"**Sheet (ID):** `{SHEET_ID}`")
 
 st.sidebar.markdown("## 🔐 Credenciales")
 st.sidebar.code(f"Comparte el Sheet con:\n{SERVICE_EMAIL}")
 
-# Healthcheck (muestra problema exacto si no hay acceso)
 with st.sidebar.expander("Estado de conexión", expanded=False):
     try:
         if SHEET_ID:
@@ -363,7 +389,7 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
 st.title("Mel-IA — Plan táctico (diario por SVC)")
 spr_mode = st.radio("SPR objetivo", options=["promedio","peak","plan"], horizontal=True, index=0)
 
-# Inicializa SIEMPRE para evitar NameError
+# Inicializa para evitar NameError
 run_btn = False
 auto_run = False
 sel_svcs: List[str] = []
@@ -415,10 +441,10 @@ except Exception as e:
 
 with st.expander("ℹ️ Notas de esta versión"):
     st.markdown(textwrap.dedent(f"""
-    - **Fallback UI de `SHEET_ID`**: si no está en Secrets/ENV, puedes pegarlo en la barra lateral.
-    - **Estado de conexión** te dice si falta compartir el Sheet con **{SERVICE_EMAIL}** o si el ID es inválido.
-    - Normalización de encabezados (SVC/SVCs/SHP_LG_FACILITY_ID/LOGISTIC_CENTER_ID → SVC), coerción numérica/fechas.
-    - Si un dataset/columna falta, se completa con 0/NaN y la app no se cae.
-    - SPR objetivo: promedio→SPR_PROM, peak→SPR_PEAK, plan→SPR_OBJ; fallback a SPR_OBJ y luego 20.
+    - **Acepta URL o ID** de Google Sheet; extrae el ID automáticamente.
+    - **Estado de conexión** indica si falta compartir el Sheet con **{SERVICE_EMAIL}** o si el ID es inválido.
+    - Normalización de encabezados; coerción numérica/fechas; defaults para evitar caídas.
+    - `SPR objetivo`: promedio→SPR_PROM, peak→SPR_PEAK, plan→SPR_OBJ; fallback a SPR_OBJ y luego 20.
     - Orden: SPR base → Rentals → Crowd base → MLP SDD/Spot → Crowd E1.
     """))
+
