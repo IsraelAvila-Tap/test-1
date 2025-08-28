@@ -288,15 +288,13 @@ def load_capacity_caps() -> pd.DataFrame:
     else:
         df["FECHA"] = hoy
 
+    # Normaliza a minúsculas y asegura tipo texto
     dm_norm     = df["DELIVERY_MODEL"].fillna("").astype(str).str.lower()
     tipo_norm   = df["TIPO"].fillna("").astype(str).str.lower()
     tipodm_norm = df["TIPO_DM"].fillna("").astype(str).str.lower()
 
+    # --- FIX definitivo: solo str.contains ---
     df["IS_RENTALS"]      = dm_norm.str.contains("rent",  regex=False)
-    df["IS_CROWD_ROUTES"] = dm_norm.str.contains("crowd", regex=False) & (
-                                tipo_norm.str_contains("route",  regex=False) if hasattr(tipo_norm, "str") else False
-                            )
-    # usar str.contains también en tipo_norm/tipodm_norm (compat):
     df["IS_CROWD_ROUTES"] = dm_norm.str.contains("crowd", regex=False) & (
                                 tipo_norm.str.contains("route",  regex=False) |
                                 tipodm_norm.str.contains("route", regex=False)
@@ -325,14 +323,12 @@ def load_rentals_fallback() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=target_cols)
 
-    # Mapear alias de SVC; si no queda, devolvemos estructura vacía segura
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", required=False, source_label="Rentals")
     if "SVC" not in df.columns:
         out = pd.DataFrame(columns=target_cols)
         out["FECHA"] = date.today()
         return out
 
-    # Mapear cantidad
     find_and_rename(df, ["Unidades disponibles","Units","Cantidad","Qty","QTY","COUNT"], "CANT", required=False, source_label="Rentals")
     df = ensure_columns(df, {"CANT":0})
     df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
@@ -538,9 +534,10 @@ except Exception as e:
 
 with st.expander("ℹ️ Notas de esta versión"):
     st.markdown(textwrap.dedent("""
-    - Fix Rentals: si no hay `SVC` tras mapear alias, devolvemos DF vacío seguro (sin `groupby`) → elimina `KeyError: 'SVC'`.
-    - Crowd: soporta encabezado doble y devuelve DF seguro si falta `SVC`.
-    - Capacity: usa `str.contains` con normalización y agrega por grupos alineando máscaras.
+    - FIX: eliminadas todas las referencias a `str_contains`; solo se usa `str.contains`.
+    - Rentals seguro: si falta SVC/columnas, devuelve DF vacío sin groupby.
+    - Crowd con encabezado doble y fallback seguro.
+    - Capacity con normalización y agregación por máscaras.
     - Autodetección de encabezado (busca `SVC`) en todas las pestañas.
     - Filtro inicial: SGD1, SMT1, SMX9, SPB1 y auto-run.
     """))
