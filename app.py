@@ -78,6 +78,26 @@ def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFram
             df[c] = v
     return df
 
+def _clean_svc_values(series_like) -> list[str]:
+    """
+    Devuelve una lista de SVCs válidos, eliminando None/nan/'' y
+    cadenas 'none'/'nan' y cosas raras.
+    """
+    import pandas as pd, re
+    if series_like is None:
+        return []
+    s = pd.Series(series_like)
+    # quita nulos reales
+    s = s[~s.isna()]
+    # a str para normalizar
+    s = s.astype(str).str.strip()
+    # quita valores vacíos o 'none'/'nan'
+    s = s[~s.str.lower().isin(["", "none", "nan", "(none)"])]
+    # patrón simple de SVC (alfa-num, guion/guion_bajo)
+    s = s[s.str.match(r"^[A-Za-z0-9_\-]{2,}$", na=False)]
+    return sorted(s.unique().tolist())
+
+
 def _as_str_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     for c in cols:
         if c in df.columns:
