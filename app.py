@@ -828,12 +828,6 @@ def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
         "CAP_TOTAL","CAP_VS_FCST","CAP_DIFF_ABS","RIESGO",
     ]
 
-    # si quedaron columnas auxiliares, las removemos
-    resumen = resumen.drop(
-        columns=["RUTAS_MLP_SDD_CAPACITY","RUTAS_MLP_SPOT_CAPACITY"],
-        errors="ignore"
-    )
-
     cols = [c for c in orden if c in resumen.columns] + [c for c in resumen.columns if c not in orden]
     return resumen[cols]
 
