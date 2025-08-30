@@ -1066,17 +1066,6 @@ with st.expander("▶️ Cargando datos...", expanded=True):
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
 
-# Diagnóstico rápido (opcional)
-try:
-    _srm_df = read_sheet(SHEET_ID, SHEET_TABS["srm"])
-    _cols_preview = list(_srm_df.columns[:12])
-    _rows = len(_srm_df)
-    st.caption("Diagnóstico rápido de lectura (pestaña SRM):")
-    st.write({"filas": _rows, "primeras columnas": _cols_preview})
-except Exception:
-    pass
-
-
 
 if 'auto_run_once' not in st.session_state:
     st.session_state['auto_run_once'] = True
