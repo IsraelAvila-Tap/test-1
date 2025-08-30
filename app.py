@@ -211,7 +211,7 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
         row_can = [_canon_name(c) for c in row]
         return any(c in {"svc", "svcs", "logisticcenterid", "facility", "lc"} for c in row_can)
 
-    # Detecta el índice del encabezado
+    # Detecta índice del encabezado
     header_idx = None
     limit = min(50, len(values))
     for i in range(limit):
@@ -235,7 +235,7 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     if header_idx + 1 < len(values):
         r2 = values[header_idx + 1]
         r2_nonempty = [x for x in r2 if str(x).strip() != ""]
-        # Si r2 es mayormente numérica, es una fila de datos → NO combinar
+        # Si r2 es mayormente numérica, es fila de datos → NO combinar
         def is_num(x: str) -> bool:
             x = str(x).strip().replace(",", "")
             return bool(re.fullmatch(r"-?\d+(\.\d+)?", x))
@@ -256,7 +256,6 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     header = _make_unique_headers(header)
     df = pd.DataFrame(data_rows, columns=header)
     return coerce_numeric_df(df)
-
 
 def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
     out = {"sheet_id": sanitize_sheet_id(sheet_id) or "", "ok": "false", "note": ""}
@@ -673,7 +672,6 @@ def load_mlp_caps_from_srm() -> pd.DataFrame:
 def load_spr_mlp() -> pd.DataFrame:
     """
     SPR_MLP por SVC (mediana). Detecta filas con 'mlp', 'sdd', 'spot', 'back' en DM/Tipo/Vehicle.
-    Fallback: mediana global; si no hay, se usa SPR_USADO.
     """
     spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
     if spr.empty:
@@ -852,25 +850,30 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     # Rutas MLP necesarias totales
     out["RUTAS_MLP_NEEDED"] = np.ceil(out["SHIP_RESTANTES_PRE_MLP"] / out["SPR_MLP"]).astype(int)
 
-    # Asignación por tipo (prioridad: SDD -> SPOT -> BACKLOG)
-    need = out["RUTAS_MLP_NEEDED"]
-    use_sdd  = np.minimum(need, out["MLP_SDD_CAP"])
-    need2    = (need - use_sdd).clip(lower=0)
-    use_spot = np.minimum(need2, out["MLP_SPOT_CAP"])
-    need3    = (need2 - use_spot).clip(lower=0)
-    use_back = np.minimum(need3, out["MLP_BACK_CAP"])
+    # --- Asignación por tipo (prioridad: SDD -> SPOT -> BACKLOG) ---
+    need   = pd.to_numeric(out["RUTAS_MLP_NEEDED"], errors="coerce").fillna(0)
 
-    out["RUTAS_MLP_SDD_USADAS"]    = use_sdd.astype(int)
-    out["RUTAS_MLP_SPOT_USADAS"]   = use_spot.astype(int)
-    out["RUTAS_MLP_BACKLOG_USADAS"]= use_back.astype(int)
+    sddcap  = pd.to_numeric(out.get("MLP_SDD_CAP", 0),  errors="coerce").fillna(0)
+    spotcap = pd.to_numeric(out.get("MLP_SPOT_CAP", 0), errors="coerce").fillna(0)
+    backcap = pd.to_numeric(out.get("MLP_BACK_CAP", 0), errors="coerce").fillna(0)
+
+    use_sdd  = np.minimum(need, sddcap)
+    need2    = (need - use_sdd).clip(lower=0)
+    use_spot = np.minimum(need2, spotcap)
+    need3    = (need2 - use_spot).clip(lower=0)
+    use_back = np.minimum(need3, backcap)
+
+    def _to_int_safe(x):
+        return pd.to_numeric(x, errors="coerce").fillna(0).round(0).astype(int)
+
+    out["RUTAS_MLP_SDD_USADAS"]     = _to_int_safe(use_sdd)
+    out["RUTAS_MLP_SPOT_USADAS"]    = _to_int_safe(use_spot)
+    out["RUTAS_MLP_BACKLOG_USADAS"] = _to_int_safe(use_back)
 
     # Faltantes tras MLP
-    out["RUTAS_RESTANTES"] = (need3 - use_back).clip(lower=0).astype(int)
+    out["RUTAS_RESTANTES"] = _to_int_safe(need3 - use_back).clip(lower=0)
     out["RUTAS_POST_MLP"]  = out["RUTAS_RESTANTES"]  # compat
     out["RUTAS_FALTANTES"] = out["RUTAS_RESTANTES"]
-
-    # Limpiar columnas Capacity de MLP si sólo quieres ver SRM (dejamos para comparar)
-    # out = out.drop(columns=["RUTAS_MLP_SDD","RUTAS_MLP_SPOT"], errors="ignore")
 
     if sel_svcs:
         out = out[out["SVC"].isin(sel_svcs)]
@@ -973,6 +976,3 @@ with st.expander("ℹ️ Notas de esta versión"):
     - **MLP**: lee **SRM** y calcula capacidad SDD/SPOT/Backlog; añade **SPR_MLP** y asigna rutas por tipo
       para cubrir **SHIP_RESTANTES_PRE_MLP** (= FCST − DC − SP − Rentals − Crowd).
     """))
-
-
-
