@@ -291,44 +291,56 @@ def load_capacity_caps() -> pd.DataFrame:
     else:
         df["FECHA"] = hoy
 
-    # Normaliza texto
+    # ------------ Normaliza texto ------------
     dm_norm     = df["DELIVERY_MODEL"].fillna("").astype(str).str.lower()
     tipo_norm   = df["TIPO"].fillna("").astype(str).str.lower()
     tipodm_norm = df["TIPO_DM"].fillna("").astype(str).str.lower()
 
-    # Caps de rutas (como antes)
-    is_rentals      = dm_norm.str.contains("rent",  regex=False)
-    is_crowd_routes = dm_norm.str.contains("crowd", regex=False) & (
-                        tipo_norm.str.contains("route",  regex=False) |
-                        tipodm_norm.astype(str).str.contains("route", case=False, regex=False, na=False)
-                      )
-    is_mlp_spot     = dm_norm.str.contains("mlp",   regex=False) & tipodm_norm.str.contains("spot", regex=False)
-    is_mlp_sdd      = dm_norm.str.contains("mlp",   regex=False) & (~is_mlp_spot) & (
-                        tipodm_norm.str.contains("mlp",  regex=False) |
-                        tipodm_norm.str.contains("sdd",  regex=False) |
-                        (tipodm_norm == "")
-                      )
+    # ------------ Caps de rutas ------------
+    is_rentals = dm_norm.str.contains("rent",  regex=False)
 
-    # ONLY Shipments de DC y SP
+    is_crowd_routes = (
+        dm_norm.str.contains("crowd", regex=False)
+        & (
+            tipo_norm.str.contains("route", regex=False)
+            | tipodm_norm.str.contains("route", case=False, regex=False)
+        )
+    )
+
+    is_mlp_spot = (
+        dm_norm.str.contains("mlp", regex=False)
+        & tipodm_norm.str.contains("spot", regex=False)
+    )
+
+    is_mlp_sdd = (
+        dm_norm.str.contains("mlp", regex=False)
+        & (~is_mlp_spot)
+        & (
+            tipodm_norm.str.contains("mlp", regex=False)
+            | tipodm_norm.str.contains("sdd", regex=False)
+            | (tipodm_norm == "")
+        )
+    )
+
+    # ------------ Shipments DC / SP ------------
     is_shipments = tipo_norm.str.contains("ship", regex=False)
 
     is_dc = (
-    (dm_norm.str.contains("delivery", regex=False) & dm_norm.str.contains("cell", regex=False)) |
-    tipodm_norm.str.contains("delivery cell", regex=False) |
-    tipodm_norm.str.contains(r"^(dc|cell)$", case=False, regex=True)
-)
+        (dm_norm.str.contains("delivery", regex=False) & dm_norm.str.contains("cell", regex=False))
+        | tipodm_norm.str.contains("delivery cell", regex=False)
+        | tipodm_norm.str.contains(r"^(dc|cell)$", case=False, regex=True)
+    )
 
-is_sp = (
-    dm_norm.str.contains(r"^(s\.?p\.?|sp)$", case=False, regex=True) |
-    (dm_norm.str.contains("service", regex=False) & dm_norm.str.contains("partner", regex=False)) |
-    tipodm_norm.str.contains(r"\bsp\b|service partner", case=False, regex=True)
-)
-
-
+    is_sp = (
+        dm_norm.str.contains(r"^(s\.?p\.?|sp)$", case=False, regex=True)
+        | (dm_norm.str.contains("service", regex=False) & dm_norm.str.contains("partner", regex=False))
+        | tipodm_norm.str.contains(r"\bsp\b|service partner", case=False, regex=True)
+    )
 
     is_dc_ship = is_shipments & is_dc
     is_sp_ship = is_shipments & is_sp
 
+    # ------------ Agregación ------------
     g = df.groupby(["FECHA","SVC"])["CANT"]
     agg = pd.DataFrame({
         "RUTAS_MLP_SDD":   g.apply(lambda s: s[is_mlp_sdd.loc[s.index]].sum()),
@@ -340,6 +352,7 @@ is_sp = (
     }).reset_index()
 
     return _finalize(agg, wanted)
+
 
 def load_rentals_fallback() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
