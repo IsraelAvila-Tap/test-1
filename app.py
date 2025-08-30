@@ -2,8 +2,6 @@
 # =============================================================================
 # Mel-IA — Plan táctico (diario por SVC)
 # Tabs: FCST, SPR, Capacity, Rentals, Crowd, SRM (MLP caps).
-# Encabezado autodetectado (busca SVC/SVCs/LC/Facility) + encabezado de 2 filas (Crowd).
-# Robusto ante vacíos/alias y pestañas ausentes.
 # =============================================================================
 import os, json, re, unicodedata, textwrap, traceback
 from datetime import date
@@ -48,7 +46,7 @@ SHEET_TABS = {
     "capacity": "Capacity",
     "rentals":  "Rentals",
     "crowd":    "Crowd",
-    "srm":      "SRM",     # <--- NUEVO (capacidad MLP)
+    "srm":      "SRM",     # MLP caps
 }
 
 # -----------------------------------------------------------------------------
@@ -85,17 +83,15 @@ def _as_str_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df
 
 def _find_units_like_column(df: pd.DataFrame) -> str | None:
-    if df is None or df.empty:
-        return None
+    if df is None or df.empty: return None
     def canon(x: str) -> str:
         return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(x).lower()).encode("ascii","ignore").decode("ascii"))
-    cands = [canon(c) for c in df.columns]
-    real  = list(df.columns)
-    targets = [r"^unidades", r"^units?$", r"^cantidad$", r"^qty$", r"^count$"]
+    real = list(df.columns)
+    cands = [canon(c) for c in real]
+    pats = [r"^unidades", r"^units?$", r"^cantidad$", r"^qty$", r"^count$"]
     for i, can in enumerate(cands):
-        for pat in targets:
-            if re.search(pat, can):
-                return real[i]
+        for pat in pats:
+            if re.search(pat, can): return real[i]
     return None
 
 _NUM_SEP_RE = re.compile(r"[ ,\u00A0]")
@@ -148,7 +144,7 @@ def show_exception(e: Exception, title: str):
         st.code("".join(traceback.format_exception(None, e, e.__traceback__)))
 
 # -----------------------------------------------------------------------------
-# 2) Header único + 2 filas + AUTODETECCIÓN
+# 2) Header único + 2 filas + autodetección
 # -----------------------------------------------------------------------------
 def _make_unique_headers(headers):
     clean = [(h or "").strip() for h in headers]
@@ -179,7 +175,7 @@ def _looks_group_header(row_lower: List[str]) -> bool:
     return hits >= max(2, len(row_lower)//6)
 
 # -----------------------------------------------------------------------------
-# 3) Carga desde Google Sheets con header autodetectado
+# 3) Lectura de Google Sheets
 # -----------------------------------------------------------------------------
 def _get_gspread_client():
     import gspread
@@ -208,8 +204,8 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
 
     def _is_header_row(row: list[str]) -> bool:
         row_can = [_canon_name(c) for c in row]
-        header_keys = {"svc", "svcs", "logisticcenterid", "facility", "lc"}
-        return any(c in header_keys for c in row_can)
+        keys = {"svc", "svcs", "logisticcenterid", "facility", "lc"}
+        return any(c in keys for c in row_can)
 
     header_idx = None
     limit = min(50, len(values))
@@ -219,12 +215,9 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
             break
     if header_idx is None:
         for i in range(limit):
-            nonempty = sum(1 for x in values[i] if x.strip())
-            if nonempty >= 2:
-                header_idx = i
-                break
-    if header_idx is None:
-        header_idx = 0
+            if sum(1 for x in values[i] if x.strip()) >= 2:
+                header_idx = i; break
+    if header_idx is None: header_idx = 0
 
     r1 = values[header_idx]
     r1_lower = [c.strip().lower() for c in r1]
@@ -260,7 +253,7 @@ def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
     return out
 
 # -----------------------------------------------------------------------------
-# 4) Loaders
+# 4) Loaders de cada pestaña
 # -----------------------------------------------------------------------------
 def _finalize(df: pd.DataFrame, wanted: List[str]) -> pd.DataFrame:
     df = ensure_columns(df, {"FECHA": pd.NaT, "SVC": None})
@@ -297,7 +290,7 @@ def load_spr() -> pd.DataFrame:
     out["FECHA"] = date.today()
     return _finalize(out, ["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"])
 
-# ---- Rentals (homologación + SPR histórico ponderado) ----
+# ---- Rentals: homologación + SPR ponderado ----
 def _norm_txt(x: str) -> str:
     x = (x or "").strip().lower()
     rep = {"eléctrica":"electric","eléctrico":"electric","electrica":"electric","electrico":"electric"}
@@ -338,8 +331,7 @@ def load_spr_hist_from_sheet() -> pd.DataFrame:
     out["SVC"] = out["SVC"].fillna("__GLOBAL__")
     out["SPR_HIST"] = out["SPR_HIST"].fillna(out["SPR_GLOBAL_TIPO"])
     out = out.drop(columns=["SPR_GLOBAL_TIPO"])
-    out = _as_str_cols(out, ["SVC","VEHICULO_TIPO_HOM"])
-    return out
+    return _as_str_cols(out, ["SVC","VEHICULO_TIPO_HOM"])
 
 def load_rentals_caps_from_sheet() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
@@ -350,7 +342,6 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
     find_and_rename(df, ["Tipo de vehiculo","Tipo de vehículo","Vehicle type","Tipo"], "TIPO_VEHICULO", False, "Rentals")
     df = ensure_columns(df, {"SVC": None, "TIPO_VEHICULO":"", })
 
-    # Columna UNIDADES (exactos + fuzzy)
     units_col = None
     for keys in [["Unidades","Unidades dispon","Unidades disponibles"],
                  ["Units","Cantidad","Qty","QTY","COUNT"]]:
@@ -393,7 +384,7 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
     out = rentals_sum.merge(spr_r[["SVC","SPR_RENTALS"]], on="SVC", how="left")
     out = _as_str_cols(out, ["SVC"])
 
-    # Rellena con fallback simple por SVC si existiera
+    # fallback simple
     rents_fb = load_rentals_fallback()
     if not rents_fb.empty:
         rents_fb = _as_str_cols(rents_fb, ["SVC"])
@@ -409,21 +400,17 @@ def load_rentals_fallback() -> pd.DataFrame:
     target_cols = ["FECHA","SVC","RUTAS_RENTALS"]
     if df.empty:
         return pd.DataFrame(columns=target_cols)
-
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", required=False, source_label="Rentals")
     if "SVC" not in df.columns:
-        out = pd.DataFrame(columns=target_cols)
-        out["FECHA"] = date.today()
-        return out
-
+        out = pd.DataFrame(columns=target_cols); out["FECHA"] = date.today(); return out
     find_and_rename(df, ["Unidades disponibles","Unidades dispon","Units","Cantidad","Qty","QTY","COUNT"], "CANT", required=False, source_label="Rentals")
     df = ensure_columns(df, {"CANT":0})
     df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
-
     out = df.groupby("SVC", as_index=False)["CANT"].sum().rename(columns={"CANT":"RUTAS_RENTALS"})
     out["FECHA"] = date.today()
     return _finalize(out, target_cols)
 
+# ---- Crowd (cap E1) y Crowd% desde Capacity + SPR_CROWD ----
 def load_crowd_caps() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
     if df.empty:
@@ -455,7 +442,6 @@ def load_crowd_caps() -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
     df["CROWD_E1_CAP"] = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
-
     if "SVC" not in df.columns:
         return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1_CAP"])
 
@@ -467,7 +453,6 @@ def load_crowd_pct_from_capacity() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
     if df.empty:
         return pd.DataFrame(columns=["SVC", "CROWD_PCT"])
-
     find_and_rename(df, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "Capacity")
     find_and_rename(df, ["Tipo","Type","Category"], "TIPO", False, "Capacity")
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Capacity")
@@ -478,36 +463,27 @@ def load_crowd_pct_from_capacity() -> pd.DataFrame:
     df = ensure_columns(df, {"DELIVERY_MODEL":"", "TIPO":"", "TIPO_DM":"", "SVC":None, "FECHA": pd.NaT, "CANT":0})
     df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
     df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
-    _as_str_cols(df, ["SVC", "DELIVERY_MODEL", "TIPO", "TIPO_DM"])  # <- asegura str
+    df = _as_str_cols(df, ["SVC"])
 
-    # toma último día por SVC si hay fechas
     if df["FECHA"].notna().any():
         last_by_svc = df.groupby("SVC")["FECHA"].transform("max")
         df = df[df["FECHA"] == last_by_svc]
 
-    # normaliza textos
-    dm     = df["DELIVERY_MODEL"].fillna("").astype(str)
-    tipo   = df["TIPO"].fillna("").astype(str)
-    tipodm = df["TIPO_DM"].fillna("").astype(str)
+    tipo   = df["TIPO"].astype(str).str.lower()
+    dm     = df["DELIVERY_MODEL"].astype(str).str.lower()
+    tipodm = df["TIPO_DM"].astype(str).str.lower()
 
-    is_shipments = tipo.str.contains("ship", case=False, regex=False)
-    is_crowd = (
-        dm.str.contains("crowd", case=False, regex=False) |
-        tipodm.str.contains("crowd", case=False, regex=False) |
-        tipo.str.contains("crowd", case=False, regex=False)
-    )
-    is_crowd = is_shipments & is_crowd
+    is_shipments = tipo.str.contains("ship", regex=False)
+    is_crowd = is_shipments & (dm.str.contains("crowd", regex=False) | tipodm.str.contains("crowd", regex=False) | tipo.str.contains("crowd", regex=False))
 
     tot = df[is_shipments].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_TOT")
     crd = df[is_crowd].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_CROWD")
-
     out = pd.concat([tot, crd], axis=1).reset_index()
-    _as_str_cols(out, ["SVC"])
+    out = _as_str_cols(out, ["SVC"])
     out["SHIP_TOT"]   = pd.to_numeric(out["SHIP_TOT"], errors="coerce").fillna(0)
     out["SHIP_CROWD"] = pd.to_numeric(out["SHIP_CROWD"], errors="coerce").fillna(0)
     out["CROWD_PCT"]  = (out["SHIP_CROWD"] / out["SHIP_TOT"]).replace([np.inf,-np.inf], 0).fillna(0)
     return out[["SVC", "CROWD_PCT"]]
-
 
 def load_spr_crowd() -> pd.DataFrame:
     spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
@@ -604,136 +580,95 @@ def load_capacity_caps() -> pd.DataFrame:
 
     return _finalize(agg, wanted)
 
-# ---- NUEVO: MLP caps desde SRM (SDD/SPOT/BACKLOG) — SIN “TOTAL” y con desglose por tipo ----
+# ---- MLP desde SRM (por tipo de vehículo) ----
 def load_mlp_caps_from_srm() -> pd.DataFrame:
     """
-    Capacidad MLP por SVC leyendo la pestaña SRM, desglosada por tipo:
-      - SDD:  MLP_SDD_LV, MLP_SDD_SV, MLP_SDD_CAR  + MLP_SDD_CAP (suma)
-      - SPOT: MLP_SPOT_LV, MLP_SPOT_SV, MLP_SPOT_CAR + MLP_SPOT_CAP (suma)
-      - BACKLOG/BU/Back Up: MLP_BACK_CAP
-    Se ignoran columnas 'total' para no contar doble.
+    Lee SRM y calcula:
+      - SDD por tipo: MLP_SDD_LV / SV / CAR
+      - SPOT por tipo: MLP_SPOT_LV / SV / CAR (excluye cualquier columna 'total' y Back/BU)
+      - Backlog total: MLP_BACK_CAP (cualquier columna con 'back','backlog' o 'bu')
+    Además devuelve los totales: MLP_SDD_CAP y MLP_SPOT_CAP (sumas de tipos).
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["srm"])
     if df.empty:
         return pd.DataFrame(columns=[
-            "SVC",
-            "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
+            "SVC","MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
             "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
             "MLP_BACK_CAP"
         ])
 
-    # Normaliza SVC
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SRM")
     df = _as_str_cols(df, ["SVC"])
     if "SVC" not in df.columns:
         return pd.DataFrame(columns=[
-            "SVC",
-            "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
+            "SVC","MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
             "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
             "MLP_BACK_CAP"
         ])
 
-    # Canonicaliza nombres de columnas (sin espacios/acentos, en minúsculas)
     canon = {c: _canon_name(c) for c in df.columns}
-
     def is_not_svc(cc: str) -> bool:
-        return cc not in ("svc", "svcs", "logisticcenterid", "facility", "lc")
+        return cc not in ("svc","svcs","logisticcenterid","facility","lc")
 
-    # Helpers de matching
-    def has(cc: str, token: str) -> bool:
-        return token in cc
+    # helpers de detección
+    def _is_sdd(cc):  return ("sdd" in cc) and is_not_svc(cc)
+    def _is_spot(cc): return ("spot" in cc) and is_not_svc(cc)
+    def _is_back(cc): return any(k in cc for k in ("back","backlog","bu")) and is_not_svc(cc)
+    def _is_total(cc):return "total" in cc
 
-    def has_any(cc: str, tokens: list[str]) -> bool:
-        return any(t in cc for t in tokens)
+    def _is_lv(cc):  return ("largevan" in cc) or re.search(r"\blv\b", cc or "") is not None
+    def _is_sv(cc):  return ("smallvan" in cc) or re.search(r"\bsv\b", cc or "") is not None
+    def _is_car(cc): return "car" in cc
 
-    def pick_cols(type_tokens: list[str], family_tokens: list[str], exclude_tokens: list[str]) -> list[str]:
-        """
-        Selecciona columnas cuyo nombre canónico:
-          - contenga TODOS los 'family_tokens' (p.ej. ['sdd'] o ['spot'])
-          - contenga ALGUNO de los 'type_tokens' (p.ej. ['large','lv','xlv'])
-          - NO contenga ninguno de 'exclude_tokens' (p.ej. ['total','bu','back','backlog'])
-        """
-        selected = []
-        for col, cc in canon.items():
-            if not is_not_svc(cc):
-                continue
-            if all(has(cc, ft) for ft in family_tokens) \
-               and has_any(cc, type_tokens) \
-               and not has_any(cc, exclude_tokens):
-                selected.append(col)
-        return selected
+    sdd_lv  = [c for c,cc in canon.items() if _is_sdd(cc)  and _is_lv(cc) and not _is_total(cc)]
+    sdd_sv  = [c for c,cc in canon.items() if _is_sdd(cc)  and _is_sv(cc) and not _is_total(cc)]
+    sdd_car = [c for c,cc in canon.items() if _is_sdd(cc)  and _is_car(cc) and not _is_total(cc)]
 
-    def pick_cols_any(family_tokens: list[str], include_any: list[str], exclude_tokens: list[str]) -> list[str]:
-        """Para backlog: que tenga familia (spot) y alguno de ['bu','back','backup','backlog']"""
-        selected = []
-        for col, cc in canon.items():
-            if not is_not_svc(cc):
-                continue
-            if all(has(cc, ft) for ft in family_tokens) \
-               and has_any(cc, include_any) \
-               and not has_any(cc, exclude_tokens):
-                selected.append(col)
-        return selected
+    spot_lv  = [c for c,cc in canon.items() if _is_spot(cc) and _is_lv(cc) and not _is_total(cc) and not _is_back(cc)]
+    spot_sv  = [c for c,cc in canon.items() if _is_spot(cc) and _is_sv(cc) and not _is_total(cc) and not _is_back(cc)]
+    spot_car = [c for c,cc in canon.items() if _is_spot(cc) and _is_car(cc) and not _is_total(cc) and not _is_back(cc)]
 
-    # Tokens de tipo de vehículo (aceptamos variantes)
-    LV = ["largevan", "large", "lv", "xlarge", "xlv", "heavybulky", "hb"]  # 'LV H&B', 'XLV' => LV
-    SV = ["smallvan", "small", "sv"]
-    CAR = ["car", "auto"]
+    back_cols = [c for c,cc in canon.items() if _is_back(cc)]
 
-    # Familias y exclusiones
-    EXC_TOTAL = ["total"]
-    EXC_BACK  = ["bu", "backup", "back", "backlog"]  # para separar SPOT normal
-    BACK_ANY  = ["bu", "backup", "back", "backlog"]
-
-    # Columnas por familia/tipo
-    sdd_lv_cols  = pick_cols(LV,  ["sdd"], EXC_TOTAL + [])                 # “...sdd...” y LV; no 'total'
-    sdd_sv_cols  = pick_cols(SV,  ["sdd"], EXC_TOTAL + [])
-    sdd_car_cols = pick_cols(CAR, ["sdd"], EXC_TOTAL + [])
-
-    spot_lv_cols  = pick_cols(LV,  ["spot"], EXC_TOTAL + EXC_BACK)         # “...spot...” y LV; no 'total' ni backlog
-    spot_sv_cols  = pick_cols(SV,  ["spot"], EXC_TOTAL + EXC_BACK)
-    spot_car_cols = pick_cols(CAR, ["spot"], EXC_TOTAL + EXC_BACK)
-
-    back_cols     = pick_cols_any(["spot"], BACK_ANY, EXC_TOTAL)           # backlog/BU/Back Up
-
-    # Asegura numérico
-    for c in set(sdd_lv_cols + sdd_sv_cols + sdd_car_cols +
-                 spot_lv_cols + spot_sv_cols + spot_car_cols +
-                 back_cols):
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    # coerción numérica
+    for c in set(sdd_lv+sdd_sv+sdd_car+spot_lv+spot_sv+spot_car+back_cols):
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
     grp = df.groupby("SVC", dropna=False)
+    idx = grp.size().index
 
     def sum_cols(cols: list[str]) -> pd.Series:
-        if not cols:
-            return grp.size().mul(0)  # serie de 0s indexada por SVC
-        # sumar por columna y luego por fila
+        if not cols: return pd.Series(0, index=idx, dtype="float64")
         return grp[cols].sum().sum(axis=1)
 
-    out = pd.DataFrame({"SVC": grp.size().index}).reset_index(drop=True)
+    sdd_lv_s  = sum_cols(sdd_lv).rename("MLP_SDD_LV")
+    sdd_sv_s  = sum_cols(sdd_sv).rename("MLP_SDD_SV")
+    sdd_car_s = sum_cols(sdd_car).rename("MLP_SDD_CAR")
+    spot_lv_s  = sum_cols(spot_lv).rename("MLP_SPOT_LV")
+    spot_sv_s  = sum_cols(spot_sv).rename("MLP_SPOT_SV")
+    spot_car_s = sum_cols(spot_car).rename("MLP_SPOT_CAR")
+    back_s     = sum_cols(back_cols).rename("MLP_BACK_CAP")
 
-    out["MLP_SDD_LV"]   = sum_cols(sdd_lv_cols).values
-    out["MLP_SDD_SV"]   = sum_cols(sdd_sv_cols).values
-    out["MLP_SDD_CAR"]  = sum_cols(sdd_car_cols).values
-    out["MLP_SDD_CAP"]  = (out["MLP_SDD_LV"] + out["MLP_SDD_SV"] + out["MLP_SDD_CAR"]).astype(int)
+    out = (sdd_lv_s.reset_index()
+           .merge(sdd_sv_s.reset_index(), on="SVC", how="outer")
+           .merge(sdd_car_s.reset_index(), on="SVC", how="outer")
+           .merge(spot_lv_s.reset_index(), on="SVC", how="outer")
+           .merge(spot_sv_s.reset_index(), on="SVC", how="outer")
+           .merge(spot_car_s.reset_index(), on="SVC", how="outer")
+           .merge(back_s.reset_index(), on="SVC", how="outer")
+          ).fillna(0)
 
-    out["MLP_SPOT_LV"]  = sum_cols(spot_lv_cols).values
-    out["MLP_SPOT_SV"]  = sum_cols(spot_sv_cols).values
-    out["MLP_SPOT_CAR"] = sum_cols(spot_car_cols).values
+    out["MLP_SDD_CAP"]  = (out["MLP_SDD_LV"]  + out["MLP_SDD_SV"]  + out["MLP_SDD_CAR"]).astype(int)
     out["MLP_SPOT_CAP"] = (out["MLP_SPOT_LV"] + out["MLP_SPOT_SV"] + out["MLP_SPOT_CAR"]).astype(int)
 
-    out["MLP_BACK_CAP"] = sum_cols(back_cols).astype(int).values
+    for c in ["MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_BACK_CAP"]:
+        out[c] = out[c].round(0).astype(int)
 
-    # Tipos finales
-    for c in ["MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR",
-              "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR",
-              "MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).round(0).astype(int)
+    cols = ["SVC","MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
+            "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
+            "MLP_BACK_CAP"]
+    return out[cols]
 
-    return out
-
-
-# ---- NUEVO: SPR de MLP ----
 def load_spr_mlp() -> pd.DataFrame:
     spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
     if spr.empty:
@@ -748,11 +683,9 @@ def load_spr_mlp() -> pd.DataFrame:
     spr["SPR"] = pd.to_numeric(spr["SPR"], errors="coerce")
     spr = _as_str_cols(spr, ["SVC","DELIVERY_MODEL","TIPO","VEH_TYPE"])
 
-    is_mlp = (
-        spr["DELIVERY_MODEL"].str.lower().str.contains("mlp|sdd|spot|back", regex=True)
-        | spr["TIPO"].str.lower().str.contains("mlp|sdd|spot|back", regex=True)
-        | spr["VEH_TYPE"].str.lower().str.contains("mlp|sdd|spot|back", regex=True)
-    )
+    is_mlp = (spr["DELIVERY_MODEL"].str.lower().str.contains("mlp|sdd|spot|back", regex=True)
+              | spr["TIPO"].str.lower().str.contains("mlp|sdd|spot|back", regex=True)
+              | spr["VEH_TYPE"].str.lower().str.contains("mlp|sdd|spot|back", regex=True))
     mlp_rows = spr[is_mlp]
     if mlp_rows.empty:
         return pd.DataFrame(columns=["SVC","SPR_MLP"])
@@ -771,18 +704,16 @@ def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
         "FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)","DEMANDA_AJUSTADA",
         "SPR_USADO","RUTAS_SPR_BASE",
         "RUTAS_RENTALS","SPR_RENTALS",
-        # Crowd objetivo
-        "CROWD_PCT","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
-        "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO",
-        # Resultado pre-MLP
+        "CROWD_PCT","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ","RUTAS_CROWD_CAP","RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO",
         "SHIP_RENTALS","SHIP_CROWD","SHIP_RESTANTES_PRE_MLP",
-        # MLP
         "SPR_MLP",
+        # Capacidades MLP por tipo y totales
         "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
         "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
         "MLP_BACK_CAP",
+        # Asignación de rutas MLP
         "RUTAS_MLP_NEEDED","RUTAS_MLP_SDD_USADAS","RUTAS_MLP_SPOT_USADAS","RUTAS_MLP_BACKLOG_USADAS",
-        # MLP legado/capacidad de Capacity si se desea comparar
+        # Comparativo legacy
         "RUTAS_MLP_SDD","RUTAS_MLP_SPOT",
         # E1/MLP y faltantes
         "CROWD_E1_CAP","RUTAS_CROWDE1_USADAS",
@@ -798,32 +729,25 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     crowdc   = load_crowd_caps()
     rents    = load_rentals_caps_from_sheet()
     rents_fb = load_rentals_fallback()
-    crowd_pct = load_crowd_pct_from_capacity()
-    spr_crowd = load_spr_crowd()
-    mlp_caps  = load_mlp_caps_from_srm()
-    spr_mlp   = load_spr_mlp()
+    crowd_pct= load_crowd_pct_from_capacity()
+    spr_crowd= load_spr_crowd()
+    mlp_caps = load_mlp_caps_from_srm()
+    spr_mlp  = load_spr_mlp()
 
     for d in (fcst, spr, caps, crowdc, rents, rents_fb, crowd_pct, spr_crowd, mlp_caps, spr_mlp):
-        if not d.empty and "SVC" in d.columns:
-            _as_str_cols(d, ["SVC"])
+        if not d.empty and "SVC" in d.columns: _as_str_cols(d, ["SVC"])
 
     hoy = date.today()
-
     bases = []
     for d in [fcst, spr, caps, crowdc, rents, rents_fb, crowd_pct, mlp_caps]:
-        if "SVC" in d.columns and not d.empty:
-            bases.append(d[["SVC"]])
+        if "SVC" in d.columns and not d.empty: bases.append(d[["SVC"]])
     base = pd.concat(bases, axis=0).drop_duplicates() if bases else pd.DataFrame(columns=["SVC"])
     base = _as_str_cols(base, ["SVC"])
 
-    out = base.copy()
-    out["FECHA"] = hoy
-    out = _as_str_cols(out, ["SVC"])
+    out = base.copy(); out["FECHA"] = hoy; out = _as_str_cols(out, ["SVC"])
 
-    if not fcst.empty:
-        out = safe_merge(out, fcst[["SVC","FCST"]], ["SVC"])
-    if not spr.empty:
-        out = safe_merge(out, spr[["SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"]], ["SVC"])
+    if not fcst.empty: out = safe_merge(out, fcst[["SVC","FCST"]], ["SVC"])
+    if not spr.empty:  out = safe_merge(out, spr[["SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"]], ["SVC"])
 
     spr_mode_col = {"promedio":"SPR_PROM", "peak":"SPR_PEAK", "plan":"SPR_OBJ"}.get(spr_mode, "SPR_PROM")
     out = ensure_columns(out, {"SPR_OBJ":np.nan, "SPR_PEAK":np.nan, "SPR_PROM":np.nan})
@@ -835,37 +759,30 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     else:
         out = ensure_columns(out, {"RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0, "RUTAS_CROWD_CAP":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
 
-    # Rentals: sobrescribir lo que vino de Capacity
+    # Rentals override
     out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
     if not rents.empty:
         out = safe_merge(out, rents[["SVC","RUTAS_RENTALS","SPR_RENTALS"]], ["SVC"])
     elif not rents_fb.empty:
-        out = safe_merge(out, rents_fb[["SVC","RUTAS_RENTALS"]], ["SVC"])
-        out["SPR_RENTALS"] = np.nan
+        out = safe_merge(out, rents_fb[["SVC","RUTAS_RENTALS"]], ["SVC"]); out["SPR_RENTALS"] = np.nan
     else:
-        out["RUTAS_RENTALS"] = 0
-        out["SPR_RENTALS"]   = np.nan
+        out["RUTAS_RENTALS"] = 0; out["SPR_RENTALS"] = np.nan
     out["RUTAS_RENTALS"] = pd.to_numeric(out.get("RUTAS_RENTALS", 0), errors="coerce").fillna(0).astype(int)
     out["SPR_RENTALS"]   = pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce")
     out["SPR_RENTALS"]   = out["SPR_RENTALS"].fillna(out["SPR_USADO"])
 
-    # CROWD
-    if not crowdc.empty:
-        out = safe_merge(out, crowdc[["SVC","CROWD_E1_CAP"]], ["SVC"])
+    # Crowd
+    if not crowdc.empty: out = safe_merge(out, crowdc[["SVC","CROWD_E1_CAP"]], ["SVC"])
     out = ensure_columns(out, {"CROWD_E1_CAP":0})
 
-    if not crowd_pct.empty:
-        out = safe_merge(out, crowd_pct, ["SVC"])
-    else:
-        out["CROWD_PCT"] = 0.0
+    if not crowd_pct.empty: out = safe_merge(out, crowd_pct, ["SVC"])
+    else: out["CROWD_PCT"] = 0.0
 
-    if not spr_crowd.empty:
-        out = safe_merge(out, spr_crowd, ["SVC"])
-    out["SPR_CROWD"] = pd.to_numeric(out.get("SPR_CROWD", np.nan), errors="coerce")
-    out["SPR_CROWD"] = out["SPR_CROWD"].fillna(out["SPR_USADO"]).clip(lower=1)
+    if not spr_crowd.empty: out = safe_merge(out, spr_crowd, ["SVC"])
+    out["SPR_CROWD"] = pd.to_numeric(out.get("SPR_CROWD", np.nan), errors="coerce").fillna(out["SPR_USADO"]).clip(lower=1)
     out["CROWD_PCT"] = pd.to_numeric(out.get("CROWD_PCT", 0), errors="coerce").fillna(0).clip(0,1)
 
-    # FCST (sin DC & sin SP) y DEMANDA_AJUSTADA
+    # FCST ajustado
     out = ensure_columns(out, {"FCST":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
     out["FCST (sin DC & sin SP)"] = (
         pd.to_numeric(out["FCST"], errors="coerce").fillna(0)
@@ -899,29 +816,23 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     base_otros = pd.to_numeric(out["SHIPMENTS_DC"], errors="coerce").fillna(0) + pd.to_numeric(out["SHIPMENTS_SP"], errors="coerce").fillna(0)
     out["SHIP_RESTANTES_PRE_MLP"] = (pd.to_numeric(out["FCST"], errors="coerce").fillna(0) - base_otros - out["SHIP_RENTALS"] - out["SHIP_CROWD"]).clip(lower=0)
 
-    # MLP: capacidades (SRM) y SPR_MLP
-    if not mlp_caps.empty:
-        out = safe_merge(out, mlp_caps, ["SVC"])
-    else:
-        out = ensure_columns(out, {
-            "MLP_SDD_LV":0,"MLP_SDD_SV":0,"MLP_SDD_CAR":0,"MLP_SDD_CAP":0,
-            "MLP_SPOT_LV":0,"MLP_SPOT_SV":0,"MLP_SPOT_CAR":0,"MLP_SPOT_CAP":0,
-            "MLP_BACK_CAP":0
-        })
+    # MLP caps y SPR_MLP
+    if not mlp_caps.empty: out = safe_merge(out, mlp_caps, ["SVC"])
+    else: out = ensure_columns(out, {"MLP_SDD_LV":0,"MLP_SDD_SV":0,"MLP_SDD_CAR":0,"MLP_SDD_CAP":0,"MLP_SPOT_LV":0,"MLP_SPOT_SV":0,"MLP_SPOT_CAR":0,"MLP_SPOT_CAP":0,"MLP_BACK_CAP":0})
 
-    if not spr_mlp.empty:
-        out = safe_merge(out, spr_mlp, ["SVC"])
-    out["SPR_MLP"] = pd.to_numeric(out.get("SPR_MLP", np.nan), errors="coerce")
-    out["SPR_MLP"] = out["SPR_MLP"].fillna(out["SPR_USADO"]).clip(lower=1)
+    if not spr_mlp.empty: out = safe_merge(out, spr_mlp, ["SVC"])
+    out["SPR_MLP"] = pd.to_numeric(out.get("SPR_MLP", np.nan), errors="coerce").fillna(out["SPR_USADO"]).clip(lower=1)
 
+    # Rutas MLP necesarias totales
     out["RUTAS_MLP_NEEDED"] = np.ceil(out["SHIP_RESTANTES_PRE_MLP"] / out["SPR_MLP"]).astype(int)
 
-    need = out["RUTAS_MLP_NEEDED"]
-    use_sdd  = np.minimum(need, out["MLP_SDD_CAP"])
+    # Asignación (prioridad SDD -> SPOT -> BACKLOG)
+    need  = out["RUTAS_MLP_NEEDED"]
+    use_sdd  = np.minimum(need, out.get("MLP_SDD_CAP", 0))
     need2    = (need - use_sdd).clip(lower=0)
-    use_spot = np.minimum(need2, out["MLP_SPOT_CAP"])
+    use_spot = np.minimum(need2, out.get("MLP_SPOT_CAP", 0))
     need3    = (need2 - use_spot).clip(lower=0)
-    use_back = np.minimum(need3, out["MLP_BACK_CAP"])
+    use_back = np.minimum(need3, out.get("MLP_BACK_CAP", 0))
 
     out["RUTAS_MLP_SDD_USADAS"]     = use_sdd.astype(int)
     out["RUTAS_MLP_SPOT_USADAS"]    = use_spot.astype(int)
@@ -931,8 +842,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     out["RUTAS_POST_MLP"]  = out["RUTAS_RESTANTES"]
     out["RUTAS_FALTANTES"] = out["RUTAS_RESTANTES"]
 
-    if sel_svcs:
-        out = out[out["SVC"].isin(sel_svcs)]
+    if sel_svcs: out = out[out["SVC"].isin(sel_svcs)]
 
     out = apply_output_adjustments(out).fillna(0).sort_values("SVC").reset_index(drop=True)
     return out
@@ -1027,8 +937,11 @@ except Exception as e:
 
 with st.expander("ℹ️ Notas de esta versión"):
     st.markdown(textwrap.dedent("""
-    - Rentals desde **Rentals** (fuzzy en “Unidades dispon…”) con **SPR_RENTALS** ponderado; siempre se usa 100% antes de Crowd/MLP.
+    - Rentals desde **Rentals** con **SPR_RENTALS** ponderado; se usa 100% antes de Crowd/MLP.
     - Crowd por % de **Capacity**: **CROWD_PCT**, **SHIP_OBJ_CROWD**, **SPR_CROWD**, base y escalado (E1).
-    - **MLP** (SRM): se ignoran columnas **Total** y se suma por tipo de vehículo (**Large/Small/Car**) para **SDD** y **SPOT**.
-      Se muestran columnas de desglose y se asignan rutas por prioridad **SDD → SPOT → Backlog**.
+    - **MLP** desde **SRM**:
+        - Sumo **solo por tipo** (LV / SV / Car) y **excluyo** columnas “Total …” en SDD/SPOT.
+        - **Backlog** = columnas con `back|backlog|bu`.
+        - Asigno rutas con prioridad **SDD → SPOT → Backlog**.
     """))
+
