@@ -628,15 +628,25 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     else:
         out = ensure_columns(out, {"RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0, "RUTAS_CROWD_CAP":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
 
-    # Rentals desde pestaña Rentals (con SPR_RENTALS ponderado). Si vacío, usa fallback simple.
+       # Rentals desde pestaña Rentals (con SPR_RENTALS ponderado). Si vacío, usa fallback simple.
+    # IMPORTANTE: SIEMPRE eliminar la columna que vino de Capacity para no "heredar" valores.
+    out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
+
     if not rents.empty:
-        out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
         out = safe_merge(out, rents[["SVC","RUTAS_RENTALS","SPR_RENTALS"]], ["SVC"])
     elif not rents_fb.empty:
-        out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
         out = safe_merge(out, rents_fb[["SVC","RUTAS_RENTALS"]], ["SVC"])
         out["SPR_RENTALS"] = np.nan
-    out = ensure_columns(out, {"RUTAS_RENTALS":0})
+    else:
+        # Si Rentals y fallback están vacíos, crear la columna en 0
+        out["RUTAS_RENTALS"] = 0
+        out["SPR_RENTALS"] = np.nan
+
+    # Normaliza tipos y fallback para SPR_RENTALS
+    out["RUTAS_RENTALS"] = pd.to_numeric(out.get("RUTAS_RENTALS", 0), errors="coerce").fillna(0).astype(int)
+    out["SPR_RENTALS"]   = pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce")
+    out["SPR_RENTALS"]   = out["SPR_RENTALS"].fillna(out["SPR_USADO"])
+
 
     # Fallback para SPR_RENTALS si quedó NaN: usar SPR_USADO
     out["SPR_RENTALS"] = pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce")
