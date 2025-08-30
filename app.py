@@ -143,6 +143,27 @@ def show_exception(e: Exception, title: str):
     with st.expander(f"⚠️ {title}", expanded=False):
         st.code("".join(traceback.format_exception(None, e, e.__traceback__)))
 
+def _clean_svc_values(series_like) -> list[str]:
+    """
+    Devuelve una lista de SVCs válidos, eliminando None/nan/'' y
+    cadenas 'none'/'nan' y cosas raras.
+    """
+    import pandas as pd, numpy as np, re
+    if series_like is None:
+        return []
+    s = pd.Series(series_like)
+    # quita nulos reales
+    s = s[~s.isna()]
+    # a str para normalizar
+    s = s.astype(str).str.strip()
+    # quita valores vacíos o 'none'/'nan'
+    s = s[~s.str.lower().isin(["", "none", "nan", "(none)"])]
+    # opcional: aplica un patrón simple de SVC (alfa-num, guion/guion_bajo)
+    pat = re.compile(r"^[A-Za-z0-9_\-]{2,}$")
+    s = s[s.apply(lambda x: bool(pat.match(x)))]
+    return sorted(s.unique().tolist())
+
+
 # -----------------------------------------------------------------------------
 # 2) Header único + 2 filas + autodetección
 # -----------------------------------------------------------------------------
@@ -994,26 +1015,37 @@ auto_run = False
 sel_svcs: List[str] = []
 
 with st.expander("▶️ Cargando datos...", expanded=True):
-    try:
+        try:
         if not SHEET_ID:
             st.warning("Falta `SHEET_ID`. Pégalo en la barra lateral.")
             svc_list = []
         else:
             fcst_svcs    = load_fcst()[["SVC"]]
             caps         = load_capacity_caps()
-            cap_svcs     = caps[["SVC"]] if "SVC" in caps.columns else caps.to_frame(name="SVC")
+            cap_svcs     = caps[["SVC"]] if "SVC" in caps.columns else pd.DataFrame(columns=["SVC"])
             crowd_svcs   = load_crowd_caps()[["SVC"]]
             rents_svcs   = load_rentals_caps_from_sheet()[["SVC"]]
             rent_fb_svcs = load_rentals_fallback()[["SVC"]]
             mlp_svcs     = load_mlp_caps_from_srm()[["SVC"]]
-            base_svcs = pd.concat([fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs, mlp_svcs], axis=0).drop_duplicates()
-            base_svcs = _as_str_cols(base_svcs, ["SVC"])
-            svc_list = sorted(base_svcs["SVC"].dropna().astype(str).unique().tolist())
 
+            base_svcs = pd.concat(
+                [fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs, mlp_svcs],
+                axis=0, ignore_index=True
+            )
+            # 👇 Limpia ANTES de convertir a str permanente
+            svc_list = _clean_svc_values(base_svcs.get("SVC", pd.Series(dtype=object)))
+
+        # defaults robustos
         default_sel = [s for s in DEFAULT_SVCS if s in svc_list] or svc_list[:4]
-        sel_svcs = st.multiselect("Filtrar SVC", options=svc_list, default=default_sel, placeholder="Selecciona SVCs")
+        sel_svcs = st.multiselect(
+            "Filtrar SVC",
+            options=svc_list,
+            default=default_sel,
+            placeholder="Selecciona SVCs"
+        )
         st.write(" ")
         run_btn = st.button("Calcular plan", type="primary")
+
     except Exception as e:
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
