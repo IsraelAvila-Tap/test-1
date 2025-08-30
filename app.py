@@ -204,13 +204,14 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     values = ws.get_all_values()
-    if not values: return pd.DataFrame()
+    if not values:
+        return pd.DataFrame()
 
     def _is_header_row(row: list[str]) -> bool:
         row_can = [_canon_name(c) for c in row]
-        header_keys = {"svc", "svcs", "logisticcenterid", "facility", "lc"}
-        return any(c in header_keys for c in row_can)
+        return any(c in {"svc", "svcs", "logisticcenterid", "facility", "lc"} for c in row_can)
 
+    # Detecta el índice del encabezado
     header_idx = None
     limit = min(50, len(values))
     for i in range(limit):
@@ -229,11 +230,20 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     r1 = values[header_idx]
     r1_lower = [c.strip().lower() for c in r1]
 
+    # ¿Conviene combinar con la fila siguiente?
     combine = False
     if header_idx + 1 < len(values):
         r2 = values[header_idx + 1]
-        r2_nonempty = sum(1 for x in r2 if x.strip())
-        if _looks_group_header(r1_lower) and r2_nonempty >= max(2, len(r2)//4):
+        r2_nonempty = [x for x in r2 if str(x).strip() != ""]
+        # Si r2 es mayormente numérica, es una fila de datos → NO combinar
+        def is_num(x: str) -> bool:
+            x = str(x).strip().replace(",", "")
+            return bool(re.fullmatch(r"-?\d+(\.\d+)?", x))
+        pct_nums = (sum(is_num(x) for x in r2_nonempty) / max(1, len(r2_nonempty))) if r2_nonempty else 0.0
+
+        looks_group = _looks_group_header(r1_lower)
+        # Combinar sólo si r1 parece fila de grupo, r2 NO es datos y r1 NO contiene ya 'svc'
+        if looks_group and pct_nums < 0.4 and ("svc" not in [c.strip().lower() for c in r1]):
             combine = True
 
     if combine:
@@ -246,6 +256,7 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     header = _make_unique_headers(header)
     df = pd.DataFrame(data_rows, columns=header)
     return coerce_numeric_df(df)
+
 
 def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
     out = {"sheet_id": sanitize_sheet_id(sheet_id) or "", "ok": "false", "note": ""}
@@ -608,29 +619,35 @@ def load_mlp_caps_from_srm() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["SVC","MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"])
 
-    # Normaliza SVC
-    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SRM")
+    # Intenta renombrar SVC por alias conocidos
+    found = find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", required=False, source_label="SRM")
+    # Fallback: si no encontró, toma cualquier columna cuyo nombre canónico empiece por "svc"
+    if not found:
+        for c in list(df.columns):
+            if _canon_name(c).startswith("svc"):
+                if c != "SVC":
+                    df.rename(columns={c: "SVC"}, inplace=True)
+                found = "SVC"
+                break
+
     df = _as_str_cols(df, ["SVC"])
     if "SVC" not in df.columns:
         return pd.DataFrame(columns=["SVC","MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"])
 
-    # Canonicaliza nombres de columnas
+    # Canonicaliza nombres
     canon = {c: _canon_name(c) for c in df.columns}
-
     def is_not_svc(cc: str) -> bool:
         return cc not in ("svc", "svcs", "logisticcenterid", "facility", "lc")
 
-    # Detecta columnas por familia
+    # Familias
     sdd_cols  = [c for c, cc in canon.items() if "sdd"  in cc and is_not_svc(cc)]
     spot_cols = [c for c, cc in canon.items() if "spot" in cc and all(k not in cc for k in ("bu","back","backlog")) and is_not_svc(cc)]
     back_cols = [c for c, cc in canon.items() if any(k in cc for k in ("bu","back","backlog")) and is_not_svc(cc)]
 
-    # Asegura numérico en todas las candidatas
+    # Asegura numérico
     for c in set(sdd_cols + spot_cols + back_cols):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # Agrupa por SVC y suma columnas (si no hay, deja 0)
     grp = df.groupby("SVC", dropna=False)
     idx = grp.size().index
 
@@ -649,7 +666,6 @@ def load_mlp_caps_from_srm() -> pd.DataFrame:
         .merge(back_cap.reset_index(), on="SVC", how="outer")
         .fillna(0)
     )
-    # Tipos finales
     out[["MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]] = out[["MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]].round(0).astype(int)
     return out[["SVC","MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]]
 
