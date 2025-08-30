@@ -163,6 +163,41 @@ def _clean_svc_values(series_like) -> list[str]:
     s = s[s.apply(lambda x: bool(pat.match(x)))]
     return sorted(s.unique().tolist())
 
+def _empty_plan_for(svcs: List[str]) -> pd.DataFrame:
+    """Plan mínimo para renderizar UI aunque no haya datos."""
+    svcs = _clean_svc_values(svcs or [])
+    if not svcs:
+        return pd.DataFrame()
+
+    cols = [
+        "SVC","FECHA",
+        "DEMANDA_AJUSTADA","RUTAS_SPR_BASE","RUTAS_FALTANTES",
+        # columnas comunes para no romper orden ni sumas
+        "FCST","SHIPMENTS_DC","SHIPMENTS_SP","SPR_USADO",
+        "RUTAS_RENTALS","SPR_RENTALS",
+        "CROWD_PCT","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
+        "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO",
+        "SHIP_RENTALS","SHIP_CROWD","SHIP_RESTANTES_PRE_MLP",
+        "SPR_MLP",
+        "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
+        "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
+        "MLP_BACK_CAP",
+        "RUTAS_MLP_NEEDED","RUTAS_MLP_SDD_USADAS","RUTAS_MLP_SPOT_USADAS","RUTAS_MLP_BACKLOG_USADAS",
+        "CROWD_E1_CAP","RUTAS_CROWDE1_USADAS","RUTAS_RESTANTES","RUTAS_POST_MLP"
+    ]
+    df = pd.DataFrame({"SVC": svcs})
+    df["FECHA"] = date.today()
+    for c in cols:
+        if c not in ("SVC","FECHA"):
+            df[c] = 0
+    # valores razonables por defecto
+    df["SPR_USADO"] = 20
+    df["SPR_MLP"] = 20
+    df["DEMANDA_AJUSTADA"] = 0
+    df["RUTAS_SPR_BASE"] = 0
+    df["RUTAS_FALTANTES"] = 0
+    return df[cols]
+
 
 # -----------------------------------------------------------------------------
 # 2) Header único + 2 filas + autodetección
@@ -1026,15 +1061,22 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
 # -----------------------------------------------------------------------------
 # 6) UI
 # -----------------------------------------------------------------------------
+
 st.set_page_config(page_title="Mel-IA — Plan táctico (diario por SVC)", layout="wide")
 
+# ----- Sidebar -----
 st.sidebar.markdown("## 🗂️ Proyecto")
-raw_input = st.sidebar.text_input("SHEET_ID (puede ser URL o ID)", value=SHEET_ID or "", placeholder="pega aquí la URL o el ID del Sheet")
+raw_input = st.sidebar.text_input(
+    "SHEET_ID (puede ser URL o ID)",
+    value=SHEET_ID or "",
+    placeholder="pega aquí la URL o el ID del Sheet",
+)
 new_sheet_id = sanitize_sheet_id(raw_input)
 if new_sheet_id != SHEET_ID:
     SHEET_ID = new_sheet_id
     st.cache_data.clear()
     st.session_state["sheet_id"] = SHEET_ID
+
 if SHEET_ID:
     st.sidebar.markdown(f"**Sheet (ID):** `{SHEET_ID}`")
 else:
@@ -1056,13 +1098,15 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
         st.error("No se pudo validar acceso.")
         st.caption(str(e))
 
+# ----- Main -----
 st.title("Mel-IA — Plan táctico (diario por SVC)")
-spr_mode = st.radio("SPR objetivo", options=["promedio","peak","plan"], horizontal=True, index=0)
+spr_mode = st.radio("SPR objetivo", options=["promedio", "peak", "plan"], horizontal=True, index=0)
 
 run_btn = False
 auto_run = False
 sel_svcs: List[str] = []
 
+# Selector de SVCs (robusto; usa defaults si no hay datos en Sheets)
 with st.expander("▶️ Cargando datos...", expanded=True):
     try:
         if not SHEET_ID:
@@ -1081,8 +1125,6 @@ with st.expander("▶️ Cargando datos...", expanded=True):
                 [fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs, mlp_svcs],
                 axis=0, ignore_index=True
             )
-
-            # limpia nulos/raros
             svc_list = _clean_svc_values(base_svcs.get("SVC", pd.Series(dtype=object)))
 
         # si no hay nada en sheets, usa los defaults
@@ -1105,3 +1147,52 @@ with st.expander("▶️ Cargando datos...", expanded=True):
     except Exception as e:
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
+
+# primer render automático 1 vez
+if "auto_run_once" not in st.session_state:
+    st.session_state["auto_run_once"] = True
+    auto_run = True
+
+# Cálculo y render (con placeholder si queda vacío)
+try:
+    if run_btn or auto_run:
+        if not SHEET_ID:
+            st.warning("Proporciona `SHEET_ID` para calcular.")
+        else:
+            chosen_svcs = sel_svcs or DEFAULT_SVCS
+
+            plan = compute_plan(spr_mode, chosen_svcs)
+            if plan.empty:
+                plan = _empty_plan_for(chosen_svcs)
+
+            if plan.empty:
+                st.warning("No hay datos para mostrar con los filtros seleccionados.")
+            else:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("SVCs", int(plan["SVC"].nunique()))
+                c2.metric(
+                    "Demanda ajustada",
+                    int(pd.to_numeric(plan.get("DEMANDA_AJUSTADA", 0), errors="coerce").fillna(0).sum())
+                )
+                c3.metric(
+                    "Rutas (SPR base)",
+                    int(pd.to_numeric(plan.get("RUTAS_SPR_BASE", 0), errors="coerce").fillna(0).sum())
+                )
+                c4.metric(
+                    "Rutas faltantes",
+                    int(pd.to_numeric(plan.get("RUTAS_FALTANTES", 0), errors="coerce").fillna(0).sum())
+                )
+                st.dataframe(plan, use_container_width=True, hide_index=True)
+except Exception as e:
+    st.error("Ocurrió un error durante el cálculo.")
+    show_exception(e, "Traceback completo")
+
+with st.expander("ℹ️ Notas de esta versión"):
+    st.markdown(textwrap.dedent("""
+    - Rentals desde **Rentals** con **SPR_RENTALS** ponderado; se usa 100% antes de Crowd/MLP.
+    - Crowd por % de **Capacity**: **CROWD_PCT**, **SHIP_OBJ_CROWD**, **SPR_CROWD**, base y escalado (E1).
+    - **MLP** desde **SRM**:
+        - Sumo **solo por tipo** (LV / SV / Car) y **excluyo** columnas “Total …” en SDD/SPOT.
+        - **Backlog** = columnas con `back|backlog|bu`.
+        - Asigno rutas con prioridad **SDD → SPOT → Backlog**.
+    """))
