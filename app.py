@@ -289,16 +289,52 @@ def load_fcst() -> pd.DataFrame:
 
 def load_spr() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["spr"])
-    if df.empty: return pd.DataFrame(columns=["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"])
+    target_cols = ["FECHA", "SVC", "SPR_OBJ", "SPR_PEAK", "SPR_PROM"]
+
+    if df.empty:
+        return pd.DataFrame(columns=target_cols)
+
+    # Fecha (opcional)
     coerce_date_column(df, ["FECHA","Fecha","DATE","OP_DT"], "FECHA", "SPR", required=False)
-    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "SPR")
-    find_and_rename(df, ["SPR","Spr"], "SPR_VAL", False, "SPR")
+
+    # 1) Intento estándar
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", required=False, source_label="SPR")
+
+    # 2) Fuzzy fallback: si tras combinar headers la col quedó como "SVC algo"
+    if "SVC" not in df.columns:
+        cmap = {_canon_name(c): c for c in df.columns}
+        # busca cualquier columna cuyo nombre canónico empiece por "svc" o sea un alias común
+        for key, real in cmap.items():
+            if key.startswith("svc") or key in ("svcs", "logisticcenterid", "facility", "lc"):
+                if real != "SVC":
+                    df.rename(columns={real: "SVC"}, inplace=True)
+                break
+
+    # Si de plano no hay SVC, devolvemos vacío para no romper groupby
+    if "SVC" not in df.columns:
+        return pd.DataFrame(columns=target_cols)
+
+    # SPR
+    find_and_rename(df, ["SPR","Spr","Ships per route"], "SPR_VAL", required=False, source_label="SPR")
     df = ensure_columns(df, {"SPR_VAL": np.nan})
-    g = df.groupby("SVC")["SPR_VAL"]
-    out = g.agg(SPR_PROM="mean", SPR_PEAK=lambda x: np.nanpercentile(x.dropna(), 95) if x.notna().any() else np.nan).reset_index()
+
+    # Agregados por SVC (promedio y percentil 95)
+    try:
+        g = df.groupby("SVC", dropna=False)["SPR_VAL"]
+    except TypeError:
+        # pandas viejos no tienen dropna= en groupby
+        g = df.groupby("SVC")["SPR_VAL"]
+
+    out = g.agg(
+        SPR_PROM="mean",
+        SPR_PEAK=lambda x: np.nanpercentile(x.dropna(), 95) if x.notna().any() else np.nan
+    ).reset_index()
+
     out["SPR_OBJ"] = out["SPR_PROM"]
     out["FECHA"] = date.today()
-    return _finalize(out, ["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"])
+
+    # Orden y columnas finales
+    return _finalize(out, target_cols)
 
 # ---- Rentals: homologación + SPR ponderado ----
 def _norm_txt(x: str) -> str:
