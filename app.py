@@ -221,20 +221,37 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     values = ws.get_all_values()
-    if not values: return pd.DataFrame()
+    if not values:
+        return pd.DataFrame()
+
+    # --- DETECCIÓN ROBUSTA DE ENCABEZADO ---
+    def _is_header_row(row: list[str]) -> bool:
+        # Canonicaliza cada celda: sin acentos, espacios ni símbolos
+        row_can = [_canon_name(c) for c in row]
+        # Señales típicas para identificar encabezado
+        header_keys = {"svc", "svcs", "logisticcenterid", "facility", "lc"}
+        return any(c in header_keys for c in row_can)
 
     header_idx = None
     limit = min(50, len(values))
     for i in range(limit):
-        row_lower = [c.strip().lower() for c in values[i]]
-        if any(c == "svc" for c in row_lower):
+        if _is_header_row(values[i]):
             header_idx = i
             break
-    if header_idx is None: header_idx = 0
+    if header_idx is None:
+        # Último recurso: usa la primera fila no vacía con ≥2 celdas no vacías
+        for i in range(limit):
+            nonempty = sum(1 for x in values[i] if x.strip())
+            if nonempty >= 2:
+                header_idx = i
+                break
+    if header_idx is None:
+        header_idx = 0
 
     r1 = values[header_idx]
     r1_lower = [c.strip().lower() for c in r1]
 
+    # Heurística de 2 filas de header (como Crowd)
     combine = False
     if header_idx + 1 < len(values):
         r2 = values[header_idx + 1]
@@ -252,6 +269,7 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     header = _make_unique_headers(header)
     df = pd.DataFrame(data_rows, columns=header)
     return coerce_numeric_df(df)
+
 
 def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
     out = {"sheet_id": sanitize_sheet_id(sheet_id) or "", "ok": "false", "note": ""}
