@@ -609,51 +609,50 @@ def load_capacity_caps() -> pd.DataFrame:
 # ---- MLP caps desde SRM (robusto: SDD/SPOT/Back Up; ignora "Total") ----
 def load_mlp_caps_from_srm() -> pd.DataFrame:
     """
-    Capacidad MLP por SVC leyendo la pestaña SRM, desglosada por tipo:
-      - SDD:  MLP_SDD_LV, MLP_SDD_SV, MLP_SDD_CAR  + MLP_SDD_CAP (suma)
-      - SPOT: MLP_SPOT_LV, MLP_SPOT_SV, MLP_SPOT_CAR + MLP_SPOT_CAP (suma)
-      - BACKLOG/BU/Back Up: MLP_BACK_CAP
-    Se ignoran columnas 'total' para no contar doble.
-    Además, arrastra una columna de referencia llamada 'MLP'
-    (concatenación de nombres únicos por SVC; útil para llaves futuras).
+    Lee la pestaña SRM y arma capacidades MLP por SVC:
+      SDD:  MLP_SDD_LV, MLP_SDD_SV, MLP_SDD_CAR, MLP_SDD_CAP
+      SPOT: MLP_SPOT_LV, MLP_SPOT_SV, MLP_SPOT_CAR, MLP_SPOT_CAP
+      BACK: MLP_BACK_CAP  (Back/Backup/BU/Backlog)
+    Ignora columnas 'Total ...' para no contar doble.
+    También arrastra la columna textual 'MLP' (proveedor) como referencia.
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["srm"])
     out_cols = [
         "SVC",
-        "MLP",  # <- referencia de proveedor, aunque no se use aún en el cálculo
+        "MLP",  # referencia textual (proveedor)
         "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
         "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
-        "MLP_BACK_CAP"
+        "MLP_BACK_CAP",
     ]
     if df.empty:
         return pd.DataFrame(columns=out_cols)
 
-    # SVC
-    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SRM")
-    df = _as_str_cols(df, ["SVC"])
+    # --- SVC (con fallback fuzzy: acepta "SVC SCV1", "SVC (ID)", etc.) ---
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", required=False, source_label="SRM")
+    if "SVC" not in df.columns:
+        cmap = {_canon_name(c): c for c in df.columns}
+        for key, real in cmap.items():
+            if key.startswith("svc"):
+                if real != "SVC":
+                    df.rename(columns={real: "SVC"}, inplace=True)
+                break
     if "SVC" not in df.columns:
         return pd.DataFrame(columns=out_cols)
+    df = _as_str_cols(df, ["SVC"])
 
-    # MLP (proveedor) – lo arrastramos para referencia/llave
+    # --- Proveedor MLP (solo referencia textual) ---
     find_and_rename(df, ["MLP","Proveedor","Carrier","Proveedor MLP","Partner"], "MLP", required=False, source_label="SRM")
-    if "MLP" in df.columns:
-        df["MLP"] = df["MLP"].astype(str).str.strip()
-    else:
+    if "MLP" not in df.columns:
         df["MLP"] = ""
+    else:
+        df["MLP"] = df["MLP"].astype(str).str.strip()
 
-    # ---------- Canon de columnas ----------
+    # ---------- Canon de columnas para matching ----------
     def canon_col(name: str) -> str:
-        """
-        Canon para matching:
-          - quita acentos/espacios/símbolos
-          - normaliza 'h&b' -> 'hb'
-          - elimina sufijos de semana tipo 'w36'
-          - elimina números sueltos al final (ej. '... 3', '... 0')
-        """
-        c = _canon_name(name)            # e.g. 'largevansddw363'
+        c = _canon_name(name)           # quita espacios/acentos
         c = c.replace("h&b", "hb")
-        c = re.sub(r"w\d+", "", c)       # quita W36, W37...
-        c = re.sub(r"\d+$", "", c)       # quita número suelto al final
+        c = re.sub(r"w\d+", "", c)      # quita W36, W37...
+        c = re.sub(r"\d+$", "", c)      # quita número suelto final (“ … 3”)
         return c
 
     canon = {c: canon_col(c) for c in df.columns}
@@ -668,40 +667,33 @@ def load_mlp_caps_from_srm() -> pd.DataFrame:
         return any(t in cc for t in tokens)
 
     def pick_cols(type_tokens: list[str], family_tokens: list[str], exclude_tokens: list[str]) -> list[str]:
-        """
-        Selecciona columnas cuyo nombre canónico:
-          - contenga TODOS los 'family_tokens' (['sdd'] o ['spot'])
-          - contenga ALGUNO de los 'type_tokens' (['large','lv','xlv']...)
-          - NO contenga ninguno de 'exclude_tokens' (['total','bu','back','backlog']...)
-        """
-        selected = []
+        sel = []
         for col, cc in canon.items():
             if not is_not_svc(cc):
                 continue
             if all(has(cc, ft) for ft in family_tokens) and has_any(cc, type_tokens) and not has_any(cc, exclude_tokens):
-                selected.append(col)
-        return selected
+                sel.append(col)
+        return sel
 
     def pick_cols_any(family_tokens: list[str], include_any: list[str], exclude_tokens: list[str]) -> list[str]:
-        # Para backlog: que tenga familia (spot) y alguno de ['bu','back','backup','backlog']
-        selected = []
+        sel = []
         for col, cc in canon.items():
             if not is_not_svc(cc):
                 continue
             if all(has(cc, ft) for ft in family_tokens) and has_any(cc, include_any) and not has_any(cc, exclude_tokens):
-                selected.append(col)
-        return selected
+                sel.append(col)
+        return sel
 
-    # Tokens
-    LV  = ["largevn", "largev", "largevan", "large", "lv", "xlarge", "xlv", "heavybulky", "hb"]
-    SV  = ["smallvan", "small", "sv"]
-    CAR = ["car", "auto"]
+    # Tokens (amplios) para detectar tipo/familia
+    LV  = ["largevan","largev","large","lv","xlarge","xlv","heavybulky","hb"]
+    SV  = ["smallvan","small","sv"]
+    CAR = ["car","auto"]
 
     EXC_TOTAL = ["total"]
-    EXC_BACK  = ["bu", "backup", "back", "backlog"]  # para excluir de SPOT normal
-    BACK_ANY  = ["bu", "backup", "back", "backlog"]
+    EXC_BACK  = ["bu","backup","back","backlog"]
+    BACK_ANY  = ["bu","backup","back","backlog"]
 
-    # Columnas identificadas por familia/tipo
+    # Columnas por familia/tipo
     sdd_lv_cols   = pick_cols(LV,  ["sdd"], EXC_TOTAL + [])
     sdd_sv_cols   = pick_cols(SV,  ["sdd"], EXC_TOTAL + [])
     sdd_car_cols  = pick_cols(CAR, ["sdd"], EXC_TOTAL + [])
@@ -713,21 +705,21 @@ def load_mlp_caps_from_srm() -> pd.DataFrame:
     back_cols     = pick_cols_any(["spot"], BACK_ANY, EXC_TOTAL)
 
     # Asegura numérico en todas las columnas sumables
-    for c in set(sdd_lv_cols + sdd_sv_cols + sdd_car_cols + spot_lv_cols + spot_sv_cols + spot_car_cols + back_cols):
+    for c in set(sdd_lv_cols + sdd_sv_cols + sdd_car_cols +
+                 spot_lv_cols + spot_sv_cols + spot_car_cols + back_cols):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
     grp = df.groupby("SVC", dropna=False)
 
     def sum_cols(cols: list[str]) -> pd.Series:
         if not cols:
-            return grp.size().mul(0)  # serie de 0s indexada por SVC
+            return grp.size().mul(0)
+        # suma por columna dentro de cada grupo y luego por fila
         return grp[cols].sum().sum(axis=1)
 
-    # Agregación de nombres MLP (solo referencia)
+    # Agrega referencia MLP (concatena nombres únicos por SVC)
     mlp_ref = grp["MLP"].apply(
-        lambda s: ", ".join(
-            pd.Series(s).astype(str).str.strip().replace("", np.nan).dropna().unique()[:5]
-        )
+        lambda s: ", ".join(pd.Series(s).astype(str).str.strip().replace("", np.nan).dropna().unique()[:5])
     ).rename("MLP").reset_index()
 
     out = pd.DataFrame({"SVC": grp.size().index}).reset_index(drop=True)
@@ -750,7 +742,7 @@ def load_mlp_caps_from_srm() -> pd.DataFrame:
               "MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).round(0).astype(int)
 
-    # Adjunta referencia MLP
+    # Adjunta MLP (texto)
     out = out.merge(mlp_ref, on="SVC", how="left")
     out["MLP"] = out["MLP"].fillna("")
 
