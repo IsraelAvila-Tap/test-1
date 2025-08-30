@@ -816,28 +816,28 @@ def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
     ]
     resumen = resumen.drop(columns=drop_cols, errors="ignore")
 
-    orden = [
+      orden = [
         "SVC","FECHA",
         "FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)","DEMANDA_AJUSTADA",
         "SPR_USADO","RUTAS_SPR_BASE",
         "RUTAS_RENTALS","SPR_RENTALS",
         "CROWD_PCT","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
-        "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO","CROWD_E1_CAP","RUTAS_CROWDE1_USADAS",
+        "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO",
         "SHIP_RENTALS","SHIP_CROWD","SHIP_RESTANTES_PRE_MLP",
         "SPR_MLP",
-        # Desglose de capacidad MLP leída desde SRM
         "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
         "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
         "MLP_BACK_CAP",
-        # Totales usados (lo que realmente se asignó)
-        "RUTAS_MLP_NEEDED","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_MLP_BACKLOG",
-        # (Opcional) comparativo de Capacity si existe
-        "RUTAS_MLP_SDD_CAPACITY","RUTAS_MLP_SPOT_CAPACITY",
+        "RUTAS_MLP_NEEDED","RUTAS_MLP_SDD_USADAS","RUTAS_MLP_SPOT_USADAS","RUTAS_MLP_BACKLOG_USADAS",
+        "CROWD_E1_CAP","RUTAS_CROWDE1_USADAS",
         "RUTAS_RESTANTES","RUTAS_FALTANTES",
+        # 🔥 NUEVO
+        "CAP_TOTAL","CAP_VS_FCST","RIESGO"
+    ]
+
     ]
     cols = [c for c in orden if c in resumen.columns] + [c for c in resumen.columns if c not in orden]
     return resumen[cols]
-
 
 def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
     # --- carga de datos ---
@@ -886,18 +886,9 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
 
     # Capacity (MLP legacy caps, rentals, crowd cap, shipments DC/SP)
     if not caps.empty:
-        out = safe_merge(
-            out,
-            caps[["SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","SHIPMENTS_DC","SHIPMENTS_SP"]],
-            ["SVC"]
-        )
-        # Guarda comparativo de Capacity y libera los nombres
-        if "RUTAS_MLP_SDD" in out.columns:
-            out.rename(columns={"RUTAS_MLP_SDD":"RUTAS_MLP_SDD_CAPACITY"}, inplace=True)
-        if "RUTAS_MLP_SPOT" in out.columns:
-            out.rename(columns={"RUTAS_MLP_SPOT":"RUTAS_MLP_SPOT_CAPACITY"}, inplace=True)
+        out = safe_merge(out, caps[["SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","SHIPMENTS_DC","SHIPMENTS_SP"]], ["SVC"])
     else:
-        out = ensure_columns(out, {"RUTAS_CROWD_CAP":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
+        out = ensure_columns(out, {"RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0, "RUTAS_CROWD_CAP":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
 
     # Rentals: sobrescribe lo que venga de Capacity con el cálculo de Rentals
     out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
@@ -942,7 +933,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
 
     out["RUTAS_SPR_BASE"] = np.ceil(out["DEMANDA_AJUSTADA"] / out["SPR_USADO"]).astype(int)
 
-    for c in ["RUTAS_CROWD_CAP","CROWD_E1_CAP"]:
+    for c in ["RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","CROWD_E1_CAP"]:
         out[c] = pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0)
 
     # ----------------- CROWD ASIGNACIÓN -----------------
@@ -958,8 +949,8 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     exceso_obj = (out["RUTAS_CROWD_OBJ"] - out["RUTAS_CROWD_BASE"]).clip(lower=0)
     rem_despues_base = (np.maximum(out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"], 0) - out["RUTAS_CROWD_BASE"]).clip(lower=0)
 
-    out["RUTAS_CROWD_ESCALADO"]  = np.minimum.reduce([exceso_obj, out["CROWD_E1_CAP"], rem_despues_base]).astype(int)
-    out["RUTAS_CROWDE1_USADAS"]  = out["RUTAS_CROWD_ESCALADO"]
+    out["RUTAS_CROWD_ESCALADO"] = np.minimum.reduce([exceso_obj, out["CROWD_E1_CAP"], rem_despues_base]).astype(int)
+    out["RUTAS_CROWDE1_USADAS"] = out["RUTAS_CROWD_ESCALADO"]
 
     # Shipments cubiertos por Rentals y Crowd
     out["SHIP_RENTALS"] = out["RUTAS_RENTALS"] * out["SPR_RENTALS"]
@@ -988,7 +979,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
 
     out["RUTAS_MLP_NEEDED"] = np.ceil(out["SHIP_RESTANTES_PRE_MLP"] / out["SPR_MLP"]).astype(int)
 
-    # ---- Asignación priorizada: SDD → SPOT → BACKLOG ----
+    # Asignación priorizada: SDD → SPOT → BACKLOG
     need     = out["RUTAS_MLP_NEEDED"]
     use_sdd  = np.minimum(need, out.get("MLP_SDD_CAP", 0))
     need2    = (need - use_sdd).clip(lower=0)
@@ -996,20 +987,22 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     need3    = (need2 - use_spot).clip(lower=0)
     use_back = np.minimum(need3, out.get("MLP_BACK_CAP", 0))
 
-    # Totales usados (para mostrar)
     out["RUTAS_MLP_SDD_USADAS"]     = use_sdd.astype(int)
     out["RUTAS_MLP_SPOT_USADAS"]    = use_spot.astype(int)
     out["RUTAS_MLP_BACKLOG_USADAS"] = use_back.astype(int)
 
-    # Totales finales que se verán en la tabla
-    out["RUTAS_MLP_SDD"]      = out["RUTAS_MLP_SDD_USADAS"]
-    out["RUTAS_MLP_SPOT"]     = out["RUTAS_MLP_SPOT_USADAS"]
-    out["RUTAS_MLP_BACKLOG"]  = out["RUTAS_MLP_BACKLOG_USADAS"]
-
-    # Restantes/faltantes
     out["RUTAS_RESTANTES"] = (need3 - use_back).clip(lower=0).astype(int)
     out["RUTAS_POST_MLP"]  = out["RUTAS_RESTANTES"]
     out["RUTAS_FALTANTES"] = out["RUTAS_RESTANTES"]
+
+    # ----------------- NUEVO: capacidad total y riesgo -----------------
+    cap_rentals = out["RUTAS_RENTALS"] * out["SPR_RENTALS"]
+    cap_crowd   = (out["RUTAS_CROWD_BASE"] + out["RUTAS_CROWDE1_USADAS"]) * out["SPR_CROWD"]
+    cap_mlp     = (out["RUTAS_MLP_SDD_USADAS"] + out["RUTAS_MLP_SPOT_USADAS"] + out["RUTAS_MLP_BACKLOG_USADAS"]) * out["SPR_MLP"]
+
+    out["CAP_TOTAL"]   = cap_rentals.fillna(0) + cap_crowd.fillna(0) + cap_mlp.fillna(0)
+    out["CAP_VS_FCST"] = (out["CAP_TOTAL"] / out["FCST"].replace(0, np.nan)).fillna(0).round(2)
+    out["RIESGO"]      = np.where(out["CAP_TOTAL"] >= out["FCST"], "OK", "RIESGO")
 
     # ----------------- FILTRO FINAL POR SELECCIÓN -----------------
     if sel_svcs:
@@ -1020,6 +1013,9 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     # ----------------- ORDEN & LIMPIEZA -----------------
     out = apply_output_adjustments(out).fillna(0).sort_values("SVC").reset_index(drop=True)
     return out
+
+
+
 
 # -----------------------------------------------------------------------------
 # 6) UI
