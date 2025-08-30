@@ -71,6 +71,36 @@ def find_and_rename(df: pd.DataFrame, candidates: List[str], new_name: str,
         raise ValueError(f"{source_label}: falta columna equivalente a {candidates}. Encabezados: {list(df.columns)}")
     return None
 
+def _find_units_like_column(df: pd.DataFrame) -> str | None:
+    """
+    Busca una columna que parezca 'unidades' (robusto a 'Unidades dispon…', 'Unidades disponibles', 'Qty', etc.).
+    Devuelve el nombre real de la columna o None si no encontró.
+    """
+    if df is None or df.empty:
+        return None
+
+    def canon(x: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(x).lower()).encode("ascii","ignore").decode("ascii"))
+
+    candidates = [canon(c) for c in df.columns]
+    real_cols  = list(df.columns)
+
+    # patrones frecuentes
+    targets = [
+        r"^unidades",          # 'unidades', 'unidadesdispon...', etc.
+        r"^units?$",           # 'unit', 'units'
+        r"^cantidad$",         # 'cantidad'
+        r"^qty$",              # 'qty'
+        r"^count$",            # 'count'
+    ]
+
+    for i, can in enumerate(candidates):
+        for pat in targets:
+            if re.search(pat, can):
+                return real_cols[i]
+    return None
+
+
 def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFrame:
     for c, v in defaults.items():
         if c not in df.columns:
@@ -321,18 +351,43 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
     if df.empty:
         return pd.DataFrame(columns=["SVC","RUTAS_RENTALS","SPR_RENTALS"])
+
+    # SVC y tipo
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "Rentals")
     find_and_rename(df, ["Tipo de vehiculo","Tipo de vehículo","Vehicle type","Tipo"], "TIPO_VEHICULO", False, "Rentals")
-    find_and_rename(df, ["Unidades","Unidades dispon","Qty","Cantidad"], "UNIDADES", False, "Rentals")
-    df = ensure_columns(df, {"SVC": None, "TIPO_VEHICULO":"", "UNIDADES":0})
-    df["UNIDADES"] = pd.to_numeric(df["UNIDADES"], errors="coerce").fillna(0)
+    df = ensure_columns(df, {"SVC": None, "TIPO_VEHICULO":"", })
 
+    # Columna UNIDADES: primero try exact keys, luego fuzzy
+    units_col = None
+    for keys in [
+        ["Unidades", "Unidades dispon", "Unidades disponibles"],
+        ["Units","Cantidad","Qty","QTY","COUNT"]
+    ]:
+        if units_col: break
+        for k in keys:
+            col = find_and_rename(df, [k], "UNIDADES", required=False, source_label="Rentals")
+            if col: units_col = "UNIDADES"; break
+    if not units_col:
+        guessed = _find_units_like_column(df)
+        if guessed:
+            if guessed != "UNIDADES":
+                df.rename(columns={guessed:"UNIDADES"}, inplace=True)
+            units_col = "UNIDADES"
+
+    # Si aún no hay UNIDADES, no podemos calcular: regresamos vacío
+    if not units_col:
+        return pd.DataFrame(columns=["SVC","RUTAS_RENTALS","SPR_RENTALS"])
+
+    # Tipados y homologación
+    df["UNIDADES"] = pd.to_numeric(df["UNIDADES"], errors="coerce").fillna(0)
     df = _as_str_cols(df, ["SVC","TIPO_VEHICULO"])
     df["VEHICULO_TIPO_HOM"] = df["TIPO_VEHICULO"].map(homologar_vehicle_type)
 
+    # Agrega por (SVC, tipo)
     by_type = df.groupby(["SVC","VEHICULO_TIPO_HOM"], dropna=False)["UNIDADES"].sum().reset_index()
     by_type = _as_str_cols(by_type, ["SVC","VEHICULO_TIPO_HOM"])
 
+    # SPR histórico (local por SVC con fallback global por tipo)
     spr_hist = load_spr_hist_from_sheet()
     spr_loc  = spr_hist[spr_hist["SVC"] != "__GLOBAL__"]
     spr_loc  = _as_str_cols(spr_loc, ["SVC","VEHICULO_TIPO_HOM"])
@@ -340,11 +395,14 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
     spr_glob = _as_str_cols(spr_glob, ["VEHICULO_TIPO_HOM"])
 
     by_type = by_type.merge(spr_loc, on=["SVC","VEHICULO_TIPO_HOM"], how="left") \
-                     .merge(spr_glob, on=["VEHICULO_TIPO_HOM"], how="left")
+                     .merge(spr_glob, on=["VEHICULO_TIPO_HOM"],      how="left")
     by_type["SPR_HIST"] = by_type["SPR_HIST"].fillna(by_type["SPR_GLOBAL_TIPO"])
-    by_type = by_type.drop(columns=["SPR_GLOBAL_TIPO"])
+    by_type.drop(columns=["SPR_GLOBAL_TIPO"], inplace=True)
 
+    # Resultado por SVC
     rentals_sum = by_type.groupby("SVC", dropna=False)["UNIDADES"].sum().rename("RUTAS_RENTALS").reset_index()
+
+    # SPR ponderado por SVC
     by_type["PESO"] = by_type["UNIDADES"]
     by_type["POND"] = by_type["UNIDADES"] * by_type["SPR_HIST"]
     spr_r = by_type.groupby("SVC", dropna=False)[["POND","PESO"]].sum().reset_index()
@@ -352,7 +410,18 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
 
     out = rentals_sum.merge(spr_r[["SVC","SPR_RENTALS"]], on="SVC", how="left")
     out = _as_str_cols(out, ["SVC"])
+
+    # Si algún SVC quedó sin filas (o 0 unidades), rellena con fallback simple por SVC
+    rents_fb = load_rentals_fallback()
+    if not rents_fb.empty:
+        rents_fb = _as_str_cols(rents_fb, ["SVC"])
+        out = out.merge(rents_fb[["SVC","RUTAS_RENTALS"]].rename(columns={"RUTAS_RENTALS":"RUTAS_RENTALS_FB"}),
+                        on="SVC", how="outer")
+        out["RUTAS_RENTALS"] = out["RUTAS_RENTALS"].fillna(out["RUTAS_RENTALS_FB"]).fillna(0)
+        out.drop(columns=["RUTAS_RENTALS_FB"], inplace=True)
+
     return out[["SVC","RUTAS_RENTALS","SPR_RENTALS"]]
+
 
 def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
     resumen = resumen.drop(columns=["Demanda esperada", "DEMANDA_ESPERADA"], errors="ignore")
