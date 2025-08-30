@@ -2,7 +2,7 @@
 # =============================================================================
 # Mel-IA — Plan táctico (diario por SVC)
 # Tabs: FCST, SPR, Capacity, Rentals, Crowd.
-# Encabezado autodetectado (busca SVC) + encabezado de 2 filas (Crowd).
+# Encabezado autodetectado (busca SVC/SVCs/LC/Facility) + encabezado de 2 filas (Crowd).
 # Robusto ante vacíos/alias y pestañas ausentes.
 # =============================================================================
 import os, json, re, unicodedata, textwrap, traceback
@@ -71,49 +71,33 @@ def find_and_rename(df: pd.DataFrame, candidates: List[str], new_name: str,
         raise ValueError(f"{source_label}: falta columna equivalente a {candidates}. Encabezados: {list(df.columns)}")
     return None
 
-def _find_units_like_column(df: pd.DataFrame) -> str | None:
-    """
-    Busca una columna que parezca 'unidades' (robusto a 'Unidades dispon…', 'Unidades disponibles', 'Qty', etc.).
-    Devuelve el nombre real de la columna o None si no encontró.
-    """
-    if df is None or df.empty:
-        return None
-
-    def canon(x: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(x).lower()).encode("ascii","ignore").decode("ascii"))
-
-    candidates = [canon(c) for c in df.columns]
-    real_cols  = list(df.columns)
-
-    # patrones frecuentes
-    targets = [
-        r"^unidades",          # 'unidades', 'unidadesdispon...', etc.
-        r"^units?$",           # 'unit', 'units'
-        r"^cantidad$",         # 'cantidad'
-        r"^qty$",              # 'qty'
-        r"^count$",            # 'count'
-    ]
-
-    for i, can in enumerate(candidates):
-        for pat in targets:
-            if re.search(pat, can):
-                return real_cols[i]
-    return None
-
-
 def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFrame:
     for c, v in defaults.items():
         if c not in df.columns:
             df[c] = v
     return df
 
-# --- NUEVO: forzar columnas a texto (evita merge float64 vs object) ---
+# --- Forzar llaves a texto (evita merge float64 vs object) ---
 def _as_str_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     for c in cols:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
     return df
-# ----------------------------------------------------------------------
+
+# --- Fuzzy para detectar columna de unidades en Rentals ---
+def _find_units_like_column(df: pd.DataFrame) -> str | None:
+    if df is None or df.empty:
+        return None
+    def canon(x: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(x).lower()).encode("ascii","ignore").decode("ascii"))
+    cands = [canon(c) for c in df.columns]
+    real  = list(df.columns)
+    targets = [r"^unidades", r"^units?$", r"^cantidad$", r"^qty$", r"^count$"]
+    for i, can in enumerate(cands):
+        for pat in targets:
+            if re.search(pat, can):
+                return real[i]
+    return None
 
 _NUM_SEP_RE = re.compile(r"[ ,\u00A0]")
 
@@ -221,14 +205,11 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     values = ws.get_all_values()
-    if not values:
-        return pd.DataFrame()
+    if not values: return pd.DataFrame()
 
-    # --- DETECCIÓN ROBUSTA DE ENCABEZADO ---
+    # --- Detección robusta de encabezado ---
     def _is_header_row(row: list[str]) -> bool:
-        # Canonicaliza cada celda: sin acentos, espacios ni símbolos
         row_can = [_canon_name(c) for c in row]
-        # Señales típicas para identificar encabezado
         header_keys = {"svc", "svcs", "logisticcenterid", "facility", "lc"}
         return any(c in header_keys for c in row_can)
 
@@ -239,7 +220,6 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
             header_idx = i
             break
     if header_idx is None:
-        # Último recurso: usa la primera fila no vacía con ≥2 celdas no vacías
         for i in range(limit):
             nonempty = sum(1 for x in values[i] if x.strip())
             if nonempty >= 2:
@@ -251,7 +231,6 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     r1 = values[header_idx]
     r1_lower = [c.strip().lower() for c in r1]
 
-    # Heurística de 2 filas de header (como Crowd)
     combine = False
     if header_idx + 1 < len(values):
         r2 = values[header_idx + 1]
@@ -269,7 +248,6 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     header = _make_unique_headers(header)
     df = pd.DataFrame(data_rows, columns=header)
     return coerce_numeric_df(df)
-
 
 def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
     out = {"sheet_id": sanitize_sheet_id(sheet_id) or "", "ok": "false", "note": ""}
@@ -321,7 +299,7 @@ def load_spr() -> pd.DataFrame:
     out["FECHA"] = date.today()
     return _finalize(out, ["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"])
 
-# -------------------- INTEGRACIÓN NUEVA: Rentals con homologación + SPR histórico --------------------
+# ---- Integración: Rentals (homologación + SPR histórico ponderado) ----
 def _norm_txt(x: str) -> str:
     x = (x or "").strip().lower()
     rep = {"eléctrica":"electric","eléctrico":"electric","electrica":"electric","electrico":"electric"}
@@ -370,57 +348,45 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["SVC","RUTAS_RENTALS","SPR_RENTALS"])
 
-    # SVC y tipo
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "Rentals")
     find_and_rename(df, ["Tipo de vehiculo","Tipo de vehículo","Vehicle type","Tipo"], "TIPO_VEHICULO", False, "Rentals")
     df = ensure_columns(df, {"SVC": None, "TIPO_VEHICULO":"", })
 
-    # Columna UNIDADES: primero try exact keys, luego fuzzy
+    # Columna UNIDADES (exactos + fuzzy)
     units_col = None
-    for keys in [
-        ["Unidades", "Unidades dispon", "Unidades disponibles"],
-        ["Units","Cantidad","Qty","QTY","COUNT"]
-    ]:
-        if units_col: break
+    for keys in [["Unidades","Unidades dispon","Unidades disponibles"],
+                 ["Units","Cantidad","Qty","QTY","COUNT"]]:
         for k in keys:
             col = find_and_rename(df, [k], "UNIDADES", required=False, source_label="Rentals")
             if col: units_col = "UNIDADES"; break
+        if units_col: break
     if not units_col:
         guessed = _find_units_like_column(df)
         if guessed:
             if guessed != "UNIDADES":
                 df.rename(columns={guessed:"UNIDADES"}, inplace=True)
             units_col = "UNIDADES"
-
-    # Si aún no hay UNIDADES, no podemos calcular: regresamos vacío
     if not units_col:
         return pd.DataFrame(columns=["SVC","RUTAS_RENTALS","SPR_RENTALS"])
 
-    # Tipados y homologación
     df["UNIDADES"] = pd.to_numeric(df["UNIDADES"], errors="coerce").fillna(0)
     df = _as_str_cols(df, ["SVC","TIPO_VEHICULO"])
     df["VEHICULO_TIPO_HOM"] = df["TIPO_VEHICULO"].map(homologar_vehicle_type)
 
-    # Agrega por (SVC, tipo)
     by_type = df.groupby(["SVC","VEHICULO_TIPO_HOM"], dropna=False)["UNIDADES"].sum().reset_index()
     by_type = _as_str_cols(by_type, ["SVC","VEHICULO_TIPO_HOM"])
 
-    # SPR histórico (local por SVC con fallback global por tipo)
     spr_hist = load_spr_hist_from_sheet()
-    spr_loc  = spr_hist[spr_hist["SVC"] != "__GLOBAL__"]
-    spr_loc  = _as_str_cols(spr_loc, ["SVC","VEHICULO_TIPO_HOM"])
-    spr_glob = spr_hist[spr_hist["SVC"] == "__GLOBAL__"].drop(columns=["SVC"]).rename(columns={"SPR_HIST":"SPR_GLOBAL_TIPO"})
-    spr_glob = _as_str_cols(spr_glob, ["VEHICULO_TIPO_HOM"])
+    spr_loc  = _as_str_cols(spr_hist[spr_hist["SVC"] != "__GLOBAL__"], ["SVC","VEHICULO_TIPO_HOM"])
+    spr_glob = _as_str_cols(spr_hist[spr_hist["SVC"] == "__GLOBAL__"].drop(columns=["SVC"]).rename(columns={"SPR_HIST":"SPR_GLOBAL_TIPO"}), ["VEHICULO_TIPO_HOM"])
 
-    by_type = by_type.merge(spr_loc, on=["SVC","VEHICULO_TIPO_HOM"], how="left") \
+    by_type = by_type.merge(spr_loc,  on=["SVC","VEHICULO_TIPO_HOM"], how="left") \
                      .merge(spr_glob, on=["VEHICULO_TIPO_HOM"],      how="left")
     by_type["SPR_HIST"] = by_type["SPR_HIST"].fillna(by_type["SPR_GLOBAL_TIPO"])
     by_type.drop(columns=["SPR_GLOBAL_TIPO"], inplace=True)
 
-    # Resultado por SVC
     rentals_sum = by_type.groupby("SVC", dropna=False)["UNIDADES"].sum().rename("RUTAS_RENTALS").reset_index()
 
-    # SPR ponderado por SVC
     by_type["PESO"] = by_type["UNIDADES"]
     by_type["POND"] = by_type["UNIDADES"] * by_type["SPR_HIST"]
     spr_r = by_type.groupby("SVC", dropna=False)[["POND","PESO"]].sum().reset_index()
@@ -429,7 +395,7 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
     out = rentals_sum.merge(spr_r[["SVC","SPR_RENTALS"]], on="SVC", how="left")
     out = _as_str_cols(out, ["SVC"])
 
-    # Si algún SVC quedó sin filas (o 0 unidades), rellena con fallback simple por SVC
+    # Rellena con fallback simple por SVC si existiera
     rents_fb = load_rentals_fallback()
     if not rents_fb.empty:
         rents_fb = _as_str_cols(rents_fb, ["SVC"])
@@ -439,108 +405,6 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
         out.drop(columns=["RUTAS_RENTALS_FB"], inplace=True)
 
     return out[["SVC","RUTAS_RENTALS","SPR_RENTALS"]]
-
-
-def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
-    resumen = resumen.drop(columns=["Demanda esperada", "DEMANDA_ESPERADA"], errors="ignore")
-    orden = [
-        "SVC",
-        "FECHA",
-        "FCST",
-        "SHIPMENTS_DC","SHIPMENTS_SP",
-        "FCST (sin DC & sin SP)",
-        "DEMANDA_AJUSTADA",
-        "SPR_USADO",
-        "RUTAS_SPR_BASE",
-        "RUTAS_RENTALS","SPR_RENTALS",
-        "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE",
-        "RUTAS_MLP_SDD","RUTAS_MLP_SPOT",
-        "CROWD_E1_CAP",
-        "RUTAS_CROWDE1_USADAS","RUTAS_FALTANTES",
-    ]
-    cols = [c for c in orden if c in resumen.columns] + [c for c in resumen.columns if c not in orden]
-    return resumen[cols]
-
-# -------------------- FIN INTEGRACIÓN NUEVA --------------------
-
-def load_capacity_caps() -> pd.DataFrame:
-    """Caps de rutas + Shipments por DC y SP para restar del FCST.
-       (RUTAS_RENTALS aquí es provisional: se sobreescribe con Rentals sheet)"""
-    df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
-    wanted = ["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","SHIPMENTS_DC","SHIPMENTS_SP"]
-    if df.empty:
-        return pd.DataFrame(columns=wanted)
-
-    find_and_rename(df, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "Capacity")
-    find_and_rename(df, ["Tipo","Type","Category"], "TIPO", False, "Capacity")
-    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Capacity")
-    find_and_rename(df, ["Tipo DM","TipoDM","DM Type"], "TIPO_DM", False, "Capacity")
-    coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Capacity", required=False)
-    find_and_rename(df, ["Cantidad","Qty","Quantity","COUNT","QTY"], "CANT", False, "Capacity")
-    df = ensure_columns(df, {"DELIVERY_MODEL":"", "TIPO":"", "TIPO_DM":"", "SVC":None, "FECHA": pd.NaT, "CANT":0})
-    df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
-
-    hoy = date.today()
-    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
-    if df["FECHA"].notna().any():
-        sub = df[df["FECHA"].notna()]
-        sub = sub[sub["FECHA"] <= hoy]
-        target = sub["FECHA"].max() if not sub.empty else df["FECHA"].max()
-        df = df[df["FECHA"] == target]
-    else:
-        df["FECHA"] = hoy
-
-    # ------------ Normaliza texto ------------
-    dm_norm     = df["DELIVERY_MODEL"].fillna("").astype(str).str.lower()
-    tipo_norm   = df["TIPO"].fillna("").astype(str).str.lower()
-    tipodm_norm = df["TIPO_DM"].fillna("").astype(str).str.lower()
-
-    # ------------ Caps de rutas ------------
-    is_rentals = dm_norm.str.contains("rent",  regex=False)
-    is_crowd_routes = (
-        dm_norm.str.contains("crowd", regex=False)
-        & (
-            tipo_norm.str.contains("route", regex=False)
-            | tipodm_norm.str.contains("route", case=False, regex=False)
-        )
-    )
-    is_mlp_spot = dm_norm.str.contains("mlp", regex=False) & tipodm_norm.str.contains("spot", regex=False)
-    is_mlp_sdd  = (
-        dm_norm.str.contains("mlp", regex=False)
-        & (~is_mlp_spot)
-        & (
-            tipodm_norm.str.contains("mlp", regex=False)
-            | tipodm_norm.str.contains("sdd", regex=False)
-            | (tipodm_norm == "")
-        )
-    )
-    # ------------ Shipments DC / SP ------------
-    is_shipments = tipo_norm.str.contains("ship", regex=False)
-    is_dc = (
-        (dm_norm.str.contains("delivery", regex=False) & dm_norm.str.contains("cell", regex=False))
-        | tipodm_norm.str.contains("delivery cell", regex=False)
-        | tipodm_norm.str.contains(r"^(dc|cell)$", case=False, regex=True)
-    )
-    is_sp = (
-        dm_norm.str.contains(r"^(s\.?p\.?|sp)$", case=False, regex=True)
-        | (dm_norm.str.contains("service", regex=False) & dm_norm.str.contains("partner", regex=False))
-        | tipodm_norm.str.contains(r"\bsp\b|service partner", case=False, regex=True)
-    )
-    is_dc_ship = is_shipments & is_dc
-    is_sp_ship = is_shipments & is_sp
-
-    # ------------ Agregación ------------
-    g = df.groupby(["FECHA","SVC"])["CANT"]
-    agg = pd.DataFrame({
-        "RUTAS_MLP_SDD":   g.apply(lambda s: s[is_mlp_sdd.loc[s.index]].sum()),
-        "RUTAS_MLP_SPOT":  g.apply(lambda s: s[is_mlp_spot.loc[s.index]].sum()),
-        "RUTAS_RENTALS":   g.apply(lambda s: s[is_rentals.loc[s.index]].sum()),  # <- se sobrescribe con Rentals sheet
-        "RUTAS_CROWD_CAP": g.apply(lambda s: s[is_crowd_routes.loc[s.index]].sum()),
-        "SHIPMENTS_DC":    g.apply(lambda s: s[is_dc_ship.loc[s.index]].sum()),
-        "SHIPMENTS_SP":    g.apply(lambda s: s[is_sp_ship.loc[s.index]].sum()),
-    }).reset_index()
-
-    return _finalize(agg, wanted)
 
 def load_rentals_fallback() -> pd.DataFrame:
     """Fallback minimal: suma de unidades por SVC cuando no se puede homologar/ponderar SPR."""
@@ -602,18 +466,176 @@ def load_crowd_caps() -> pd.DataFrame:
     out["FECHA"] = date.today()
     return _finalize(out, ["FECHA","SVC","CROWD_E1_CAP"])
 
+# ---- Nuevo: % de Crowd desde Capacity y SPR_CROWD ----
+def load_crowd_pct_from_capacity() -> pd.DataFrame:
+    """
+    %Crowd = (Shipments Crowd) / (Shipments Totales) por SVC con la última fecha disponible.
+    """
+    df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
+    if df.empty:
+        return pd.DataFrame(columns=["SVC", "CROWD_PCT"])
+
+    find_and_rename(df, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "Capacity")
+    find_and_rename(df, ["Tipo","Type","Category"], "TIPO", False, "Capacity")
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Capacity")
+    find_and_rename(df, ["Tipo DM","TipoDM","DM Type"], "TIPO_DM", False, "Capacity")
+    coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Capacity", required=False)
+    find_and_rename(df, ["Cantidad","Qty","Quantity","COUNT","QTY"], "CANT", False, "Capacity")
+
+    df = ensure_columns(df, {"DELIVERY_MODEL":"", "TIPO":"", "TIPO_DM":"", "SVC":None, "FECHA": pd.NaT, "CANT":0})
+    df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
+    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
+
+    if df["FECHA"].notna().any():
+        idx = df.groupby("SVC")["FECHA"].idxmax()
+        df = df.loc[idx]
+    df = _as_str_cols(df, ["SVC"])
+
+    tipo = df["TIPO"].astype(str).str.lower()
+    dm   = df["DELIVERY_MODEL"].astype(str).str.lower()
+    tipodm = df["TIPO_DM"].astype(str).str.lower()
+
+    is_shipments = tipo.str.contains("ship", regex=False)
+    is_crowd = is_shipments & (dm.str.contains("crowd", regex=False) | tipodm.str.contains("crowd", regex=False) | tipo.str.contains("crowd", regex=False))
+
+    tot = df[is_shipments].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_TOT")
+    crd = df[is_crowd].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_CROWD")
+    out = pd.concat([tot, crd], axis=1).reset_index()
+    out = _as_str_cols(out, ["SVC"])
+    out["SHIP_TOT"]   = pd.to_numeric(out["SHIP_TOT"], errors="coerce").fillna(0)
+    out["SHIP_CROWD"] = pd.to_numeric(out["SHIP_CROWD"], errors="coerce").fillna(0)
+    out["CROWD_PCT"]  = (out["SHIP_CROWD"] / out["SHIP_TOT"]).replace([np.inf,-np.inf], 0).fillna(0)
+    return out[["SVC", "CROWD_PCT"]]
+
+def load_spr_crowd() -> pd.DataFrame:
+    """
+    SPR específico de Crowd por SVC (mediana). Fallback: mediana global de Crowd; y si no hay, se usa SPR_USADO.
+    """
+    spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
+    if spr.empty:
+        return pd.DataFrame(columns=["SVC","SPR_CROWD"])
+    find_and_rename(spr, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SPR")
+    find_and_rename(spr, ["SPR","spr","Ships per route"], "SPR", False, "SPR")
+    find_and_rename(spr, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "SPR")
+    find_and_rename(spr, ["Tipo","Type","Category"], "TIPO", False, "SPR")
+    find_and_rename(spr, ["SHP_LG_VEHICLE_TYPE","Vehicle type","Tipo de vehículo","Tipo de vehiculo"], "VEH_TYPE", False, "SPR")
+
+    spr = ensure_columns(spr, {"SVC":None, "SPR":np.nan, "DELIVERY_MODEL":"", "TIPO":"", "VEH_TYPE":""})
+    spr["SPR"] = pd.to_numeric(spr["SPR"], errors="coerce")
+    spr = _as_str_cols(spr, ["SVC","DELIVERY_MODEL","TIPO","VEH_TYPE"])
+
+    is_crowd = spr["DELIVERY_MODEL"].str.lower().str.contains("crowd", regex=False) \
+               | spr["TIPO"].str.lower().str.contains("crowd", regex=False) \
+               | spr["VEH_TYPE"].str.lower().str.contains("crowd", regex=False)
+
+    spr_crowd = spr[is_crowd].copy()
+    if spr_crowd.empty:
+        return pd.DataFrame(columns=["SVC","SPR_CROWD"])
+
+    grp_local = spr_crowd.groupby("SVC")["SPR"].median().rename("SPR_CROWD").reset_index()
+    global_val = spr_crowd["SPR"].median()
+    grp_local["SPR_CROWD"] = grp_local["SPR_CROWD"].fillna(global_val)
+    return _as_str_cols(grp_local, ["SVC"])
+
+# ---- Capacity caps (MLP/Crowd caps + Shipments DC/SP) ----
+def load_capacity_caps() -> pd.DataFrame:
+    """Caps de rutas + Shipments por DC y SP para restar del FCST.
+       (RUTAS_RENTALS aquí es provisional: se sobreescribe con Rentals sheet)"""
+    df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
+    wanted = ["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","SHIPMENTS_DC","SHIPMENTS_SP"]
+    if df.empty:
+        return pd.DataFrame(columns=wanted)
+
+    find_and_rename(df, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "Capacity")
+    find_and_rename(df, ["Tipo","Type","Category"], "TIPO", False, "Capacity")
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Capacity")
+    find_and_rename(df, ["Tipo DM","TipoDM","DM Type"], "TIPO_DM", False, "Capacity")
+    coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Capacity", required=False)
+    find_and_rename(df, ["Cantidad","Qty","Quantity","COUNT","QTY"], "CANT", False, "Capacity")
+    df = ensure_columns(df, {"DELIVERY_MODEL":"", "TIPO":"", "TIPO_DM":"", "SVC":None, "FECHA": pd.NaT, "CANT":0})
+    df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
+
+    hoy = date.today()
+    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
+    if df["FECHA"].notna().any():
+        sub = df[df["FECHA"].notna()]
+        sub = sub[sub["FECHA"] <= hoy]
+        target = sub["FECHA"].max() if not sub.empty else df["FECHA"].max()
+        df = df[df["FECHA"] == target]
+    else:
+        df["FECHA"] = hoy
+
+    dm_norm     = df["DELIVERY_MODEL"].fillna("").astype(str).str.lower()
+    tipo_norm   = df["TIPO"].fillna("").astype(str).str.lower()
+    tipodm_norm = df["TIPO_DM"].fillna("").astype(str).str.lower()
+
+    is_rentals = dm_norm.str.contains("rent",  regex=False)
+    is_crowd_routes = dm_norm.str.contains("crowd", regex=False) & (
+                        tipo_norm.str.contains("route", regex=False) |
+                        tipodm_norm.str.contains("route", case=False, regex=False)
+                      )
+    is_mlp_spot = dm_norm.str.contains("mlp", regex=False) & tipodm_norm.str.contains("spot", regex=False)
+    is_mlp_sdd  = dm_norm.str.contains("mlp", regex=False) & (~is_mlp_spot) & (
+                        tipodm_norm.str.contains("mlp", regex=False) |
+                        tipodm_norm.str.contains("sdd", regex=False) |
+                        (tipodm_norm == "")
+                  )
+
+    is_shipments = tipo_norm.str.contains("ship", regex=False)
+    is_dc = (
+        (dm_norm.str.contains("delivery", regex=False) & dm_norm.str.contains("cell", regex=False)) |
+        tipodm_norm.str.contains("delivery cell", regex=False) |
+        tipodm_norm.str.contains(r"^(dc|cell)$", case=False, regex=True)
+    )
+    is_sp = (
+        dm_norm.str.contains(r"^(s\.?p\.?|sp)$", case=False, regex=True) |
+        (dm_norm.str.contains("service", regex=False) & dm_norm.str.contains("partner", regex=False)) |
+        tipodm_norm.str.contains(r"\bsp\b|service partner", case=False, regex=True)
+    )
+    is_dc_ship = is_shipments & is_dc
+    is_sp_ship = is_shipments & is_sp
+
+    g = df.groupby(["FECHA","SVC"])["CANT"]
+    agg = pd.DataFrame({
+        "RUTAS_MLP_SDD":   g.apply(lambda s: s[is_mlp_sdd.loc[s.index]].sum()),
+        "RUTAS_MLP_SPOT":  g.apply(lambda s: s[is_mlp_spot.loc[s.index]].sum()),
+        "RUTAS_RENTALS":   g.apply(lambda s: s[is_rentals.loc[s.index]].sum()),  # <- se sobrescribe con Rentals sheet
+        "RUTAS_CROWD_CAP": g.apply(lambda s: s[is_crowd_routes.loc[s.index]].sum()),
+        "SHIPMENTS_DC":    g.apply(lambda s: s[is_dc_ship.loc[s.index]].sum()),
+        "SHIPMENTS_SP":    g.apply(lambda s: s[is_sp_ship.loc[s.index]].sum()),
+    }).reset_index()
+
+    return _finalize(agg, wanted)
+
 # -----------------------------------------------------------------------------
 # 5) Cálculo del plan
 # -----------------------------------------------------------------------------
+def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
+    resumen = resumen.drop(columns=["Demanda esperada", "DEMANDA_ESPERADA"], errors="ignore")
+    orden = [
+        "SVC","FECHA",
+        "FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)","DEMANDA_AJUSTADA",
+        "SPR_USADO","RUTAS_SPR_BASE",
+        "RUTAS_RENTALS","SPR_RENTALS",
+        # Crowd objetivo
+        "CROWD_PCT","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
+        "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO",
+        # MLP / E1
+        "RUTAS_MLP_SDD","RUTAS_MLP_SPOT",
+        "CROWD_E1_CAP","RUTAS_CROWDE1_USADAS",
+        "RUTAS_RESTANTES","RUTAS_FALTANTES",
+    ]
+    cols = [c for c in orden if c in resumen.columns] + [c for c in resumen.columns if c not in orden]
+    return resumen[cols]
+
 def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
     fcst     = load_fcst()
     spr      = load_spr()
     caps     = load_capacity_caps()
     crowdc   = load_crowd_caps()
     rents    = load_rentals_caps_from_sheet()
-    rents_fb = load_rentals_fallback()  # por si la pestaña Rentals no trae SVC/unidades
+    rents_fb = load_rentals_fallback()
 
-    # Normaliza SVC a str en todos los DF usados
     for d in (fcst, spr, caps, crowdc, rents, rents_fb):
         if not d.empty and "SVC" in d.columns:
             _as_str_cols(d, ["SVC"])
@@ -646,42 +668,47 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     else:
         out = ensure_columns(out, {"RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0, "RUTAS_CROWD_CAP":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
 
-       # Rentals desde pestaña Rentals (con SPR_RENTALS ponderado). Si vacío, usa fallback simple.
-    # IMPORTANTE: SIEMPRE eliminar la columna que vino de Capacity para no "heredar" valores.
+    # Rentals: SIEMPRE sobrescribir lo que vino de Capacity
     out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
-
     if not rents.empty:
         out = safe_merge(out, rents[["SVC","RUTAS_RENTALS","SPR_RENTALS"]], ["SVC"])
     elif not rents_fb.empty:
         out = safe_merge(out, rents_fb[["SVC","RUTAS_RENTALS"]], ["SVC"])
         out["SPR_RENTALS"] = np.nan
     else:
-        # Si Rentals y fallback están vacíos, crear la columna en 0
         out["RUTAS_RENTALS"] = 0
-        out["SPR_RENTALS"] = np.nan
+        out["SPR_RENTALS"]   = np.nan
 
-    # Normaliza tipos y fallback para SPR_RENTALS
     out["RUTAS_RENTALS"] = pd.to_numeric(out.get("RUTAS_RENTALS", 0), errors="coerce").fillna(0).astype(int)
     out["SPR_RENTALS"]   = pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce")
     out["SPR_RENTALS"]   = out["SPR_RENTALS"].fillna(out["SPR_USADO"])
 
-
-    # Fallback para SPR_RENTALS si quedó NaN: usar SPR_USADO
-    out["SPR_RENTALS"] = pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce")
-    out["SPR_RENTALS"] = out["SPR_RENTALS"].fillna(out["SPR_USADO"])
-
+    # CROWD: capacidades E1 y % objetivo + SPR específico de crowd
     if not crowdc.empty:
         out = safe_merge(out, crowdc[["SVC","CROWD_E1_CAP"]], ["SVC"])
     out = ensure_columns(out, {"CROWD_E1_CAP":0})
 
-    # FCST (sin DC & sin SP)
+    crowd_pct = load_crowd_pct_from_capacity()
+    spr_crowd = load_spr_crowd()
+
+    if not crowd_pct.empty:
+        out = safe_merge(out, crowd_pct, ["SVC"])
+    else:
+        out["CROWD_PCT"] = 0.0
+
+    if not spr_crowd.empty:
+        out = safe_merge(out, spr_crowd, ["SVC"])
+    out["SPR_CROWD"] = pd.to_numeric(out.get("SPR_CROWD", np.nan), errors="coerce")
+    out["SPR_CROWD"] = out["SPR_CROWD"].fillna(out["SPR_USADO"]).clip(lower=1)
+    out["CROWD_PCT"] = pd.to_numeric(out.get("CROWD_PCT", 0), errors="coerce").fillna(0).clip(0,1)
+
+    # FCST (sin DC & sin SP) y DEMANDA_AJUSTADA
     out = ensure_columns(out, {"FCST":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
     out["FCST (sin DC & sin SP)"] = (
         pd.to_numeric(out["FCST"], errors="coerce").fillna(0)
         - pd.to_numeric(out["SHIPMENTS_DC"], errors="coerce").fillna(0)
         - pd.to_numeric(out["SHIPMENTS_SP"], errors="coerce").fillna(0)
     ).clip(lower=0)
-
     out["DEMANDA_AJUSTADA"] = out["FCST (sin DC & sin SP)"]
 
     # Rutas base por SPR
@@ -690,17 +717,40 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     for c in ["RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","CROWD_E1_CAP"]:
         out[c] = pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0)
 
+    # 1) Descuenta Rentals al 100%
     out["RUTAS_POST_RENTALS"] = (out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"]).clip(lower=0)
-    out["RUTAS_CROWD_BASE"]   = np.minimum(out["RUTAS_POST_RENTALS"], out["RUTAS_CROWD_CAP"]).astype(int)
-    out["RUTAS_RESTANTES"]    = (out["RUTAS_POST_RENTALS"] - out["RUTAS_CROWD_BASE"]).clip(lower=0)
-    out["RUTAS_POST_MLP"]     = (out["RUTAS_RESTANTES"] - out["RUTAS_MLP_SDD"] - out["RUTAS_MLP_SPOT"]).clip(lower=0)
-    out["RUTAS_CROWDE1_USADAS"] = np.minimum(out["RUTAS_POST_MLP"], out["CROWD_E1_CAP"]).astype(int)
-    out["RUTAS_FALTANTES"]      = (out["RUTAS_POST_MLP"] - out["RUTAS_CROWDE1_USADAS"]).clip(lower=0)
+
+    # 2) Objetivo Crowd por % sobre FCST TOTAL
+    out["SHIP_OBJ_CROWD"]  = pd.to_numeric(out["FCST"], errors="coerce").fillna(0) * out["CROWD_PCT"]
+    out["RUTAS_CROWD_OBJ"] = np.ceil(out["SHIP_OBJ_CROWD"] / out["SPR_CROWD"]).astype(int)
+
+    # 3) Crowd BASE
+    out["RUTAS_CROWD_BASE"] = np.minimum.reduce([
+        out["RUTAS_POST_RENTALS"],
+        out["RUTAS_CROWD_CAP"],
+        out["RUTAS_CROWD_OBJ"]
+    ]).astype(int)
+
+    # 4) Crowd ESCALADO (E1)
+    exceso_obj = (out["RUTAS_CROWD_OBJ"] - out["RUTAS_CROWD_BASE"]).clip(lower=0)
+    rem_despues_base = (out["RUTAS_POST_RENTALS"] - out["RUTAS_CROWD_BASE"]).clip(lower=0)
+    out["RUTAS_CROWD_ESCALADO"] = np.minimum.reduce([
+        exceso_obj,
+        out["CROWD_E1_CAP"],
+        rem_despues_base
+    ]).astype(int)
+    out["RUTAS_CROWDE1_USADAS"] = out["RUTAS_CROWD_ESCALADO"]
+
+    # 5) Rutas restantes y MLP
+    out["RUTAS_RESTANTES"] = (out["RUTAS_POST_RENTALS"] - out["RUTAS_CROWD_BASE"] - out["RUTAS_CROWD_ESCALADO"]).clip(lower=0)
+    out["RUTAS_POST_MLP"]  = (out["RUTAS_RESTANTES"] - out["RUTAS_MLP_SDD"] - out["RUTAS_MLP_SPOT"]).clip(lower=0)
+
+    # 6) Faltantes finales
+    out["RUTAS_FALTANTES"] = out["RUTAS_POST_MLP"]
 
     if sel_svcs:
         out = out[out["SVC"].isin(sel_svcs)]
 
-    # Orden y limpieza final (incluye SPR_RENTALS junto a RUTAS_RENTALS)
     out = apply_output_adjustments(out).fillna(0).sort_values("SVC").reset_index(drop=True)
     return out
 
@@ -793,11 +843,13 @@ except Exception as e:
 
 with st.expander("ℹ️ Notas de esta versión"):
     st.markdown(textwrap.dedent("""
-    - Descuento **solo** “Shipments” de **Delivery Cell (DC)** y **Service Partners (SP)**.
-    - **Rentals** ahora se toma de la pestaña *Rentals* y su **SPR_RENTALS** se calcula ponderando
-      el histórico de la pestaña *SPR* por tipo homologado.
-    - Se elimina la columna *Demanda esperada* si existía y se muestra **SPR_RENTALS** a un lado de **RUTAS_RENTALS**.
-    - Fix de merges (llaves a texto) para evitar float64 vs object.
-    - Se mantiene toda la robustez: headers dobles, alias, coerción numérica/fechas, etc.
+    - Rentals desde pestaña **Rentals** (fuzzy en “Unidades dispon…”) con **SPR_RENTALS** ponderado por tipo (histórico SPR).
+      Siempre sobrescribe lo de Capacity y se usa 100% antes de Crowd/MLP.
+    - Crowd: calcula **CROWD_PCT** desde **Capacity** (Crowd Shipments / Shipments totales),
+      define **SHIP_OBJ_CROWD**, **SPR_CROWD**, **RUTAS_CROWD_OBJ**, reparte en **RUTAS_CROWD_BASE** (cap/objetivo)
+      y **RUTAS_CROWD_ESCALADO** (E1).
+    - Se eliminó *Demanda esperada* si existía.
+    - Fix de merges (llaves a texto) y lectura robusta de headers (SVC/SVCs/LC/Facility).
     """))
+
 
