@@ -1015,7 +1015,7 @@ auto_run = False
 sel_svcs: List[str] = []
 
 with st.expander("▶️ Cargando datos...", expanded=True):
-        try:
+    try:
         if not SHEET_ID:
             st.warning("Falta `SHEET_ID`. Pégalo en la barra lateral.")
             svc_list = []
@@ -1032,10 +1032,8 @@ with st.expander("▶️ Cargando datos...", expanded=True):
                 [fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs, mlp_svcs],
                 axis=0, ignore_index=True
             )
-            # 👇 Limpia ANTES de convertir a str permanente
             svc_list = _clean_svc_values(base_svcs.get("SVC", pd.Series(dtype=object)))
 
-        # defaults robustos
         default_sel = [s for s in DEFAULT_SVCS if s in svc_list] or svc_list[:4]
         sel_svcs = st.multiselect(
             "Filtrar SVC",
@@ -1049,37 +1047,3 @@ with st.expander("▶️ Cargando datos...", expanded=True):
     except Exception as e:
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
-
-if 'auto_run_once' not in st.session_state:
-    st.session_state['auto_run_once'] = True
-    auto_run = True
-
-try:
-    if run_btn or auto_run:
-        if not SHEET_ID:
-            st.warning("Proporciona `SHEET_ID` para calcular.")
-        else:
-            plan = compute_plan(spr_mode, sel_svcs or DEFAULT_SVCS)
-            if plan.empty:
-                st.warning("No hay datos para mostrar con los filtros seleccionados.")
-            else:
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("SVCs", plan["SVC"].nunique())
-                c2.metric("Demanda ajustada", int(plan["DEMANDA_AJUSTADA"].sum()))
-                c3.metric("Rutas (SPR base)", int(plan["RUTAS_SPR_BASE"].sum()))
-                c4.metric("Rutas faltantes", int(plan["RUTAS_FALTANTES"].sum()))
-                st.dataframe(plan, use_container_width=True, hide_index=True)
-except Exception as e:
-    st.error("Ocurrió un error durante el cálculo.")
-    show_exception(e, "Traceback completo")
-
-with st.expander("ℹ️ Notas de esta versión"):
-    st.markdown(textwrap.dedent("""
-    - Rentals desde **Rentals** con **SPR_RENTALS** ponderado; se usa 100% antes de Crowd/MLP.
-    - Crowd por % de **Capacity**: **CROWD_PCT**, **SHIP_OBJ_CROWD**, **SPR_CROWD**, base y escalado (E1).
-    - **MLP** desde **SRM**:
-        - Sumo **solo por tipo** (LV / SV / Car) y **excluyo** columnas “Total …” en SDD/SPOT.
-        - **Backlog** = columnas con `back|backlog|bu`.
-        - Asigno rutas con prioridad **SDD → SPOT → Backlog**.
-    """))
-
