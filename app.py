@@ -300,7 +300,7 @@ def load_capacity_caps() -> pd.DataFrame:
     is_rentals      = dm_norm.str.contains("rent",  regex=False)
     is_crowd_routes = dm_norm.str.contains("crowd", regex=False) & (
                         tipo_norm.str.contains("route",  regex=False) |
-                        tipodm_norm.str_contains("route", regex=False)
+                        tipodm_norm.astype(str).str.contains("route", case=False, regex=False, na=False)
                       )
     is_mlp_spot     = dm_norm.str.contains("mlp",   regex=False) & tipodm_norm.str.contains("spot", regex=False)
     is_mlp_sdd      = dm_norm.str.contains("mlp",   regex=False) & (~is_mlp_spot) & (
@@ -526,7 +526,8 @@ with st.expander("▶️ Cargando datos...", expanded=True):
             svc_list = []
         else:
             fcst_svcs    = load_fcst()[["SVC"]]
-            cap_svcs     = load_capacity_caps()[["SVC"]]
+            caps = load_capacity_caps()
+            cap_svcs = caps[["SVC"]] if "SVC" in caps.columns else caps.to_frame(name="SVC")
             crowd_svcs   = load_crowd_caps()[["SVC"]]
             rent_fb_svcs = load_rentals_fallback()[["SVC"]]
             base_svcs = pd.concat([fcst_svcs, cap_svcs, crowd_svcs, rent_fb_svcs], axis=0).drop_duplicates()
