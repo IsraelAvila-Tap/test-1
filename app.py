@@ -312,17 +312,18 @@ def load_capacity_caps() -> pd.DataFrame:
     # ONLY Shipments de DC y SP
     is_shipments = tipo_norm.str.contains("ship", regex=False)
 
-     is_dc = (
-        (dm_norm.str.contains("delivery", regex=False) & dm_norm.str.contains("cell", regex=False)) |
-        tipodm_norm.str.contains("delivery cell", regex=False) |
-        tipodm_norm.str.contains(r"^(dc|cell)$", case=False, regex=True)
-     )
+    is_dc = (
+    (dm_norm.str.contains("delivery", regex=False) & dm_norm.str.contains("cell", regex=False)) |
+    tipodm_norm.str.contains("delivery cell", regex=False) |
+    tipodm_norm.str.contains(r"^(dc|cell)$", case=False, regex=True)
+)
 
-    is_sp = (
-        dm_norm.str.contains(r"^(s\.?p\.?|sp)$", case=False, regex=True) |
-        (dm_norm.str.contains("service", regex=False) & dm_norm.str.contains("partner", regex=False)) |
-        tipodm_norm.str.contains(r"\bsp\b|service partner", case=False, regex=True)
-    )
+is_sp = (
+    dm_norm.str.contains(r"^(s\.?p\.?|sp)$", case=False, regex=True) |
+    (dm_norm.str.contains("service", regex=False) & dm_norm.str.contains("partner", regex=False)) |
+    tipodm_norm.str.contains(r"\bsp\b|service partner", case=False, regex=True)
+)
+
 
 
     is_dc_ship = is_shipments & is_dc
