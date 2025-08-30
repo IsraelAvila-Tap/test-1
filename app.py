@@ -469,12 +469,14 @@ def load_crowd_caps() -> pd.DataFrame:
 # ---- Nuevo: % de Crowd desde Capacity y SPR_CROWD ----
 def load_crowd_pct_from_capacity() -> pd.DataFrame:
     """
-    %Crowd = (Shipments Crowd) / (Shipments Totales) por SVC con la última fecha disponible.
+    %Crowd = (Shipments Crowd) / (Shipments Totales) por SVC,
+    sumando TODAS las filas del día más reciente por SVC.
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
     if df.empty:
         return pd.DataFrame(columns=["SVC", "CROWD_PCT"])
 
+    # Normaliza columnas
     find_and_rename(df, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "Capacity")
     find_and_rename(df, ["Tipo","Type","Category"], "TIPO", False, "Capacity")
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Capacity")
@@ -485,27 +487,34 @@ def load_crowd_pct_from_capacity() -> pd.DataFrame:
     df = ensure_columns(df, {"DELIVERY_MODEL":"", "TIPO":"", "TIPO_DM":"", "SVC":None, "FECHA": pd.NaT, "CANT":0})
     df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
     df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
-
-    if df["FECHA"].notna().any():
-        idx = df.groupby("SVC")["FECHA"].idxmax()
-        df = df.loc[idx]
     df = _as_str_cols(df, ["SVC"])
 
-    tipo = df["TIPO"].astype(str).str.lower()
-    dm   = df["DELIVERY_MODEL"].astype(str).str.lower()
+    # ► En lugar de elegir UNA fila con idxmax, filtramos TODAS las filas de la última fecha por SVC
+    if df["FECHA"].notna().any():
+        last_by_svc = df.groupby("SVC")["FECHA"].transform("max")
+        df = df[df["FECHA"] == last_by_svc]
+
+    tipo   = df["TIPO"].astype(str).str.lower()
+    dm     = df["DELIVERY_MODEL"].astype(str).str.lower()
     tipodm = df["TIPO_DM"].astype(str).str.lower()
 
     is_shipments = tipo.str.contains("ship", regex=False)
-    is_crowd = is_shipments & (dm.str.contains("crowd", regex=False) | tipodm.str.contains("crowd", regex=False) | tipo.str.contains("crowd", regex=False))
+    is_crowd = is_shipments & (
+        dm.str.contains("crowd", regex=False) |
+        tipodm.str.contains("crowd", regex=False) |
+        tipo.str.contains("crowd", regex=False)
+    )
 
     tot = df[is_shipments].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_TOT")
     crd = df[is_crowd].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_CROWD")
+
     out = pd.concat([tot, crd], axis=1).reset_index()
     out = _as_str_cols(out, ["SVC"])
     out["SHIP_TOT"]   = pd.to_numeric(out["SHIP_TOT"], errors="coerce").fillna(0)
     out["SHIP_CROWD"] = pd.to_numeric(out["SHIP_CROWD"], errors="coerce").fillna(0)
     out["CROWD_PCT"]  = (out["SHIP_CROWD"] / out["SHIP_TOT"]).replace([np.inf,-np.inf], 0).fillna(0)
-    return out[["SVC", "CROWD_PCT"]]
+
+    return out[["SVC","CROWD_PCT"]]
 
 def load_spr_crowd() -> pd.DataFrame:
     """
