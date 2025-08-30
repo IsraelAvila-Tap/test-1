@@ -77,6 +77,14 @@ def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFram
             df[c] = v
     return df
 
+# --- NUEVO: forzar columnas a texto (evita merge float64 vs object) ---
+def _as_str_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+    return df
+# ----------------------------------------------------------------------
+
 _NUM_SEP_RE = re.compile(r"[ ,\u00A0]")
 
 def _maybe_to_numeric(series_like):
@@ -295,13 +303,19 @@ def load_spr_hist_from_sheet() -> pd.DataFrame:
     find_and_rename(spr, ["SPR","spr","Ships per route"], "SPR", False, "SPR")
     spr = ensure_columns(spr, {"SVC": None, "SHP_LG_VEHICLE_TYPE":"", "SPR": np.nan})
     spr["SPR"] = pd.to_numeric(spr["SPR"], errors="coerce")
+
+    spr = _as_str_cols(spr, ["SVC", "SHP_LG_VEHICLE_TYPE"])
     spr["VEHICULO_TIPO_HOM"] = spr["SHP_LG_VEHICLE_TYPE"].map(homologar_vehicle_type)
+
     grp_local = spr.groupby(["SVC","VEHICULO_TIPO_HOM"], dropna=False)["SPR"].median().reset_index().rename(columns={"SPR":"SPR_HIST"})
     grp_glob  = spr.groupby("VEHICULO_TIPO_HOM")["SPR"].median().rename("SPR_GLOBAL_TIPO").reset_index()
+
     out = grp_local.merge(grp_glob, on="VEHICULO_TIPO_HOM", how="right")
     out["SVC"] = out["SVC"].fillna("__GLOBAL__")
     out["SPR_HIST"] = out["SPR_HIST"].fillna(out["SPR_GLOBAL_TIPO"])
-    return out.drop(columns=["SPR_GLOBAL_TIPO"])
+    out = out.drop(columns=["SPR_GLOBAL_TIPO"])
+    out = _as_str_cols(out, ["SVC","VEHICULO_TIPO_HOM"])
+    return out
 
 def load_rentals_caps_from_sheet() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
@@ -312,13 +326,18 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
     find_and_rename(df, ["Unidades","Unidades dispon","Qty","Cantidad"], "UNIDADES", False, "Rentals")
     df = ensure_columns(df, {"SVC": None, "TIPO_VEHICULO":"", "UNIDADES":0})
     df["UNIDADES"] = pd.to_numeric(df["UNIDADES"], errors="coerce").fillna(0)
+
+    df = _as_str_cols(df, ["SVC","TIPO_VEHICULO"])
     df["VEHICULO_TIPO_HOM"] = df["TIPO_VEHICULO"].map(homologar_vehicle_type)
 
     by_type = df.groupby(["SVC","VEHICULO_TIPO_HOM"], dropna=False)["UNIDADES"].sum().reset_index()
+    by_type = _as_str_cols(by_type, ["SVC","VEHICULO_TIPO_HOM"])
 
     spr_hist = load_spr_hist_from_sheet()
     spr_loc  = spr_hist[spr_hist["SVC"] != "__GLOBAL__"]
+    spr_loc  = _as_str_cols(spr_loc, ["SVC","VEHICULO_TIPO_HOM"])
     spr_glob = spr_hist[spr_hist["SVC"] == "__GLOBAL__"].drop(columns=["SVC"]).rename(columns={"SPR_HIST":"SPR_GLOBAL_TIPO"})
+    spr_glob = _as_str_cols(spr_glob, ["VEHICULO_TIPO_HOM"])
 
     by_type = by_type.merge(spr_loc, on=["SVC","VEHICULO_TIPO_HOM"], how="left") \
                      .merge(spr_glob, on=["VEHICULO_TIPO_HOM"], how="left")
@@ -332,6 +351,7 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
     spr_r["SPR_RENTALS"] = (spr_r["POND"] / spr_r["PESO"]).replace([np.inf,-np.inf], np.nan)
 
     out = rentals_sum.merge(spr_r[["SVC","SPR_RENTALS"]], on="SVC", how="left")
+    out = _as_str_cols(out, ["SVC"])
     return out[["SVC","RUTAS_RENTALS","SPR_RENTALS"]]
 
 def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
@@ -499,12 +519,17 @@ def load_crowd_caps() -> pd.DataFrame:
 # 5) Cálculo del plan
 # -----------------------------------------------------------------------------
 def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
-    fcst    = load_fcst()
-    spr     = load_spr()
-    caps    = load_capacity_caps()
-    crowdc  = load_crowd_caps()
-    rents   = load_rentals_caps_from_sheet()
+    fcst     = load_fcst()
+    spr      = load_spr()
+    caps     = load_capacity_caps()
+    crowdc   = load_crowd_caps()
+    rents    = load_rentals_caps_from_sheet()
     rents_fb = load_rentals_fallback()  # por si la pestaña Rentals no trae SVC/unidades
+
+    # Normaliza SVC a str en todos los DF usados
+    for d in (fcst, spr, caps, crowdc, rents, rents_fb):
+        if not d.empty and "SVC" in d.columns:
+            _as_str_cols(d, ["SVC"])
 
     hoy = date.today()
 
@@ -513,8 +538,11 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
         if "SVC" in d.columns and not d.empty:
             bases.append(d[["SVC"]])
     base = pd.concat(bases, axis=0).drop_duplicates() if bases else pd.DataFrame(columns=["SVC"])
+    base = _as_str_cols(base, ["SVC"])
+
     out = base.copy()
     out["FECHA"] = hoy
+    out = _as_str_cols(out, ["SVC"])
 
     if not fcst.empty:
         out = safe_merge(out, fcst[["SVC","FCST"]], ["SVC"])
@@ -626,12 +654,13 @@ with st.expander("▶️ Cargando datos...", expanded=True):
             svc_list = []
         else:
             fcst_svcs    = load_fcst()[["SVC"]]
-            caps = load_capacity_caps()
-            cap_svcs = caps[["SVC"]] if "SVC" in caps.columns else caps.to_frame(name="SVC")
+            caps         = load_capacity_caps()
+            cap_svcs     = caps[["SVC"]] if "SVC" in caps.columns else caps.to_frame(name="SVC")
             crowd_svcs   = load_crowd_caps()[["SVC"]]
             rents_svcs   = load_rentals_caps_from_sheet()[["SVC"]]
             rent_fb_svcs = load_rentals_fallback()[["SVC"]]
             base_svcs = pd.concat([fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs], axis=0).drop_duplicates()
+            base_svcs = _as_str_cols(base_svcs, ["SVC"])
             svc_list = sorted(base_svcs["SVC"].dropna().astype(str).unique().tolist())
 
         default_sel = [s for s in DEFAULT_SVCS if s in svc_list] or svc_list[:4]
@@ -671,6 +700,7 @@ with st.expander("ℹ️ Notas de esta versión"):
     - **Rentals** ahora se toma de la pestaña *Rentals* y su **SPR_RENTALS** se calcula ponderando
       el histórico de la pestaña *SPR* por tipo homologado.
     - Se elimina la columna *Demanda esperada* si existía y se muestra **SPR_RENTALS** a un lado de **RUTAS_RENTALS**.
+    - Fix de merges (llaves a texto) para evitar float64 vs object.
     - Se mantiene toda la robustez: headers dobles, alias, coerción numérica/fechas, etc.
     """))
 
