@@ -849,67 +849,98 @@ def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
     cols = [c for c in orden if c in resumen.columns] + [c for c in resumen.columns if c not in orden]
     return resumen[cols]
 
-def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
-    fcst     = load_fcst()
-    spr      = load_spr()
-    caps     = load_capacity_caps()
-    crowdc   = load_crowd_caps()
-    rents    = load_rentals_caps_from_sheet()
-    rents_fb = load_rentals_fallback()
-    crowd_pct= load_crowd_pct_from_capacity()
-    spr_crowd= load_spr_crowd()
-    mlp_caps = load_mlp_caps_from_srm()
-    spr_mlp  = load_spr_mlp()
 
+def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
+    # --- carga de datos ---
+    fcst      = load_fcst()
+    spr       = load_spr()
+    caps      = load_capacity_caps()
+    crowdc    = load_crowd_caps()
+    rents     = load_rentals_caps_from_sheet()
+    rents_fb  = load_rentals_fallback()
+    crowd_pct = load_crowd_pct_from_capacity()
+    spr_crowd = load_spr_crowd()
+    mlp_caps  = load_mlp_caps_from_srm()
+    spr_mlp   = load_spr_mlp()
+
+    # normaliza SVC = str sin espacios
     for d in (fcst, spr, caps, crowdc, rents, rents_fb, crowd_pct, spr_crowd, mlp_caps, spr_mlp):
-        if not d.empty and "SVC" in d.columns: _as_str_cols(d, ["SVC"])
+        if not d.empty and "SVC" in d.columns:
+            _as_str_cols(d, ["SVC"])
 
     hoy = date.today()
+
+    # ----------------- BASE DE SVCs -----------------
+    # 1) intenta construir base a partir de los tabs
     bases = []
     for d in [fcst, spr, caps, crowdc, rents, rents_fb, crowd_pct, mlp_caps]:
-        if "SVC" in d.columns and not d.empty: bases.append(d[["SVC"]])
+        if "SVC" in d.columns and not d.empty:
+            bases.append(d[["SVC"]])
     base = pd.concat(bases, axis=0).drop_duplicates() if bases else pd.DataFrame(columns=["SVC"])
+
+    # 2) si no hay nada en tabs, construye base desde selección o defaults
+    if base.empty:
+        chosen = _clean_svc_values(sel_svcs or DEFAULT_SVCS)
+        base = pd.DataFrame({"SVC": chosen})
+
     base = _as_str_cols(base, ["SVC"])
 
-    out = base.copy(); out["FECHA"] = hoy; out = _as_str_cols(out, ["SVC"])
+    out = base.copy()
+    out["FECHA"] = hoy
+    out = _as_str_cols(out, ["SVC"])
 
-    if not fcst.empty: out = safe_merge(out, fcst[["SVC","FCST"]], ["SVC"])
-    if not spr.empty:  out = safe_merge(out, spr[["SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"]], ["SVC"])
+    # ----------------- MERGES PRINCIPALES -----------------
+    if not fcst.empty:
+        out = safe_merge(out, fcst[["SVC","FCST"]], ["SVC"])
 
+    if not spr.empty:
+        out = safe_merge(out, spr[["SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"]], ["SVC"])
+
+    # SPR a usar según modo (promedio/peak/plan), con fallback y clip
     spr_mode_col = {"promedio":"SPR_PROM", "peak":"SPR_PEAK", "plan":"SPR_OBJ"}.get(spr_mode, "SPR_PROM")
     out = ensure_columns(out, {"SPR_OBJ":np.nan, "SPR_PEAK":np.nan, "SPR_PROM":np.nan})
     spr_usado = out[spr_mode_col].where(out[spr_mode_col].notna(), out["SPR_OBJ"]).fillna(20)
     out["SPR_USADO"] = pd.to_numeric(spr_usado, errors="coerce").fillna(20).clip(lower=1)
 
+    # Capacity (MLP legacy caps, rentals, crowd cap, shipments DC/SP)
     if not caps.empty:
         out = safe_merge(out, caps[["SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","SHIPMENTS_DC","SHIPMENTS_SP"]], ["SVC"])
     else:
         out = ensure_columns(out, {"RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0, "RUTAS_CROWD_CAP":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
 
-    # Rentals override
+    # Rentals: sobrescribe lo que venga de Capacity con el cálculo de Rentals
     out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
     if not rents.empty:
         out = safe_merge(out, rents[["SVC","RUTAS_RENTALS","SPR_RENTALS"]], ["SVC"])
     elif not rents_fb.empty:
-        out = safe_merge(out, rents_fb[["SVC","RUTAS_RENTALS"]], ["SVC"]); out["SPR_RENTALS"] = np.nan
+        out = safe_merge(out, rents_fb[["SVC","RUTAS_RENTALS"]], ["SVC"])
+        out["SPR_RENTALS"] = np.nan
     else:
-        out["RUTAS_RENTALS"] = 0; out["SPR_RENTALS"] = np.nan
+        out["RUTAS_RENTALS"] = 0
+        out["SPR_RENTALS"]   = np.nan
+
     out["RUTAS_RENTALS"] = pd.to_numeric(out.get("RUTAS_RENTALS", 0), errors="coerce").fillna(0).astype(int)
     out["SPR_RENTALS"]   = pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce")
     out["SPR_RENTALS"]   = out["SPR_RENTALS"].fillna(out["SPR_USADO"])
 
-    # Crowd
-    if not crowdc.empty: out = safe_merge(out, crowdc[["SVC","CROWD_E1_CAP"]], ["SVC"])
+    # Crowd caps (E1) y % crowd desde Capacity + SPR_CROWD
+    if not crowdc.empty:
+        out = safe_merge(out, crowdc[["SVC","CROWD_E1_CAP"]], ["SVC"])
     out = ensure_columns(out, {"CROWD_E1_CAP":0})
 
-    if not crowd_pct.empty: out = safe_merge(out, crowd_pct, ["SVC"])
-    else: out["CROWD_PCT"] = 0.0
+    if not crowd_pct.empty:
+        out = safe_merge(out, crowd_pct, ["SVC"])
+    else:
+        out["CROWD_PCT"] = 0.0
 
-    if not spr_crowd.empty: out = safe_merge(out, spr_crowd, ["SVC"])
-    out["SPR_CROWD"] = pd.to_numeric(out.get("SPR_CROWD", np.nan), errors="coerce").fillna(out["SPR_USADO"]).clip(lower=1)
+    if not spr_crowd.empty:
+        out = safe_merge(out, spr_crowd, ["SVC"])
+
+    out["SPR_CROWD"] = pd.to_numeric(out.get("SPR_CROWD", np.nan), errors="coerce")
+    out["SPR_CROWD"] = out["SPR_CROWD"].fillna(out["SPR_USADO"]).clip(lower=1)
     out["CROWD_PCT"] = pd.to_numeric(out.get("CROWD_PCT", 0), errors="coerce").fillna(0).clip(0,1)
 
-    # FCST ajustado
+    # ----------------- DEMANDA & SPR BASE -----------------
     out = ensure_columns(out, {"FCST":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
     out["FCST (sin DC & sin SP)"] = (
         pd.to_numeric(out["FCST"], errors="coerce").fillna(0)
@@ -923,16 +954,19 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     for c in ["RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","CROWD_E1_CAP"]:
         out[c] = pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0)
 
-    # Crowd objetivo / asignación
+    # ----------------- CROWD ASIGNACIÓN -----------------
     out["SHIP_OBJ_CROWD"]  = pd.to_numeric(out["FCST"], errors="coerce").fillna(0) * out["CROWD_PCT"]
     out["RUTAS_CROWD_OBJ"] = np.ceil(out["SHIP_OBJ_CROWD"] / out["SPR_CROWD"]).astype(int)
+
     out["RUTAS_CROWD_BASE"] = np.minimum.reduce([
         np.maximum(out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"], 0),
         out["RUTAS_CROWD_CAP"],
         out["RUTAS_CROWD_OBJ"]
     ]).astype(int)
+
     exceso_obj = (out["RUTAS_CROWD_OBJ"] - out["RUTAS_CROWD_BASE"]).clip(lower=0)
     rem_despues_base = (np.maximum(out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"], 0) - out["RUTAS_CROWD_BASE"]).clip(lower=0)
+
     out["RUTAS_CROWD_ESCALADO"] = np.minimum.reduce([exceso_obj, out["CROWD_E1_CAP"], rem_despues_base]).astype(int)
     out["RUTAS_CROWDE1_USADAS"] = out["RUTAS_CROWD_ESCALADO"]
 
@@ -941,20 +975,30 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     out["SHIP_CROWD"]   = (out["RUTAS_CROWD_BASE"] + out["RUTAS_CROWD_ESCALADO"]) * out["SPR_CROWD"]
 
     base_otros = pd.to_numeric(out["SHIPMENTS_DC"], errors="coerce").fillna(0) + pd.to_numeric(out["SHIPMENTS_SP"], errors="coerce").fillna(0)
-    out["SHIP_RESTANTES_PRE_MLP"] = (pd.to_numeric(out["FCST"], errors="coerce").fillna(0) - base_otros - out["SHIP_RENTALS"] - out["SHIP_CROWD"]).clip(lower=0)
+    out["SHIP_RESTANTES_PRE_MLP"] = (
+        pd.to_numeric(out["FCST"], errors="coerce").fillna(0) - base_otros - out["SHIP_RENTALS"] - out["SHIP_CROWD"]
+    ).clip(lower=0)
 
-    # MLP caps y SPR_MLP
-    if not mlp_caps.empty: out = safe_merge(out, mlp_caps, ["SVC"])
-    else: out = ensure_columns(out, {"MLP_SDD_LV":0,"MLP_SDD_SV":0,"MLP_SDD_CAR":0,"MLP_SDD_CAP":0,"MLP_SPOT_LV":0,"MLP_SPOT_SV":0,"MLP_SPOT_CAR":0,"MLP_SPOT_CAP":0,"MLP_BACK_CAP":0})
+    # ----------------- MLP (caps SRM + SPR_MLP) -----------------
+    if not mlp_caps.empty:
+        out = safe_merge(out, mlp_caps, ["SVC"])
+    else:
+        out = ensure_columns(out, {
+            "MLP_SDD_LV":0,"MLP_SDD_SV":0,"MLP_SDD_CAR":0,"MLP_SDD_CAP":0,
+            "MLP_SPOT_LV":0,"MLP_SPOT_SV":0,"MLP_SPOT_CAR":0,"MLP_SPOT_CAP":0,
+            "MLP_BACK_CAP":0
+        })
 
-    if not spr_mlp.empty: out = safe_merge(out, spr_mlp, ["SVC"])
-    out["SPR_MLP"] = pd.to_numeric(out.get("SPR_MLP", np.nan), errors="coerce").fillna(out["SPR_USADO"]).clip(lower=1)
+    if not spr_mlp.empty:
+        out = safe_merge(out, spr_mlp, ["SVC"])
 
-    # Rutas MLP necesarias totales
+    out["SPR_MLP"] = pd.to_numeric(out.get("SPR_MLP", np.nan), errors="coerce")
+    out["SPR_MLP"] = out["SPR_MLP"].fillna(out["SPR_USADO"]).clip(lower=1)
+
     out["RUTAS_MLP_NEEDED"] = np.ceil(out["SHIP_RESTANTES_PRE_MLP"] / out["SPR_MLP"]).astype(int)
 
-    # Asignación (prioridad SDD -> SPOT -> BACKLOG)
-    need  = out["RUTAS_MLP_NEEDED"]
+    # Asignación priorizada: SDD → SPOT → BACKLOG
+    need     = out["RUTAS_MLP_NEEDED"]
     use_sdd  = np.minimum(need, out.get("MLP_SDD_CAP", 0))
     need2    = (need - use_sdd).clip(lower=0)
     use_spot = np.minimum(need2, out.get("MLP_SPOT_CAP", 0))
@@ -969,8 +1013,13 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     out["RUTAS_POST_MLP"]  = out["RUTAS_RESTANTES"]
     out["RUTAS_FALTANTES"] = out["RUTAS_RESTANTES"]
 
-    if sel_svcs: out = out[out["SVC"].isin(sel_svcs)]
+    # ----------------- FILTRO FINAL POR SELECCIÓN -----------------
+    if sel_svcs:
+        sel_svcs = _clean_svc_values(sel_svcs)
+        if sel_svcs:
+            out = out[out["SVC"].isin(sel_svcs)]
 
+    # ----------------- ORDEN & LIMPIEZA -----------------
     out = apply_output_adjustments(out).fillna(0).sort_values("SVC").reset_index(drop=True)
     return out
 
@@ -1032,12 +1081,21 @@ with st.expander("▶️ Cargando datos...", expanded=True):
                 [fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs, mlp_svcs],
                 axis=0, ignore_index=True
             )
+
+            # limpia nulos/raros
             svc_list = _clean_svc_values(base_svcs.get("SVC", pd.Series(dtype=object)))
 
-        default_sel = [s for s in DEFAULT_SVCS if s in svc_list] or svc_list[:4]
+        # si no hay nada en sheets, usa los defaults
+        if not svc_list:
+            svc_list = sorted(set(DEFAULT_SVCS))
+
+        # muestra también defaults aunque no estén en sheets
+        options_union = sorted(set(svc_list) | set(DEFAULT_SVCS))
+
+        default_sel = [s for s in DEFAULT_SVCS if s in options_union] or options_union[:4]
         sel_svcs = st.multiselect(
             "Filtrar SVC",
-            options=svc_list,
+            options=options_union,
             default=default_sel,
             placeholder="Selecciona SVCs"
         )
