@@ -800,23 +800,13 @@ def load_spr_mlp() -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # 5) Cálculo del plan
 # -----------------------------------------------------------------------------
-def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
-    """
-    Reordena columnas y elimina auxiliares. Muestra:
-      - SDD/SPOT = rutas usadas (sumadas) calculadas en compute_plan
-      - BACKLOG = rutas usadas de backlog
-    """
-    # Quita auxiliares internas y legados no deseados
-    drop_cols = [
-        "RUTAS_MLP_SDD_USADAS",
-        "RUTAS_MLP_SPOT_USADAS",
-        "RUTAS_MLP_BACKLOG_USADAS",
-        "RUTAS_POST_MLP",
-        "Demanda esperada", "DEMANDA_ESPERADA",
-    ]
-    resumen = resumen.drop(columns=drop_cols, errors="ignore")
 
-      orden = [
+def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
+    # quitar restos/alias
+    resumen = resumen.drop(columns=["Demanda esperada", "DEMANDA_ESPERADA"], errors="ignore")
+
+    # orden final (incluye nuevas columnas de capacidad total y riesgo)
+    orden = [
         "SVC","FECHA",
         "FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)","DEMANDA_AJUSTADA",
         "SPR_USADO","RUTAS_SPR_BASE",
@@ -825,19 +815,29 @@ def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
         "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO",
         "SHIP_RENTALS","SHIP_CROWD","SHIP_RESTANTES_PRE_MLP",
         "SPR_MLP",
+        # Capacidades MLP por tipo y totales
         "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
         "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
         "MLP_BACK_CAP",
+        # Asignación de rutas MLP
         "RUTAS_MLP_NEEDED","RUTAS_MLP_SDD_USADAS","RUTAS_MLP_SPOT_USADAS","RUTAS_MLP_BACKLOG_USADAS",
+        # E1/MLP y faltantes
         "CROWD_E1_CAP","RUTAS_CROWDE1_USADAS",
         "RUTAS_RESTANTES","RUTAS_FALTANTES",
-        # 🔥 NUEVO
-        "CAP_TOTAL","CAP_VS_FCST","RIESGO"
+        # NUEVO: capacidad global y riesgo
+        "CAP_TOTAL","CAP_VS_FCST","RIESGO",
     ]
 
-    ]
+    # si por alguna razón quedaron columnas auxiliares de capacidad, las removemos
+    resumen = resumen.drop(
+        columns=["RUTAS_MLP_SDD_CAPACITY","RUTAS_MLP_SPOT_CAPACITY"],
+        errors="ignore"
+    )
+
     cols = [c for c in orden if c in resumen.columns] + [c for c in resumen.columns if c not in orden]
     return resumen[cols]
+
+
 
 def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
     # --- carga de datos ---
