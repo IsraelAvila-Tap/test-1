@@ -265,8 +265,100 @@ def load_spr() -> pd.DataFrame:
     out["FECHA"] = date.today()
     return _finalize(out, ["FECHA","SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"])
 
+# -------------------- INTEGRACIÓN NUEVA: Rentals con homologación + SPR histórico --------------------
+def _norm_txt(x: str) -> str:
+    x = (x or "").strip().lower()
+    rep = {"eléctrica":"electric","eléctrico":"electric","electrica":"electric","electrico":"electric"}
+    for a,b in rep.items(): x = x.replace(a,b)
+    x = re.sub(r"\brental(s)?\b", "", x)
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
+
+def homologar_vehicle_type(raw: str) -> str:
+    t = _norm_txt(str(raw))
+    if re.search(r"\blarge\s+van\s+electric\b", t): return "Large Van Electric"
+    if re.search(r"\blarge\s+van\b", t):           return "Large Van"
+    if re.search(r"\bsmall\s+van\s+electric\b", t):return "Small Van Electric"
+    if re.search(r"\bsmall\s+van\b", t):           return "Small Van"
+    if re.search(r"\blarge.*electric\b", t):       return "Large Van Electric"
+    if re.search(r"\bsmall.*electric\b", t):       return "Small Van Electric"
+    if "large" in t:                               return "Large Van"
+    if "small" in t:                               return "Small Van"
+    return "Large Van"
+
+def load_spr_hist_from_sheet() -> pd.DataFrame:
+    spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
+    if spr.empty:
+        return pd.DataFrame(columns=["SVC", "VEHICULO_TIPO_HOM", "SPR_HIST"])
+    find_and_rename(spr, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SPR")
+    find_and_rename(spr, ["SHP_LG_VEHICLE_TYPE","Vehicle type","Tipo de vehículo","Tipo de vehiculo"], "SHP_LG_VEHICLE_TYPE", False, "SPR")
+    find_and_rename(spr, ["SPR","spr","Ships per route"], "SPR", False, "SPR")
+    spr = ensure_columns(spr, {"SVC": None, "SHP_LG_VEHICLE_TYPE":"", "SPR": np.nan})
+    spr["SPR"] = pd.to_numeric(spr["SPR"], errors="coerce")
+    spr["VEHICULO_TIPO_HOM"] = spr["SHP_LG_VEHICLE_TYPE"].map(homologar_vehicle_type)
+    grp_local = spr.groupby(["SVC","VEHICULO_TIPO_HOM"], dropna=False)["SPR"].median().reset_index().rename(columns={"SPR":"SPR_HIST"})
+    grp_glob  = spr.groupby("VEHICULO_TIPO_HOM")["SPR"].median().rename("SPR_GLOBAL_TIPO").reset_index()
+    out = grp_local.merge(grp_glob, on="VEHICULO_TIPO_HOM", how="right")
+    out["SVC"] = out["SVC"].fillna("__GLOBAL__")
+    out["SPR_HIST"] = out["SPR_HIST"].fillna(out["SPR_GLOBAL_TIPO"])
+    return out.drop(columns=["SPR_GLOBAL_TIPO"])
+
+def load_rentals_caps_from_sheet() -> pd.DataFrame:
+    df = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
+    if df.empty:
+        return pd.DataFrame(columns=["SVC","RUTAS_RENTALS","SPR_RENTALS"])
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "Rentals")
+    find_and_rename(df, ["Tipo de vehiculo","Tipo de vehículo","Vehicle type","Tipo"], "TIPO_VEHICULO", False, "Rentals")
+    find_and_rename(df, ["Unidades","Unidades dispon","Qty","Cantidad"], "UNIDADES", False, "Rentals")
+    df = ensure_columns(df, {"SVC": None, "TIPO_VEHICULO":"", "UNIDADES":0})
+    df["UNIDADES"] = pd.to_numeric(df["UNIDADES"], errors="coerce").fillna(0)
+    df["VEHICULO_TIPO_HOM"] = df["TIPO_VEHICULO"].map(homologar_vehicle_type)
+
+    by_type = df.groupby(["SVC","VEHICULO_TIPO_HOM"], dropna=False)["UNIDADES"].sum().reset_index()
+
+    spr_hist = load_spr_hist_from_sheet()
+    spr_loc  = spr_hist[spr_hist["SVC"] != "__GLOBAL__"]
+    spr_glob = spr_hist[spr_hist["SVC"] == "__GLOBAL__"].drop(columns=["SVC"]).rename(columns={"SPR_HIST":"SPR_GLOBAL_TIPO"})
+
+    by_type = by_type.merge(spr_loc, on=["SVC","VEHICULO_TIPO_HOM"], how="left") \
+                     .merge(spr_glob, on=["VEHICULO_TIPO_HOM"], how="left")
+    by_type["SPR_HIST"] = by_type["SPR_HIST"].fillna(by_type["SPR_GLOBAL_TIPO"])
+    by_type = by_type.drop(columns=["SPR_GLOBAL_TIPO"])
+
+    rentals_sum = by_type.groupby("SVC", dropna=False)["UNIDADES"].sum().rename("RUTAS_RENTALS").reset_index()
+    by_type["PESO"] = by_type["UNIDADES"]
+    by_type["POND"] = by_type["UNIDADES"] * by_type["SPR_HIST"]
+    spr_r = by_type.groupby("SVC", dropna=False)[["POND","PESO"]].sum().reset_index()
+    spr_r["SPR_RENTALS"] = (spr_r["POND"] / spr_r["PESO"]).replace([np.inf,-np.inf], np.nan)
+
+    out = rentals_sum.merge(spr_r[["SVC","SPR_RENTALS"]], on="SVC", how="left")
+    return out[["SVC","RUTAS_RENTALS","SPR_RENTALS"]]
+
+def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
+    resumen = resumen.drop(columns=["Demanda esperada", "DEMANDA_ESPERADA"], errors="ignore")
+    orden = [
+        "SVC",
+        "FECHA",
+        "FCST",
+        "SHIPMENTS_DC","SHIPMENTS_SP",
+        "FCST (sin DC & sin SP)",
+        "DEMANDA_AJUSTADA",
+        "SPR_USADO",
+        "RUTAS_SPR_BASE",
+        "RUTAS_RENTALS","SPR_RENTALS",
+        "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE",
+        "RUTAS_MLP_SDD","RUTAS_MLP_SPOT",
+        "CROWD_E1_CAP",
+        "RUTAS_CROWDE1_USADAS","RUTAS_FALTANTES",
+    ]
+    cols = [c for c in orden if c in resumen.columns] + [c for c in resumen.columns if c not in orden]
+    return resumen[cols]
+
+# -------------------- FIN INTEGRACIÓN NUEVA --------------------
+
 def load_capacity_caps() -> pd.DataFrame:
-    """Caps de rutas + Shipments por DC y SP para restar del FCST."""
+    """Caps de rutas + Shipments por DC y SP para restar del FCST.
+       (RUTAS_RENTALS aquí es provisional: se sobreescribe con Rentals sheet)"""
     df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
     wanted = ["FECHA","SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","SHIPMENTS_DC","SHIPMENTS_SP"]
     if df.empty:
@@ -298,7 +390,6 @@ def load_capacity_caps() -> pd.DataFrame:
 
     # ------------ Caps de rutas ------------
     is_rentals = dm_norm.str.contains("rent",  regex=False)
-
     is_crowd_routes = (
         dm_norm.str.contains("crowd", regex=False)
         & (
@@ -306,13 +397,8 @@ def load_capacity_caps() -> pd.DataFrame:
             | tipodm_norm.str.contains("route", case=False, regex=False)
         )
     )
-
-    is_mlp_spot = (
-        dm_norm.str.contains("mlp", regex=False)
-        & tipodm_norm.str.contains("spot", regex=False)
-    )
-
-    is_mlp_sdd = (
+    is_mlp_spot = dm_norm.str.contains("mlp", regex=False) & tipodm_norm.str.contains("spot", regex=False)
+    is_mlp_sdd  = (
         dm_norm.str.contains("mlp", regex=False)
         & (~is_mlp_spot)
         & (
@@ -321,22 +407,18 @@ def load_capacity_caps() -> pd.DataFrame:
             | (tipodm_norm == "")
         )
     )
-
     # ------------ Shipments DC / SP ------------
     is_shipments = tipo_norm.str.contains("ship", regex=False)
-
     is_dc = (
         (dm_norm.str.contains("delivery", regex=False) & dm_norm.str.contains("cell", regex=False))
         | tipodm_norm.str.contains("delivery cell", regex=False)
         | tipodm_norm.str.contains(r"^(dc|cell)$", case=False, regex=True)
     )
-
     is_sp = (
         dm_norm.str.contains(r"^(s\.?p\.?|sp)$", case=False, regex=True)
         | (dm_norm.str.contains("service", regex=False) & dm_norm.str.contains("partner", regex=False))
         | tipodm_norm.str.contains(r"\bsp\b|service partner", case=False, regex=True)
     )
-
     is_dc_ship = is_shipments & is_dc
     is_sp_ship = is_shipments & is_sp
 
@@ -345,7 +427,7 @@ def load_capacity_caps() -> pd.DataFrame:
     agg = pd.DataFrame({
         "RUTAS_MLP_SDD":   g.apply(lambda s: s[is_mlp_sdd.loc[s.index]].sum()),
         "RUTAS_MLP_SPOT":  g.apply(lambda s: s[is_mlp_spot.loc[s.index]].sum()),
-        "RUTAS_RENTALS":   g.apply(lambda s: s[is_rentals.loc[s.index]].sum()),
+        "RUTAS_RENTALS":   g.apply(lambda s: s[is_rentals.loc[s.index]].sum()),  # <- se sobrescribe con Rentals sheet
         "RUTAS_CROWD_CAP": g.apply(lambda s: s[is_crowd_routes.loc[s.index]].sum()),
         "SHIPMENTS_DC":    g.apply(lambda s: s[is_dc_ship.loc[s.index]].sum()),
         "SHIPMENTS_SP":    g.apply(lambda s: s[is_sp_ship.loc[s.index]].sum()),
@@ -353,8 +435,8 @@ def load_capacity_caps() -> pd.DataFrame:
 
     return _finalize(agg, wanted)
 
-
 def load_rentals_fallback() -> pd.DataFrame:
+    """Fallback minimal: suma de unidades por SVC cuando no se puede homologar/ponderar SPR."""
     df = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
     target_cols = ["FECHA","SVC","RUTAS_RENTALS"]
     if df.empty:
@@ -366,7 +448,7 @@ def load_rentals_fallback() -> pd.DataFrame:
         out["FECHA"] = date.today()
         return out
 
-    find_and_rename(df, ["Unidades disponibles","Units","Cantidad","Qty","QTY","COUNT"], "CANT", required=False, source_label="Rentals")
+    find_and_rename(df, ["Unidades disponibles","Unidades dispon","Units","Cantidad","Qty","QTY","COUNT"], "CANT", required=False, source_label="Rentals")
     df = ensure_columns(df, {"CANT":0})
     df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
 
@@ -417,16 +499,17 @@ def load_crowd_caps() -> pd.DataFrame:
 # 5) Cálculo del plan
 # -----------------------------------------------------------------------------
 def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
-    fcst   = load_fcst()
-    spr    = load_spr()
-    caps   = load_capacity_caps()
-    crowdc = load_crowd_caps()
-    rents_fb = load_rentals_fallback()
+    fcst    = load_fcst()
+    spr     = load_spr()
+    caps    = load_capacity_caps()
+    crowdc  = load_crowd_caps()
+    rents   = load_rentals_caps_from_sheet()
+    rents_fb = load_rentals_fallback()  # por si la pestaña Rentals no trae SVC/unidades
 
     hoy = date.today()
 
     bases = []
-    for d in [fcst, spr, caps, crowdc, rents_fb]:
+    for d in [fcst, spr, caps, crowdc, rents, rents_fb]:
         if "SVC" in d.columns and not d.empty:
             bases.append(d[["SVC"]])
     base = pd.concat(bases, axis=0).drop_duplicates() if bases else pd.DataFrame(columns=["SVC"])
@@ -448,10 +531,19 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     else:
         out = ensure_columns(out, {"RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0, "RUTAS_CROWD_CAP":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
 
-    if "RUTAS_RENTALS" not in out.columns or out["RUTAS_RENTALS"].isna().all():
-        if not rents_fb.empty:
-            out = safe_merge(out, rents_fb[["SVC","RUTAS_RENTALS"]], ["SVC"])
+    # Rentals desde pestaña Rentals (con SPR_RENTALS ponderado). Si vacío, usa fallback simple.
+    if not rents.empty:
+        out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
+        out = safe_merge(out, rents[["SVC","RUTAS_RENTALS","SPR_RENTALS"]], ["SVC"])
+    elif not rents_fb.empty:
+        out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
+        out = safe_merge(out, rents_fb[["SVC","RUTAS_RENTALS"]], ["SVC"])
+        out["SPR_RENTALS"] = np.nan
     out = ensure_columns(out, {"RUTAS_RENTALS":0})
+
+    # Fallback para SPR_RENTALS si quedó NaN: usar SPR_USADO
+    out["SPR_RENTALS"] = pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce")
+    out["SPR_RENTALS"] = out["SPR_RENTALS"].fillna(out["SPR_USADO"])
 
     if not crowdc.empty:
         out = safe_merge(out, crowdc[["SVC","CROWD_E1_CAP"]], ["SVC"])
@@ -468,7 +560,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     out["DEMANDA_AJUSTADA"] = out["FCST (sin DC & sin SP)"]
 
     # Rutas base por SPR
-    out["RUTAS_SPR_BASE"]   = np.ceil(out["DEMANDA_AJUSTADA"] / out["SPR_USADO"]).astype(int)
+    out["RUTAS_SPR_BASE"] = np.ceil(out["DEMANDA_AJUSTADA"] / out["SPR_USADO"]).astype(int)
 
     for c in ["RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","CROWD_E1_CAP"]:
         out[c] = pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0)
@@ -476,23 +568,15 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     out["RUTAS_POST_RENTALS"] = (out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"]).clip(lower=0)
     out["RUTAS_CROWD_BASE"]   = np.minimum(out["RUTAS_POST_RENTALS"], out["RUTAS_CROWD_CAP"]).astype(int)
     out["RUTAS_RESTANTES"]    = (out["RUTAS_POST_RENTALS"] - out["RUTAS_CROWD_BASE"]).clip(lower=0)
-
-    out["RUTAS_POST_MLP"] = (out["RUTAS_RESTANTES"]
-                             - out["RUTAS_MLP_SDD"]
-                             - out["RUTAS_MLP_SPOT"]).clip(lower=0)
-
+    out["RUTAS_POST_MLP"]     = (out["RUTAS_RESTANTES"] - out["RUTAS_MLP_SDD"] - out["RUTAS_MLP_SPOT"]).clip(lower=0)
     out["RUTAS_CROWDE1_USADAS"] = np.minimum(out["RUTAS_POST_MLP"], out["CROWD_E1_CAP"]).astype(int)
     out["RUTAS_FALTANTES"]      = (out["RUTAS_POST_MLP"] - out["RUTAS_CROWDE1_USADAS"]).clip(lower=0)
 
     if sel_svcs:
         out = out[out["SVC"].isin(sel_svcs)]
 
-    cols = ["SVC","FECHA","FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)",
-            "DEMANDA_AJUSTADA","SPR_USADO","RUTAS_SPR_BASE",
-            "RUTAS_RENTALS","RUTAS_CROWD_CAP","RUTAS_CROWD_BASE",
-            "RUTAS_MLP_SDD","RUTAS_MLP_SPOT","CROWD_E1_CAP",
-            "RUTAS_CROWDE1_USADAS","RUTAS_FALTANTES"]
-    out = out.reindex(columns=cols).fillna(0).sort_values("SVC").reset_index(drop=True)
+    # Orden y limpieza final (incluye SPR_RENTALS junto a RUTAS_RENTALS)
+    out = apply_output_adjustments(out).fillna(0).sort_values("SVC").reset_index(drop=True)
     return out
 
 # -----------------------------------------------------------------------------
@@ -545,8 +629,9 @@ with st.expander("▶️ Cargando datos...", expanded=True):
             caps = load_capacity_caps()
             cap_svcs = caps[["SVC"]] if "SVC" in caps.columns else caps.to_frame(name="SVC")
             crowd_svcs   = load_crowd_caps()[["SVC"]]
+            rents_svcs   = load_rentals_caps_from_sheet()[["SVC"]]
             rent_fb_svcs = load_rentals_fallback()[["SVC"]]
-            base_svcs = pd.concat([fcst_svcs, cap_svcs, crowd_svcs, rent_fb_svcs], axis=0).drop_duplicates()
+            base_svcs = pd.concat([fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs], axis=0).drop_duplicates()
             svc_list = sorted(base_svcs["SVC"].dropna().astype(str).unique().tolist())
 
         default_sel = [s for s in DEFAULT_SVCS if s in svc_list] or svc_list[:4]
@@ -583,6 +668,9 @@ except Exception as e:
 with st.expander("ℹ️ Notas de esta versión"):
     st.markdown(textwrap.dedent("""
     - Descuento **solo** “Shipments” de **Delivery Cell (DC)** y **Service Partners (SP)**.
-    - Nuevas columnas: **SHIPMENTS_DC**, **SHIPMENTS_SP** y **FCST (sin DC & sin SP)**.
+    - **Rentals** ahora se toma de la pestaña *Rentals* y su **SPR_RENTALS** se calcula ponderando
+      el histórico de la pestaña *SPR* por tipo homologado.
+    - Se elimina la columna *Demanda esperada* si existía y se muestra **SPR_RENTALS** a un lado de **RUTAS_RENTALS**.
     - Se mantiene toda la robustez: headers dobles, alias, coerción numérica/fechas, etc.
     """))
+
