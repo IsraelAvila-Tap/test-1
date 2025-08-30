@@ -598,59 +598,59 @@ def load_capacity_caps() -> pd.DataFrame:
 # ---- NUEVO: MLP caps desde SRM (SDD/SPOT/BACKLOG) ----
 def load_mlp_caps_from_srm() -> pd.DataFrame:
     """
-    Lee SRM y calcula capacidad de MLP por SVC:
-      - MLP_SDD_CAP   : suma columnas que contengan 'sdd'
-      - MLP_SPOT_CAP  : suma columnas que contengan 'spot' y NO 'bu'/'back'
-      - MLP_BACK_CAP  : columnas con 'bu' (back up), 'backup', 'backlog'
-    Además, si hay 'Total SDD', 'Total SPOT', 'Total SPOT BU', los prioriza.
+    Capacidad MLP por SVC leyendo la pestaña SRM.
+
+    - MLP_SDD_CAP   = suma de TODAS las columnas que contengan 'sdd'
+    - MLP_SPOT_CAP  = suma de TODAS las columnas que contengan 'spot' y NO contengan 'bu'/'back'/'backlog'
+    - MLP_BACK_CAP  = suma de TODAS las columnas que contengan 'bu' o 'back' o 'backlog'
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["srm"])
     if df.empty:
         return pd.DataFrame(columns=["SVC","MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"])
+
+    # Normaliza SVC
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SRM")
     df = _as_str_cols(df, ["SVC"])
     if "SVC" not in df.columns:
         return pd.DataFrame(columns=["SVC","MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"])
 
-    # Canon para nombres de columnas
-    cols = df.columns.tolist()
-    canon = {c: _canon_name(c) for c in cols}
+    # Canonicaliza nombres de columnas
+    canon = {c: _canon_name(c) for c in df.columns}
 
-    def pick_cols(patterns_in: list[str], patterns_out: list[str] = None) -> list[str]:
-        got = []
-        for c, cc in canon.items():
-            if all(p in cc for p in patterns_in) and (not patterns_out or all(p not in cc for p in patterns_out)):
-                got.append(c)
-        return got
+    def is_not_svc(cc: str) -> bool:
+        return cc not in ("svc", "svcs", "logisticcenterid", "facility", "lc")
 
-    # Preferir "total"
-    sdd_total = pick_cols(["tot","sdd"])
-    spot_total = pick_cols(["tot","spot",])
-    bu_total = pick_cols(["tot","spot","bu"]) + pick_cols(["tot","back"])
+    # Detecta columnas por familia
+    sdd_cols  = [c for c, cc in canon.items() if "sdd"  in cc and is_not_svc(cc)]
+    spot_cols = [c for c, cc in canon.items() if "spot" in cc and all(k not in cc for k in ("bu","back","backlog")) and is_not_svc(cc)]
+    back_cols = [c for c, cc in canon.items() if any(k in cc for k in ("bu","back","backlog")) and is_not_svc(cc)]
 
-    # Si no hay totales, sumar por categoría
-    sdd_cols  = sdd_total or pick_cols(["sdd"])
-    spot_cols = spot_total or pick_cols(["spot"], patterns_out=["bu","back"])
-    back_cols = bu_total or (pick_cols(["spot","bu"]) + pick_cols(["back"]))
-
-    # Coerce num
+    # Asegura numérico en todas las candidatas
     for c in set(sdd_cols + spot_cols + back_cols):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    out = df.groupby("SVC", dropna=False).agg(
-        MLP_SDD_CAP = pd.NamedAgg(column=sdd_cols[0], aggfunc="sum") if len(sdd_cols)==1 else pd.NamedAgg(column=sdd_cols[0], aggfunc=lambda x: 0)
-    ).reset_index()
-    # Si múltiples columnas, sumarlas manualmente
-    if len(sdd_cols) != 1:
-        tmp = df.groupby("SVC")[sdd_cols].sum().sum(axis=1).rename("MLP_SDD_CAP").reset_index()
-        out = out[["SVC"]].merge(tmp, on="SVC", how="left")
+    # Agrupa por SVC y suma columnas (si no hay, deja 0)
+    grp = df.groupby("SVC", dropna=False)
+    idx = grp.size().index
 
-    spot_sum = df.groupby("SVC")[spot_cols].sum().sum(axis=1).rename("MLP_SPOT_CAP").reset_index() if spot_cols else pd.DataFrame({"SVC":[], "MLP_SPOT_CAP":[]})
-    back_sum = df.groupby("SVC")[back_cols].sum().sum(axis=1).rename("MLP_BACK_CAP").reset_index() if back_cols else pd.DataFrame({"SVC":[], "MLP_BACK_CAP":[]})
+    def sum_family(cols: list[str]) -> pd.Series:
+        if not cols:
+            return pd.Series(0, index=idx, dtype="float64")
+        return grp[cols].sum().sum(axis=1)
 
-    out = out.merge(spot_sum, on="SVC", how="left").merge(back_sum, on="SVC", how="left")
-    out[["MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]] = out[["MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]].fillna(0).astype(int)
+    sdd_cap  = sum_family(sdd_cols).rename("MLP_SDD_CAP")
+    spot_cap = sum_family(spot_cols).rename("MLP_SPOT_CAP")
+    back_cap = sum_family(back_cols).rename("MLP_BACK_CAP")
+
+    out = (
+        sdd_cap.reset_index()
+        .merge(spot_cap.reset_index(), on="SVC", how="outer")
+        .merge(back_cap.reset_index(), on="SVC", how="outer")
+        .fillna(0)
+    )
+    # Tipos finales
+    out[["MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]] = out[["MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]].round(0).astype(int)
     return out[["SVC","MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]]
 
 # ---- NUEVO: SPR de MLP ----
