@@ -170,9 +170,15 @@ def _combine_two_header_rows(r1: List[str], r2: List[str]) -> List[str]:
     return out
 
 def _looks_group_header(row_lower: List[str]) -> bool:
-    words = ("base", "e1", "spot", "back", "up", "sdd")
-    hits = sum(1 for c in row_lower if any(w in c for w in words))
-    return hits >= max(2, len(row_lower)//6)
+    """
+    Detecta headers 'agrupados' (fila1=familias, fila2=tipos),
+    ampliando tokens típicos de SRM y relajando el umbral.
+    """
+    tokens = ("mlp","sdd","spot","back","backup","bu","total",
+              "lv","sv","car","hb","heavy","bulky")
+    hits = sum(1 for c in row_lower if any(t in c for t in tokens) and c != "")
+    return hits >= 1
+
 
 # -----------------------------------------------------------------------------
 # 3) Lectura de Google Sheets
@@ -216,8 +222,10 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     if header_idx is None:
         for i in range(limit):
             if sum(1 for x in values[i] if x.strip()) >= 2:
-                header_idx = i; break
-    if header_idx is None: header_idx = 0
+                header_idx = i
+                break
+    if header_idx is None:
+        header_idx = 0
 
     r1 = values[header_idx]
     r1_lower = [c.strip().lower() for c in r1]
@@ -226,7 +234,8 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     if header_idx + 1 < len(values):
         r2 = values[header_idx + 1]
         r2_nonempty = sum(1 for x in r2 if x.strip())
-        if _looks_group_header(r1_lower) and r2_nonempty >= max(2, len(r2)//4):
+        # ➜ más laxo: si la fila1 “parece grupo” y la fila2 tiene ≥ 2 celdas, combinamos
+        if _looks_group_header(r1_lower) and r2_nonempty >= 2:
             combine = True
 
     if combine:
@@ -239,6 +248,7 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
     header = _make_unique_headers(header)
     df = pd.DataFrame(data_rows, columns=header)
     return coerce_numeric_df(df)
+
 
 def quick_healthcheck(sheet_id: str) -> Dict[str, str]:
     out = {"sheet_id": sanitize_sheet_id(sheet_id) or "", "ok": "false", "note": ""}
@@ -583,91 +593,151 @@ def load_capacity_caps() -> pd.DataFrame:
 # ---- MLP desde SRM (por tipo de vehículo) ----
 def load_mlp_caps_from_srm() -> pd.DataFrame:
     """
-    Lee SRM y calcula:
-      - SDD por tipo: MLP_SDD_LV / SV / CAR
-      - SPOT por tipo: MLP_SPOT_LV / SV / CAR (excluye cualquier columna 'total' y Back/BU)
-      - Backlog total: MLP_BACK_CAP (cualquier columna con 'back','backlog' o 'bu')
-    Además devuelve los totales: MLP_SDD_CAP y MLP_SPOT_CAP (sumas de tipos).
+    Capacidad MLP por SVC leyendo la pestaña SRM, desglosada por tipo:
+      - SDD:  MLP_SDD_LV, MLP_SDD_SV, MLP_SDD_CAR  + MLP_SDD_CAP (suma)
+      - SPOT: MLP_SPOT_LV, MLP_SPOT_SV, MLP_SPOT_CAR + MLP_SPOT_CAP (suma)
+      - BACKLOG/BU/Back Up: MLP_BACK_CAP
+    Se ignoran columnas 'total' para no contar doble.
+    Incluye fallback cuando el header viene en 2 filas (familia / tipo).
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["srm"])
     if df.empty:
         return pd.DataFrame(columns=[
-            "SVC","MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
+            "SVC",
+            "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
             "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
             "MLP_BACK_CAP"
         ])
 
+    # Normaliza SVC
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SRM")
     df = _as_str_cols(df, ["SVC"])
     if "SVC" not in df.columns:
         return pd.DataFrame(columns=[
-            "SVC","MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
+            "SVC",
+            "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
             "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
             "MLP_BACK_CAP"
         ])
 
+    # ------- Fallback: cuando familia y tipo están en filas distintas -------
     canon = {c: _canon_name(c) for c in df.columns}
+    fam_tokens = ("sdd", "spot")
+    tipo_tokens = ("lv", "sv", "car", "hb", "heavy", "bulky", "large", "small", "xlarge", "xlv")
+    cols_raw = list(df.columns)
+
+    def _is_family(c):
+        cc = _canon_name(c)
+        return any(t in cc for t in fam_tokens) and not any(t in cc for t in tipo_tokens)
+
+    def _is_tipo(c):
+        cc = _canon_name(c)
+        return any(t in cc for t in tipo_tokens) and not any(t in cc for t in fam_tokens)
+
+    fam_cols = [c for c in cols_raw if _is_family(c)]
+    tipo_cols = [c for c in cols_raw if _is_tipo(c)]
+
+    # Si detectamos patrón familia→tipos a la derecha, construimos columnas "familia tipo"
+    if fam_cols and tipo_cols:
+        for c in cols_raw:
+            df[c] = pd.to_numeric(df[c], errors="ignore")
+        new_cols = {}
+        for fam in fam_cols:
+            idx = cols_raw.index(fam)
+            tail = cols_raw[idx+1: idx+1+6]  # miramos unas cuantas columnas a la derecha
+            tipos_here = [t for t in tail if _is_tipo(t)]
+            for t in tipos_here:
+                name = f"{fam} {t}".strip()
+                if name not in df.columns:
+                    new_cols[name] = pd.to_numeric(df.get(t, 0), errors="coerce").fillna(0)
+        for k, s in new_cols.items():
+            df[k] = s
+        canon = {c: _canon_name(c) for c in df.columns}
+    # -----------------------------------------------------------------------
+
+    # Helpers de matching
     def is_not_svc(cc: str) -> bool:
-        return cc not in ("svc","svcs","logisticcenterid","facility","lc")
+        return cc not in ("svc", "svcs", "logisticcenterid", "facility", "lc")
 
-    # helpers de detección
-    def _is_sdd(cc):  return ("sdd" in cc) and is_not_svc(cc)
-    def _is_spot(cc): return ("spot" in cc) and is_not_svc(cc)
-    def _is_back(cc): return any(k in cc for k in ("back","backlog","bu")) and is_not_svc(cc)
-    def _is_total(cc):return "total" in cc
+    def has(cc: str, token: str) -> bool:
+        return token in cc
 
-    def _is_lv(cc):  return ("largevan" in cc) or re.search(r"\blv\b", cc or "") is not None
-    def _is_sv(cc):  return ("smallvan" in cc) or re.search(r"\bsv\b", cc or "") is not None
-    def _is_car(cc): return "car" in cc
+    def has_any(cc: str, tokens: list[str]) -> bool:
+        return any(t in cc for t in tokens)
 
-    sdd_lv  = [c for c,cc in canon.items() if _is_sdd(cc)  and _is_lv(cc) and not _is_total(cc)]
-    sdd_sv  = [c for c,cc in canon.items() if _is_sdd(cc)  and _is_sv(cc) and not _is_total(cc)]
-    sdd_car = [c for c,cc in canon.items() if _is_sdd(cc)  and _is_car(cc) and not _is_total(cc)]
+    def pick_cols(type_tokens: list[str], family_tokens: list[str], exclude_tokens: list[str]) -> list[str]:
+        selected = []
+        for col, cc_raw in canon.items():
+            cc = cc_raw
+            if not is_not_svc(cc): 
+                continue
+            if all(has(cc, ft) for ft in family_tokens) and has_any(cc, type_tokens) and not has_any(cc, exclude_tokens):
+                selected.append(col)
+        return selected
 
-    spot_lv  = [c for c,cc in canon.items() if _is_spot(cc) and _is_lv(cc) and not _is_total(cc) and not _is_back(cc)]
-    spot_sv  = [c for c,cc in canon.items() if _is_spot(cc) and _is_sv(cc) and not _is_total(cc) and not _is_back(cc)]
-    spot_car = [c for c,cc in canon.items() if _is_spot(cc) and _is_car(cc) and not _is_total(cc) and not _is_back(cc)]
+    def pick_cols_any(family_tokens: list[str], include_any: list[str], exclude_tokens: list[str]) -> list[str]:
+        selected = []
+        for col, cc_raw in canon.items():
+            cc = cc_raw
+            if not is_not_svc(cc): 
+                continue
+            if all(has(cc, ft) for ft in family_tokens) and has_any(cc, include_any) and not has_any(cc, exclude_tokens):
+                selected.append(col)
+        return selected
 
-    back_cols = [c for c,cc in canon.items() if _is_back(cc)]
+    # Tokens de tipo
+    LV  = ["largevan", "large", "lv", "xlarge", "xlv", "heavybulky", "hb"]
+    SV  = ["smallvan", "small", "sv"]
+    CAR = ["car", "auto"]
 
-    # coerción numérica
-    for c in set(sdd_lv+sdd_sv+sdd_car+spot_lv+spot_sv+spot_car+back_cols):
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    EXC_TOTAL = ["total"]
+    EXC_BACK  = ["bu", "backup", "back", "backlog"]
+    BACK_ANY  = ["bu", "backup", "back", "backlog"]
+
+    # Columnas por familia/tipo
+    sdd_lv_cols   = pick_cols(LV,  ["sdd"], EXC_TOTAL + [])
+    sdd_sv_cols   = pick_cols(SV,  ["sdd"], EXC_TOTAL + [])
+    sdd_car_cols  = pick_cols(CAR, ["sdd"], EXC_TOTAL + [])
+
+    spot_lv_cols  = pick_cols(LV,  ["spot"], EXC_TOTAL + EXC_BACK)
+    spot_sv_cols  = pick_cols(SV,  ["spot"], EXC_TOTAL + EXC_BACK)
+    spot_car_cols = pick_cols(CAR, ["spot"], EXC_TOTAL + EXC_BACK)
+
+    back_cols     = pick_cols_any(["spot"], BACK_ANY, EXC_TOTAL)
+
+    # Asegura numérico
+    for c in set(sdd_lv_cols + sdd_sv_cols + sdd_car_cols +
+                 spot_lv_cols + spot_sv_cols + spot_car_cols +
+                 back_cols):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
     grp = df.groupby("SVC", dropna=False)
-    idx = grp.size().index
 
     def sum_cols(cols: list[str]) -> pd.Series:
-        if not cols: return pd.Series(0, index=idx, dtype="float64")
+        if not cols:
+            return grp.size().mul(0)  # serie de 0s indexada por SVC
         return grp[cols].sum().sum(axis=1)
 
-    sdd_lv_s  = sum_cols(sdd_lv).rename("MLP_SDD_LV")
-    sdd_sv_s  = sum_cols(sdd_sv).rename("MLP_SDD_SV")
-    sdd_car_s = sum_cols(sdd_car).rename("MLP_SDD_CAR")
-    spot_lv_s  = sum_cols(spot_lv).rename("MLP_SPOT_LV")
-    spot_sv_s  = sum_cols(spot_sv).rename("MLP_SPOT_SV")
-    spot_car_s = sum_cols(spot_car).rename("MLP_SPOT_CAR")
-    back_s     = sum_cols(back_cols).rename("MLP_BACK_CAP")
+    out = pd.DataFrame({"SVC": grp.size().index}).reset_index(drop=True)
 
-    out = (sdd_lv_s.reset_index()
-           .merge(sdd_sv_s.reset_index(), on="SVC", how="outer")
-           .merge(sdd_car_s.reset_index(), on="SVC", how="outer")
-           .merge(spot_lv_s.reset_index(), on="SVC", how="outer")
-           .merge(spot_sv_s.reset_index(), on="SVC", how="outer")
-           .merge(spot_car_s.reset_index(), on="SVC", how="outer")
-           .merge(back_s.reset_index(), on="SVC", how="outer")
-          ).fillna(0)
+    out["MLP_SDD_LV"]   = sum_cols(sdd_lv_cols).values
+    out["MLP_SDD_SV"]   = sum_cols(sdd_sv_cols).values
+    out["MLP_SDD_CAR"]  = sum_cols(sdd_car_cols).values
+    out["MLP_SDD_CAP"]  = (out["MLP_SDD_LV"] + out["MLP_SDD_SV"] + out["MLP_SDD_CAR"]).astype(int)
 
-    out["MLP_SDD_CAP"]  = (out["MLP_SDD_LV"]  + out["MLP_SDD_SV"]  + out["MLP_SDD_CAR"]).astype(int)
+    out["MLP_SPOT_LV"]  = sum_cols(spot_lv_cols).values
+    out["MLP_SPOT_SV"]  = sum_cols(spot_sv_cols).values
+    out["MLP_SPOT_CAR"] = sum_cols(spot_car_cols).values
     out["MLP_SPOT_CAP"] = (out["MLP_SPOT_LV"] + out["MLP_SPOT_SV"] + out["MLP_SPOT_CAR"]).astype(int)
 
-    for c in ["MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_BACK_CAP"]:
-        out[c] = out[c].round(0).astype(int)
+    out["MLP_BACK_CAP"] = sum_cols(back_cols).astype(int).values
 
-    cols = ["SVC","MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
-            "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
-            "MLP_BACK_CAP"]
-    return out[cols]
+    for c in ["MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR",
+              "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR",
+              "MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).round(0).astype(int)
+
+    return out
 
 def load_spr_mlp() -> pd.DataFrame:
     spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
