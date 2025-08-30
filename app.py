@@ -1107,19 +1107,55 @@ auto_run = False
 sel_svcs: List[str] = []
 
 # Selector de SVCs (robusto; usa defaults si no hay datos en Sheets)
+# Selector de SVCs (robusto; usa defaults si no hay datos en Sheets)
 with st.expander("▶️ Cargando datos...", expanded=True):
     try:
         if not SHEET_ID:
             st.warning("Falta `SHEET_ID`. Pégalo en la barra lateral.")
             svc_list = []
         else:
-            fcst_svcs    = load_fcst()[["SVC"]]
-            caps         = load_capacity_caps()
-            cap_svcs     = caps[["SVC"]] if "SVC" in caps.columns else pd.DataFrame(columns=["SVC"])
-            crowd_svcs   = load_crowd_caps()[["SVC"]]
-            rents_svcs   = load_rentals_caps_from_sheet()[["SVC"]]
-            rent_fb_svcs = load_rentals_fallback()[["SVC"]]
-            mlp_svcs     = load_mlp_caps_from_srm()[["SVC"]]
+            # --- lee todo una vez para diagnosticar ---
+            _fcst      = load_fcst()
+            _spr       = load_spr()
+            _caps      = load_capacity_caps()
+            _crowdc    = load_crowd_caps()
+            _rents     = load_rentals_caps_from_sheet()
+            _rents_fb  = load_rentals_fallback()
+            _crowd_pct = load_crowd_pct_from_capacity()
+            _spr_crowd = load_spr_crowd()
+            _mlp_caps  = load_mlp_caps_from_srm()
+            _spr_mlp   = load_spr_mlp()
+
+            def _status(name, df):
+                return {
+                    "Tab": name,
+                    "Filas": 0 if df is None else int(len(df)),
+                    "Columnas": 0 if df is None else int(len(df.columns)),
+                    "Primeras columnas": [] if df is None else list(df.columns)[:10],
+                }
+
+            diag_rows = [
+                _status("FCST", _fcst),
+                _status("SPR", _spr),
+                _status("Capacity", _caps),
+                _status("Crowd", _crowdc),
+                _status("Rentals (caps)", _rents),
+                _status("Rentals (fallback)", _rents_fb),
+                _status("Capacity → Crowd %", _crowd_pct),
+                _status("SPR → Crowd SPR", _spr_crowd),
+                _status("SRM → MLP caps", _mlp_caps),
+                _status("SPR → SPR_MLP", _spr_mlp),
+            ]
+            st.caption("Diagnóstico rápido de lectura (filas/columnas por pestaña):")
+            st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
+
+            # --- construir lista de SVCs desde lo leído ---
+            fcst_svcs    = _fcst[["SVC"]]           if not _fcst.empty else pd.DataFrame(columns=["SVC"])
+            cap_svcs     = _caps[["SVC"]]           if (isinstance(_caps, pd.DataFrame) and "SVC" in _caps.columns) else pd.DataFrame(columns=["SVC"])
+            crowd_svcs   = _crowdc[["SVC"]]         if not _crowdc.empty else pd.DataFrame(columns=["SVC"])
+            rents_svcs   = _rents[["SVC"]]          if not _rents.empty else pd.DataFrame(columns=["SVC"])
+            rent_fb_svcs = _rents_fb[["SVC"]]       if not _rents_fb.empty else pd.DataFrame(columns=["SVC"])
+            mlp_svcs     = _mlp_caps[["SVC"]]       if not _mlp_caps.empty else pd.DataFrame(columns=["SVC"])
 
             base_svcs = pd.concat(
                 [fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs, mlp_svcs],
@@ -1147,6 +1183,7 @@ with st.expander("▶️ Cargando datos...", expanded=True):
     except Exception as e:
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
+
 
 # primer render automático 1 vez
 if "auto_run_once" not in st.session_state:
