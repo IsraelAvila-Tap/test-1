@@ -812,8 +812,7 @@ def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
         "CROWD_PCT","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
         "RUTAS_CROWD_CAP",
         "RUTAS_CROWD_BASE_ASIGNADO","RUTAS_CROWD_E1_ASIGNADO",
-        "SHIP_CROWD",
-        "SHIP_RESTANTES_PRE_MLP",
+        "SHIP_CROWD", "SHIP_RESTANTES_PRE_MLP",
         "SPR_USADO","SPR_PROM","SPR_PEAK","SPR_OBJ","SPR_MLP",
         # MLP por tipo y totales (capacidad)
         "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
