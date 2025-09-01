@@ -810,8 +810,10 @@ def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
         "FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)","DEMANDA_AJUSTADA",
         "RUTAS_RENTALS","SPR_RENTALS","SHIP_RENTALS",
         "CROWD_PCT","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
-        "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO",
-        "SHIP_CROWD","SHIP_RESTANTES_PRE_MLP",
+        "RUTAS_CROWD_CAP",
+        "RUTAS_CROWD_BASE_ASIGNADO","RUTAS_CROWD_E1_ASIGNADO",
+        "SHIP_CROWD",
+        "SHIP_RESTANTES_PRE_MLP",
         "SPR_USADO","SPR_PROM","SPR_PEAK","SPR_OBJ","SPR_MLP",
         # MLP por tipo y totales (capacidad)
         "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
@@ -930,30 +932,34 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     for c in ["RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","CROWD_E1_CAP"]:
         out[c] = pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0)
 
+
     # ----------------- CROWD ASIGNACIÓN -----------------
     out["SHIP_OBJ_CROWD"]  = pd.to_numeric(out["FCST"], errors="coerce").fillna(0) * out["CROWD_PCT"]
     out["RUTAS_CROWD_OBJ"] = np.ceil(out["SHIP_OBJ_CROWD"] / out["SPR_CROWD"]).astype(int)
-    out["RUTAS_CROWD_BASE"] = np.minimum.reduce([
+
+    # Base crowd asignada
+    base_crowd = np.minimum.reduce([
         np.maximum(out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"], 0),
         out["RUTAS_CROWD_CAP"],
         out["RUTAS_CROWD_OBJ"]
     ]).astype(int)
-    exceso_obj       = (out["RUTAS_CROWD_OBJ"] - out["RUTAS_CROWD_BASE"]).clip(lower=0)
-    rem_despues_base = (np.maximum(out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"], 0) - out["RUTAS_CROWD_BASE"]).clip(lower=0)
-    out["RUTAS_CROWD_ESCALADO"] = np.minimum.reduce([exceso_obj, out["CROWD_E1_CAP"], rem_despues_base]).astype(int)
-    out["RUTAS_CROWDE1_USADAS"] = out["RUTAS_CROWD_ESCALADO"]
 
-    # Shipments cubiertos por Rentals y Crowd
-    out["SHIP_RENTALS"] = out["RUTAS_RENTALS"] * out["SPR_RENTALS"]
-    out["SHIP_CROWD"]   = (out["RUTAS_CROWD_BASE"] + out["RUTAS_CROWD_ESCALADO"]) * out["SPR_CROWD"]
+    # Escalado (E1 crowd asignado)
+    exceso_obj = (out["RUTAS_CROWD_OBJ"] - base_crowd).clip(lower=0)
+    rem_despues_base = (np.maximum(out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"], 0) - base_crowd).clip(lower=0)
+    escalado_crowd = np.minimum.reduce([exceso_obj, out["CROWD_E1_CAP"], rem_despues_base]).astype(int)
 
-    # Base DC+SP
-    base_otros = pd.to_numeric(out["SHIPMENTS_DC"], errors="coerce").fillna(0) + \
-                 pd.to_numeric(out["SHIPMENTS_SP"], errors="coerce").fillna(0)
+    # Guardamos columnas explícitas
+    out["RUTAS_CROWD_BASE_ASIGNADO"] = base_crowd
+    out["RUTAS_CROWD_E1_ASIGNADO"]   = escalado_crowd
 
-    out["SHIP_RESTANTES_PRE_MLP"] = (
-        pd.to_numeric(out["FCST"], errors="coerce").fillna(0) - base_otros - out["SHIP_RENTALS"] - out["SHIP_CROWD"]
-    ).clip(lower=0)
+    out["RUTAS_CROWDE1_USADAS"] = escalado_crowd
+
+    # Shipments cubiertos por crowd = base + escalado
+    out["SHIP_CROWD"] = (base_crowd + escalado_crowd) * out["SPR_CROWD"]
+
+
+    
 
     # ----------------- MLP (caps SRM + SPR_MLP) -----------------
     if not mlp_caps.empty:
