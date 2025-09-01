@@ -808,10 +808,9 @@ def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
     # orden final (incluye nuevas columnas de capacidad total, ratio, gap y riesgo)
     orden = [
         "SVC","FECHA",
-        "FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)","DEMANDA_AJUSTADA",
-        "SPR_USADO","RUTAS_SPR_BASE",
+        "FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)",
         "RUTAS_RENTALS","SPR_RENTALS",
-        "CROWD_PCT","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
+        "CROWD_%_OBJ","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
         "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO",
         "SHIP_RENTALS","SHIP_CROWD","SHIP_RESTANTES_PRE_MLP",
         "SPR_MLP",
