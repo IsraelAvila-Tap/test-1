@@ -802,33 +802,39 @@ def load_spr_mlp() -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 
 def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
-    # quitar restos/alias
+    # Quita algún legado que pueda colarse
     resumen = resumen.drop(columns=["Demanda esperada", "DEMANDA_ESPERADA"], errors="ignore")
 
-    # orden final (incluye nuevas columnas de capacidad total, ratio, gap y riesgo)
     orden = [
         "SVC","FECHA",
-        "FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)",
-        "RUTAS_RENTALS","SPR_RENTALS",
-        "CROWD_%_OBJ","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
+        "FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)","DEMANDA_AJUSTADA",
+        "RUTAS_RENTALS","SPR_RENTALS","SHIP_RENTALS",
+        "CROWD_PCT","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
         "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO",
-        "SHIP_RENTALS","SHIP_CROWD","SHIP_RESTANTES_PRE_MLP",
-        "SPR_MLP",
-        # Capacidades MLP por tipo y totales
+        "SHIP_CROWD","SHIP_RESTANTES_PRE_MLP",
+        "SPR_USADO","SPR_PROM","SPR_PEAK","SPR_OBJ","SPR_MLP",
+        # MLP por tipo y totales (capacidad)
         "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
         "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
         "MLP_BACK_CAP",
-        # Asignación de rutas MLP
-        "RUTAS_MLP_NEEDED","RUTAS_MLP_SDD_USADAS","RUTAS_MLP_SPOT_USADAS","RUTAS_MLP_BACKLOG_USADAS",
-        # E1/MLP y faltantes
-        "CROWD_E1_CAP","RUTAS_CROWDE1_USADAS",
-        "RUTAS_RESTANTES","RUTAS_FALTANTES",
-        # NUEVO: capacidad global, ratio, gap y riesgo
+        # MLP usadas (asignación)
+        "RUTAS_MLP_NEEDED",
+        "RUTAS_MLP_SDD_USADAS","RUTAS_MLP_SPOT_USADAS","RUTAS_MLP_BACKLOG_USADAS",
+        # KPIs finales
+        "RUTAS_SPR_BASE","RUTAS_RESTANTES","RUTAS_FALTANTES",
+        # Capacidad + riesgo
         "CAP_TOTAL","CAP_VS_FCST","CAP_DIFF_ABS","RIESGO",
     ]
 
-    cols = [c for c in orden if c in resumen.columns] + [c for c in resumen.columns if c not in orden]
-    return resumen[cols]
+    # Proyección estricta: solo columnas en 'orden'
+    cols = [c for c in orden if c in resumen.columns]
+    # Si quieres, también puedes forzar que TODAS las de 'orden' existan:
+    for c in orden:
+        if c not in resumen.columns:
+            resumen[c] = 0
+
+    return resumen[orden]
+
 
 
 
