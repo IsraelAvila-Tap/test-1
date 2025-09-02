@@ -455,22 +455,21 @@ def load_rentals_fallback() -> pd.DataFrame:
     out["FECHA"] = date.today()
     return _finalize(out, target_cols)
 
+
+
 def load_crowd_caps() -> pd.DataFrame:
     """
-    Crowd caps desde la pestaña Crowd con encabezados combinados y textos truncados.
-    Calcula:
+    Lee Crowd y calcula:
       CROWD_BASE_CAP = max(Base entre semana, Base sábado, Base domingo)
-      CROWD_E1_CAP   = max(Holgura entre semana, Holgura sábado, Holgura domingo) - CROWD_BASE_CAP (>=0)
-
-    Fallback posicional: si no encuentra por nombre, usa las 6 primeras columnas numéricas
-    a la derecha de SVC (3 Base + 3 E1), en ese orden.
+      CROWD_E1_CAP   = max(Holgura entre semana, Holgura sábado, Holgura domingo) - CROWD_BASE_CAP
+    Matching laxo + 2 fallbacks posicionales y expone diagnóstico en un expander.
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
     wanted = ["FECHA","SVC","CROWD_BASE_CAP","CROWD_E1_CAP"]
     if df.empty:
         return pd.DataFrame(columns=wanted)
 
-    # --- SVC (obligatorio) ---
+    # --- SVC ---
     try:
         find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", True, "Crowd")
     except Exception:
@@ -480,44 +479,78 @@ def load_crowd_caps() -> pd.DataFrame:
     # --- Fecha (opcional) ---
     coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Crowd", required=False)
 
-    # -------- helpers de matching laxo --------
+    # ---------- helpers ----------
     def canon(x: str) -> str:
         return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(x).lower()).encode("ascii","ignore").decode("ascii"))
+    cols = list(df.columns)
+    can  = {c: canon(c) for c in cols}
 
-    ccols = {c: canon(c) for c in df.columns}
-
-    def rename_by_family_any(family_tokens: list[str], include_any: list[str], new_name: str,
-                             exclude_any: list[str] = ["total"]) -> bool:
+    def pick_by_tokens(family_tokens: list[str], include_any: list[str]) -> list[str]:
         fam = [canon(t) for t in family_tokens]
         inc = [canon(t) for t in include_any]
-        exc = [canon(t) for t in exclude_any]
-        for col, cc in list(ccols.items()):
-            if all(t in cc for t in fam) and any(t in cc for t in inc) and not any(t in cc for t in exc):
-                if col != new_name:
-                    df.rename(columns={col: new_name}, inplace=True)
-                    ccols[new_name] = canon(new_name)
-                return True
-        return False
+        out = []
+        for c, cc in can.items():
+            if all(t in cc for t in fam) and any(t in cc for t in inc) and "total" not in cc:
+                out.append(c)
+        return out
 
-    # --- Intento 1: por nombre (muy laxo) ---
-    found_any = False
-    found_any |= rename_by_family_any(["base"], ["entre","entres","entreser","sem","semana","weekday"], "BASE_SEM")
-    found_any |= rename_by_family_any(["base"], ["sab","sabad","sabado","sábado"], "BASE_SAB")
-    found_any |= rename_by_family_any(["base"], ["dom","domingo"], "BASE_DOM")
-    found_any |= rename_by_family_any(["holg"], ["entre","entres","entreser","sem","semana","weekday"], "HOLG_SEM")
-    found_any |= rename_by_family_any(["holg"], ["sab","sabad","sabado","sábado"], "HOLG_SAB")
-    found_any |= rename_by_family_any(["holg"], ["dom","domingo"], "HOLG_DOM")
+    # ---------- intento 1: nombres ----------
+    base_sem_cols = pick_by_tokens(["base"], ["entre","entres","entreser","sem","semana","weekday"])
+    base_sab_cols = pick_by_tokens(["base"], ["sab","sabad","sabado","sábado"])
+    base_dom_cols = pick_by_tokens(["base"], ["dom","domingo"])
 
-    # --- Intento 2 (fallback posicional): 6 numéricas a la derecha de SVC ---
-    need_positional = not all(c in df.columns for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"])
+    holg_sem_cols = pick_by_tokens(["holg"], ["entre","entres","entreser","sem","semana","weekday"]) or pick_by_tokens(["e1"], ["entre","sem","weekday"])
+    holg_sab_cols = pick_by_tokens(["holg"], ["sab","sabad","sabado","sábado"]) or pick_by_tokens(["e1"], ["sab","sabad","sabado","sábado"])
+    holg_dom_cols = pick_by_tokens(["holg"], ["dom","domingo"]) or pick_by_tokens(["e1"], ["dom","domingo"])
+
+    picked = {
+        "BASE_SEM": base_sem_cols[:1],
+        "BASE_SAB": base_sab_cols[:1],
+        "BASE_DOM": base_dom_cols[:1],
+        "HOLG_SEM": holg_sem_cols[:1],
+        "HOLG_SAB": holg_sab_cols[:1],
+        "HOLG_DOM": holg_dom_cols[:1],
+    }
+
+    # ---------- intento 2: a la derecha de SVC por palabras clave ----------
+    need_positional = not all(v for v in picked.values())
     if need_positional:
-        cols = list(df.columns)
         try:
             idx_svc = cols.index("SVC")
         except ValueError:
             idx_svc = -1
         right_cols = [c for i, c in enumerate(cols) if i > idx_svc and c not in ("FECHA",)]
-        # columnas numéricas en orden de aparición
+        right_can  = [can[c] for c in right_cols]
+
+        def first_with(token_list: list[str]) -> str | None:
+            for c, cc in zip(right_cols, right_can):
+                if any(t in cc for t in token_list):
+                    return c
+            return None
+
+        picked.setdefault("BASE_SEM", [])
+        picked.setdefault("BASE_SAB", [])
+        picked.setdefault("BASE_DOM", [])
+        picked.setdefault("HOLG_SEM", [])
+        picked.setdefault("HOLG_SAB", [])
+        picked.setdefault("HOLG_DOM", [])
+
+        if not picked["BASE_SEM"]: picked["BASE_SEM"] = [first_with(["base","baseentre","baseentres","baseentreser"])]
+        if not picked["BASE_SAB"]: picked["BASE_SAB"] = [first_with(["basesab","basesabado","basesábado"])]
+        if not picked["BASE_DOM"]: picked["BASE_DOM"] = [first_with(["basedom","basedomingo"])]
+
+        if not picked["HOLG_SEM"]: picked["HOLG_SEM"] = [first_with(["holgentre","holgentres","holgentreser","holgsem","holgsemana","e1entre","e1sem"])]
+        if not picked["HOLG_SAB"]: picked["HOLG_SAB"] = [first_with(["holgsab","holgsabado","holgsábado","e1sab","e1sabado"])]
+        if not picked["HOLG_DOM"]: picked["HOLG_DOM"] = [first_with(["holgdom","holgdomingo","e1dom"])]
+
+    # ---------- intento 3: 6 primeras numéricas a la derecha de SVC ----------
+    need_numeric = not all(picked.get(k) and picked[k][0] for k in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"])
+    if need_numeric:
+        try:
+            idx_svc = cols.index("SVC")
+        except ValueError:
+            idx_svc = -1
+        right_cols = [c for i, c in enumerate(cols) if i > idx_svc and c not in ("FECHA",)]
         num_right = []
         for c in right_cols:
             s = pd.to_numeric(df[c], errors="coerce")
@@ -526,26 +559,27 @@ def load_crowd_caps() -> pd.DataFrame:
             if len(num_right) >= 6:
                 break
         if len(num_right) >= 6:
-            mapping = {
-                num_right[0]: "BASE_SEM",
-                num_right[1]: "BASE_SAB",
-                num_right[2]: "BASE_DOM",
-                num_right[3]: "HOLG_SEM",
-                num_right[4]: "HOLG_SAB",
-                num_right[5]: "HOLG_DOM",
-            }
-            for old, new in mapping.items():
-                if new not in df.columns:
-                    df.rename(columns={old: new}, inplace=True)
-                    ccols[new] = canon(new)
+            picked["BASE_SEM"] = [picked["BASE_SEM"][0] or num_right[0]]
+            picked["BASE_SAB"] = [picked["BASE_SAB"][0] or num_right[1]]
+            picked["BASE_DOM"] = [picked["BASE_DOM"][0] or num_right[2]]
+            picked["HOLG_SEM"] = [picked["HOLG_SEM"][0] or num_right[3]]
+            picked["HOLG_SAB"] = [picked["HOLG_SAB"][0] or num_right[4]]
+            picked["HOLG_DOM"] = [picked["HOLG_DOM"][0] or num_right[5]]
 
-    # Asegura existencia y numérico
+    # --- aplica renombres (y crea en 0 si faltara algo) ---
+    mapping = {}
+    for new_name, lst in picked.items():
+        if lst and lst[0]:
+            mapping[lst[0]] = new_name
+    if mapping:
+        df.rename(columns=mapping, inplace=True)
+
     for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
         if c not in df.columns:
             df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # --- Cálculos ---
+    # --- cálculos ---
     df["BASE_MAX"] = df[["BASE_SEM","BASE_SAB","BASE_DOM"]].max(axis=1)
     df["HOLG_MAX"] = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
     df["E1_EXTRA"] = (df["HOLG_MAX"] - df["BASE_MAX"]).clip(lower=0)
@@ -555,53 +589,14 @@ def load_crowd_caps() -> pd.DataFrame:
         CROWD_E1_CAP=("E1_EXTRA","max"),
     )
     out["FECHA"] = date.today()
+
+    # --- diagnóstico visible para ti ---
+    with st.expander("🔎 Debug Crowd (encabezados & mapeo)", expanded=False):
+        st.write("Columnas originales:", cols)
+        st.write("Elegidas:", {k: (v[0] if v and v[0] else None) for k, v in picked.items()})
+        st.dataframe(out, use_container_width=True)
+
     return _finalize(out, wanted)
-
-
-def load_crowd_pct_from_capacity() -> pd.DataFrame:
-    df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
-    if df.empty:
-        return pd.DataFrame(columns=["SVC", "CROWD_PCT"])
-
-    find_and_rename(df, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "Capacity")
-    find_and_rename(df, ["Tipo","Type","Category"], "TIPO", False, "Capacity")
-    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Capacity")
-    find_and_rename(df, ["Tipo DM","TipoDM","DM Type"], "TIPO_DM", False, "Capacity")
-    coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Capacity", required=False)
-    find_and_rename(df, ["Cantidad","Qty","Quantity","COUNT","QTY"], "CANT", False, "Capacity")
-
-    df = ensure_columns(df, {"DELIVERY_MODEL":"", "TIPO":"", "TIPO_DM":"", "SVC":None, "FECHA": pd.NaT, "CANT":0})
-    df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
-    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
-    _as_str_cols(df, ["SVC", "DELIVERY_MODEL", "TIPO", "TIPO_DM"])  # <- asegura str
-
-    # toma último día por SVC si hay fechas
-    if df["FECHA"].notna().any():
-        last_by_svc = df.groupby("SVC")["FECHA"].transform("max")
-        df = df[df["FECHA"] == last_by_svc]
-
-    # normaliza textos
-    dm     = df["DELIVERY_MODEL"].fillna("").astype(str)
-    tipo   = df["TIPO"].fillna("").astype(str)
-    tipodm = df["TIPO_DM"].fillna("").astype(str)
-
-    is_shipments = tipo.str.contains("ship", case=False, regex=False)
-    is_crowd = (
-        dm.str.contains("crowd", case=False, regex=False) |
-        tipodm.str.contains("crowd", case=False, regex=False) |
-        tipo.str.contains("crowd", case=False, regex=False)
-    )
-    is_crowd = is_shipments & is_crowd
-
-    tot = df[is_shipments].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_TOT")
-    crd = df[is_crowd].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_CROWD")
-
-    out = pd.concat([tot, crd], axis=1).reset_index()
-    _as_str_cols(out, ["SVC"])
-    out["SHIP_TOT"]   = pd.to_numeric(out["SHIP_TOT"], errors="coerce").fillna(0)
-    out["SHIP_CROWD"] = pd.to_numeric(out["SHIP_CROWD"], errors="coerce").fillna(0)
-    out["CROWD_PCT"]  = (out["SHIP_CROWD"] / out["SHIP_TOT"]).replace([np.inf,-np.inf], 0).fillna(0)
-    return out[["SVC", "CROWD_PCT"]]
 
 
 def load_spr_crowd() -> pd.DataFrame:
