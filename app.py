@@ -475,7 +475,6 @@ def load_crowd_caps_for(op_date: date, escenario: str) -> pd.DataFrame:
                     df.rename(columns={real: "SVC"}, inplace=True)
                 break
     if "SVC" not in df.columns:
-        # Sin SVC no hay merge confiable
         return pd.DataFrame(columns=wanted)
 
     _as_str_cols(df, ["SVC"])
@@ -498,8 +497,11 @@ def load_crowd_caps_for(op_date: date, escenario: str) -> pd.DataFrame:
     pick(df, holg_sab_keys, "HOLG_SAB")
     pick(df, holg_dom_keys, "HOLG_DOM")
 
+    # ⚠️ IMPORTANTE: crear columnas faltantes como Series de ceros ANTES de to_numeric
     for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
-        df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0).astype(int)
+        if c not in df.columns:
+            df[c] = 0  # esto crea una Series alineada al índice
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
 
     # E1 = Holgura - Base (>=0)
     df["E1_SEM"] = (df["HOLG_SEM"] - df["BASE_SEM"]).clip(lower=0)
@@ -508,6 +510,8 @@ def load_crowd_caps_for(op_date: date, escenario: str) -> pd.DataFrame:
 
     # Estandariza nombres expuestos
     df["BASE_ENTRE_SEM"] = df["BASE_SEM"].astype(int)
+    df["BASE_SAB"]       = df["BASE_SAB"].astype(int)
+    df["BASE_DOM"]       = df["BASE_DOM"].astype(int)
     df["E1_ENTRE_SEM"]   = df["E1_SEM"].astype(int)
     df["E1_SAB"]         = df["E1_SAB"].astype(int)
     df["E1_DOM"]         = df["E1_DOM"].astype(int)
@@ -524,12 +528,10 @@ def load_crowd_caps_for(op_date: date, escenario: str) -> pd.DataFrame:
         base_sel = df["BASE_DOM"]
         e1_sel   = df["E1_DOM"]
 
-    # Escenario
+    # Escenario → SIEMPRE Series (nada de escalares)
     esc = (escenario or "").strip().lower()
-    if ("e1" in esc) or ("+" in esc):
-        e1_effect = e1_sel
-    else:
-        e1_effect = 0
+    zeros = pd.Series(0, index=df.index)
+    e1_effect = e1_sel if (("e1" in esc) or ("+" in esc)) else zeros
 
     out = pd.DataFrame({
         "SVC": df["SVC"].astype(str).values,
@@ -1169,6 +1171,7 @@ with st.expander("▶️ Cargando datos...", expanded=True):
             caps         = load_capacity_caps()
             cap_svcs     = caps[["SVC"]] if "SVC" in caps.columns else caps.to_frame(name="SVC")
             crowdc_det = load_crowd_caps_for(planning_date, crowd_escenario)
+            crowd_det = crowdc_det
             rents_svcs   = load_rentals_caps_from_sheet()[["SVC"]]
             rent_fb_svcs = load_rentals_fallback()[["SVC"]]
             mlp_svcs     = load_mlp_caps_from_srm()[["SVC"]]
