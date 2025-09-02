@@ -1045,13 +1045,31 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     out["RUTAS_POST_MLP"]  = out["RUTAS_RESTANTES"]
     out["RUTAS_FALTANTES"] = out["RUTAS_RESTANTES"]
 
+
+
     # ---- Capacidad total (shipments) vs FCST ----
     cap_mlp_ship = (out["RUTAS_MLP_SDD"] + out["RUTAS_MLP_SPOT"] + out["RUTAS_MLP_BACKLOG_USADAS"]) * out["SPR_MLP"]
-    cap_total = base_otros + out["SHIP_RENTALS"] + out["SHIP_CROWD"] + cap_mlp_ship
-    out["CAP_TOTAL"]   = cap_total
-    out["CAP_VS_FCST"] = np.where(out["FCST"].fillna(0) > 0, out["CAP_TOTAL"] / out["FCST"].replace(0, np.nan), np.nan).fillna(0)
-    out["CAP_DIFF_ABS"] = (out["FCST"].fillna(0) - out["CAP_TOTAL"].fillna(0)).abs()
-    out["RIESGO"] = np.where(out["CAP_TOTAL"] + 1e-9 >= out["FCST"].fillna(0), "OK", "RIESGO")
+    cap_total = (
+        pd.to_numeric(out["SHIPMENTS_DC"], errors="coerce").fillna(0)
+      + pd.to_numeric(out["SHIPMENTS_SP"], errors="coerce").fillna(0)
+      + pd.to_numeric(out["SHIP_RENTALS"],  errors="coerce").fillna(0)
+      + pd.to_numeric(out["SHIP_CROWD"],    errors="coerce").fillna(0)
+      + pd.to_numeric(cap_mlp_ship,         errors="coerce").fillna(0)
+    )
+    out["CAP_TOTAL"] = cap_total
+
+    # Usa Series de pandas para evitar el .fillna sobre ndarrays
+    fcst_series = pd.to_numeric(out["FCST"], errors="coerce")
+
+    # Proporción de capacidad sobre FCST (si FCST==0 -> 0)
+    out["CAP_VS_FCST"] = (out["CAP_TOTAL"] / fcst_series.replace(0, np.nan)).fillna(0)
+
+    # Diferencia absoluta (|FCST - CAP_TOTAL|)
+    out["CAP_DIFF_ABS"] = (fcst_series.fillna(0) - out["CAP_TOTAL"]).abs()
+
+    # Flag de riesgo (OK si CAP_TOTAL >= FCST)
+    out["RIESGO"] = np.where(out["CAP_TOTAL"] + 1e-9 >= fcst_series.fillna(0), "OK", "RIESGO")
+
 
     # ---- Filtro por SVC (si se solicita) ----
     if sel_svcs:
