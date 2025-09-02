@@ -446,86 +446,71 @@ def load_rentals_fallback() -> pd.DataFrame:
 
 def load_crowd_caps() -> pd.DataFrame:
     """
-    Lee la pestaña Crowd y calcula:
-      - CROWD_BASE_CAP = max(Base entre semana, Base sábado, Base domingo)
-      - CROWD_E1_CAP   = max(Holgura entre semana, Holgura sábado, Holgura domingo) - CROWD_BASE_CAP (>=0)
-    Tolera encabezados combinados (dos filas) tipo: "Crowd base - Entre semana", "Holgura domingo", etc.
-    Devuelve: FECHA, SVC, CROWD_BASE_CAP, CROWD_E1_CAP
+    Crowd caps desde la pestaña Crowd con encabezados combinados.
+    Calcula:
+      CROWD_BASE_CAP = max(Base entre semana, Base sábado, Base domingo)
+      CROWD_E1_CAP   = max(Holgura entre semana, Holgura sábado, Holgura domingo) - CROWD_BASE_CAP (>=0)
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
-    wanted_cols = ["FECHA","SVC","CROWD_BASE_CAP","CROWD_E1_CAP"]
+    wanted = ["FECHA","SVC","CROWD_BASE_CAP","CROWD_E1_CAP"]
     if df.empty:
-        return pd.DataFrame(columns=wanted_cols)
+        return pd.DataFrame(columns=wanted)
 
-    # --- SVC ---
+    # SVC (obligatorio)
     try:
         find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", True, "Crowd")
     except Exception:
-        return pd.DataFrame(columns=wanted_cols)
+        return pd.DataFrame(columns=wanted)
     df = _as_str_cols(df, ["SVC"])
 
-    # --- Fecha (opcional) ---
+    # Fecha (opcional)
     coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Crowd", required=False)
 
-    # --------- Helper: fuzzy por tokens sobre encabezados combinados ----------
+    # -------- helpers de matching laxo --------
     def canon(x: str) -> str:
         return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(x).lower()).encode("ascii","ignore").decode("ascii"))
 
-    canon_cols = {c: canon(c) for c in df.columns}
+    ccols = {c: canon(c) for c in df.columns}
 
-    def rename_by_tokens(tokens: list[str], new_name: str) -> bool:
-        """
-        Renombra la PRIMERA columna cuyo nombre canónico contenga TODOS los tokens indicados.
-        Ej.: tokens ['base','entre','sem'] matchea 'crowdbaseentresemana__2'
-        """
-        toks = [canon(t) for t in tokens]
-        for col, cc in canon_cols.items():
-            if all(t in cc for t in toks):
+    def rename_by_family_any(family_tokens: list[str], include_any: list[str], new_name: str, exclude_any: list[str] = ["total"]) -> bool:
+        fam = [canon(t) for t in family_tokens]
+        inc = [canon(t) for t in include_any]
+        exc = [canon(t) for t in exclude_any]
+        for col, cc in ccols.items():
+            if all(t in cc for t in fam) and any(t in cc for t in inc) and not any(t in cc for t in exc):
                 if col != new_name:
                     df.rename(columns={col: new_name}, inplace=True)
-                    canon_cols[new_name] = canon(new_name)
+                    ccols[new_name] = canon(new_name)
                 return True
         return False
 
-    # --------- Mapear columnas posibles (varias variantes de tokens) ----------
-    # Base
-    found = False
-    found |= rename_by_tokens(["base","entre","sem"], "BASE_SEM")
-    found |= rename_by_tokens(["base","weekday"],     "BASE_SEM")
+    # Acepta: "Base Base entre ser", "Base entre semana", "Base weekday", etc.
+    rename_by_family_any(["base"], ["entre", "entres", "entreser", "sem", "semana", "weekday"], "BASE_SEM")
+    rename_by_family_any(["base"], ["sab", "sabado", "sábado"], "BASE_SAB")
+    rename_by_family_any(["base"], ["dom", "domingo"], "BASE_DOM")
 
-    found |= rename_by_tokens(["base","sab"],         "BASE_SAB") or \
-             rename_by_tokens(["base","sabad"],       "BASE_SAB")
+    # Acepta: "E1 Holgura entre", "Holgura entre semana", etc.
+    rename_by_family_any(["holg"], ["entre", "entres", "entreser", "sem", "semana", "weekday"], "HOLG_SEM")
+    rename_by_family_any(["holg"], ["sab", "sabado", "sábado"], "HOLG_SAB")
+    rename_by_family_any(["holg"], ["dom", "domingo"], "HOLG_DOM")
 
-    found |= rename_by_tokens(["base","dom"],         "BASE_DOM") or \
-             rename_by_tokens(["base","domingo"],     "BASE_DOM")
-
-    # Holgura
-    rename_by_tokens(["holg","entre","sem"], "HOLG_SEM") or rename_by_tokens(["holgura","entre","sem"], "HOLG_SEM")
-    rename_by_tokens(["holg","sab"], "HOLG_SAB") or rename_by_tokens(["holgura","sabad"], "HOLG_SAB")
-    rename_by_tokens(["holg","dom"], "HOLG_DOM") or rename_by_tokens(["holgura","domingo"], "HOLG_DOM")
-
-    # Asegura existencia y numérico
+    # Si alguna falta, créala en 0; y todas a numérico
     for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
         if c not in df.columns:
             df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # Capacidad base y holgura máxima
+    # Cálculo
     df["BASE_MAX"] = df[["BASE_SEM","BASE_SAB","BASE_DOM"]].max(axis=1)
     df["HOLG_MAX"] = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
-
-    # E1 adicional (no duplica la base)
     df["E1_EXTRA"] = (df["HOLG_MAX"] - df["BASE_MAX"]).clip(lower=0)
 
-    # Agregamos por SVC (máximo por SVC)
     out = df.groupby("SVC", as_index=False).agg(
         CROWD_BASE_CAP=("BASE_MAX","max"),
         CROWD_E1_CAP=("E1_EXTRA","max"),
     )
-
-    # FECHA de referencia (hoy si no había)
     out["FECHA"] = date.today()
-    return _finalize(out, wanted_cols)
+    return _finalize(out, wanted)
 
 
 def load_crowd_pct_from_capacity() -> pd.DataFrame:
