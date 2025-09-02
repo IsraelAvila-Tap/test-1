@@ -457,24 +457,27 @@ def load_rentals_fallback() -> pd.DataFrame:
 
 def load_crowd_caps() -> pd.DataFrame:
     """
-    Crowd caps desde la pestaña Crowd con encabezados combinados.
+    Crowd caps desde la pestaña Crowd con encabezados combinados y textos truncados.
     Calcula:
       CROWD_BASE_CAP = max(Base entre semana, Base sábado, Base domingo)
       CROWD_E1_CAP   = max(Holgura entre semana, Holgura sábado, Holgura domingo) - CROWD_BASE_CAP (>=0)
+
+    Fallback posicional: si no encuentra por nombre, usa las 6 primeras columnas numéricas
+    a la derecha de SVC (3 Base + 3 E1), en ese orden.
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
     wanted = ["FECHA","SVC","CROWD_BASE_CAP","CROWD_E1_CAP"]
     if df.empty:
         return pd.DataFrame(columns=wanted)
 
-    # SVC (obligatorio)
+    # --- SVC (obligatorio) ---
     try:
         find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", True, "Crowd")
     except Exception:
         return pd.DataFrame(columns=wanted)
     df = _as_str_cols(df, ["SVC"])
 
-    # Fecha (opcional)
+    # --- Fecha (opcional) ---
     coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Crowd", required=False)
 
     # -------- helpers de matching laxo --------
@@ -483,11 +486,12 @@ def load_crowd_caps() -> pd.DataFrame:
 
     ccols = {c: canon(c) for c in df.columns}
 
-    def rename_by_family_any(family_tokens: list[str], include_any: list[str], new_name: str, exclude_any: list[str] = ["total"]) -> bool:
+    def rename_by_family_any(family_tokens: list[str], include_any: list[str], new_name: str,
+                             exclude_any: list[str] = ["total"]) -> bool:
         fam = [canon(t) for t in family_tokens]
         inc = [canon(t) for t in include_any]
         exc = [canon(t) for t in exclude_any]
-        for col, cc in ccols.items():
+        for col, cc in list(ccols.items()):
             if all(t in cc for t in fam) and any(t in cc for t in inc) and not any(t in cc for t in exc):
                 if col != new_name:
                     df.rename(columns={col: new_name}, inplace=True)
@@ -495,23 +499,53 @@ def load_crowd_caps() -> pd.DataFrame:
                 return True
         return False
 
-    # Acepta: "Base Base entre ser", "Base entre semana", "Base weekday", etc.
-    rename_by_family_any(["base"], ["entre", "entres", "entreser", "sem", "semana", "weekday"], "BASE_SEM")
-    rename_by_family_any(["base"], ["sab", "sabado", "sábado"], "BASE_SAB")
-    rename_by_family_any(["base"], ["dom", "domingo"], "BASE_DOM")
+    # --- Intento 1: por nombre (muy laxo) ---
+    found_any = False
+    found_any |= rename_by_family_any(["base"], ["entre","entres","entreser","sem","semana","weekday"], "BASE_SEM")
+    found_any |= rename_by_family_any(["base"], ["sab","sabad","sabado","sábado"], "BASE_SAB")
+    found_any |= rename_by_family_any(["base"], ["dom","domingo"], "BASE_DOM")
+    found_any |= rename_by_family_any(["holg"], ["entre","entres","entreser","sem","semana","weekday"], "HOLG_SEM")
+    found_any |= rename_by_family_any(["holg"], ["sab","sabad","sabado","sábado"], "HOLG_SAB")
+    found_any |= rename_by_family_any(["holg"], ["dom","domingo"], "HOLG_DOM")
 
-    # Acepta: "E1 Holgura entre", "Holgura entre semana", etc.
-    rename_by_family_any(["holg"], ["entre", "entres", "entreser", "sem", "semana", "weekday"], "HOLG_SEM")
-    rename_by_family_any(["holg"], ["sab", "sabado", "sábado"], "HOLG_SAB")
-    rename_by_family_any(["holg"], ["dom", "domingo"], "HOLG_DOM")
+    # --- Intento 2 (fallback posicional): 6 numéricas a la derecha de SVC ---
+    need_positional = not all(c in df.columns for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"])
+    if need_positional:
+        cols = list(df.columns)
+        try:
+            idx_svc = cols.index("SVC")
+        except ValueError:
+            idx_svc = -1
+        right_cols = [c for i, c in enumerate(cols) if i > idx_svc and c not in ("FECHA",)]
+        # columnas numéricas en orden de aparición
+        num_right = []
+        for c in right_cols:
+            s = pd.to_numeric(df[c], errors="coerce")
+            if s.notna().any():
+                num_right.append(c)
+            if len(num_right) >= 6:
+                break
+        if len(num_right) >= 6:
+            mapping = {
+                num_right[0]: "BASE_SEM",
+                num_right[1]: "BASE_SAB",
+                num_right[2]: "BASE_DOM",
+                num_right[3]: "HOLG_SEM",
+                num_right[4]: "HOLG_SAB",
+                num_right[5]: "HOLG_DOM",
+            }
+            for old, new in mapping.items():
+                if new not in df.columns:
+                    df.rename(columns={old: new}, inplace=True)
+                    ccols[new] = canon(new)
 
-    # Si alguna falta, créala en 0; y todas a numérico
+    # Asegura existencia y numérico
     for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
         if c not in df.columns:
             df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # Cálculo
+    # --- Cálculos ---
     df["BASE_MAX"] = df[["BASE_SEM","BASE_SAB","BASE_DOM"]].max(axis=1)
     df["HOLG_MAX"] = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
     df["E1_EXTRA"] = (df["HOLG_MAX"] - df["BASE_MAX"]).clip(lower=0)
