@@ -466,7 +466,7 @@ def load_crowd_caps_for(op_date: _date) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=wanted)
 
-    # SVC robusto
+    # --- SVC robusto ---
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", required=False, source_label="Crowd")
     if "SVC" not in df.columns:
         cmap = {_canon_name(c): c for c in df.columns}
@@ -479,36 +479,49 @@ def load_crowd_caps_for(op_date: _date) -> pd.DataFrame:
         return pd.DataFrame(columns=wanted)
     _as_str_cols(df, ["SVC"])
 
-    # Renombres flexibles
-    base_sem_keys = ["Base entre semana","Base entre sem","Base semana","Base entre sem."]
+    # --- ayudante para renombrado tolerante a headers fusionados ---
+    def rename_fuzzy(variants: list[str], new_name: str):
+        # 1) intento exacto con nuestro find_and_rename
+        found = find_and_rename(df, variants, new_name, required=False, source_label="Crowd")
+        if found:
+            return
+        # 2) intento "fuzzy": coincide si el canon contiene/termina con el objetivo
+        cmap = {_canon_name(c): c for c in df.columns}
+        targets = [_canon_name(v) for v in variants]
+        for can, real in cmap.items():
+            if any(can.endswith(t) or t in can for t in targets):
+                if real != new_name:
+                    df.rename(columns={real: new_name}, inplace=True)
+                return
+
+    # --- claves (incluyen variantes con el prefijo del grupo "Base"/"E1") ---
+    base_sem_keys = ["Base entre semana","Base entre sem","Base semana","Base entre sem.", "Base Base entre semana"]
     base_sab_keys = ["Base sabado","Base sábado"]
     base_dom_keys = ["Base domingo"]
-    holg_sem_keys = ["Holgura entre semana","Holgura entre sem","Holgura semana"]
+
+    holg_sem_keys = ["Holgura entre semana","Holgura entre sem","Holgura semana", "E1 Holgura entre semana"]
     holg_sab_keys = ["Holgura sabado","Holgura sábado"]
     holg_dom_keys = ["Holgura domingo"]
 
-    def pick(df_, keys, name):
-        find_and_rename(df_, keys, name, required=False, source_label="Crowd")
+    rename_fuzzy(base_sem_keys, "BASE_SEM")
+    rename_fuzzy(base_sab_keys, "BASE_SAB")
+    rename_fuzzy(base_dom_keys, "BASE_DOM")
+    rename_fuzzy(holg_sem_keys, "HOLG_SEM")
+    rename_fuzzy(holg_sab_keys, "HOLG_SAB")
+    rename_fuzzy(holg_dom_keys, "HOLG_DOM")
 
-    pick(df, base_sem_keys, "BASE_SEM")
-    pick(df, base_sab_keys, "BASE_SAB")
-    pick(df, base_dom_keys, "BASE_DOM")
-    pick(df, holg_sem_keys, "HOLG_SEM")
-    pick(df, holg_sab_keys, "HOLG_SAB")
-    pick(df, holg_dom_keys, "HOLG_DOM")
-
-    # Asegura numérico y Series (evita ints sueltos)
+    # --- asegurar numérico e inexistentes en 0 ---
     for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
         if c not in df.columns:
             df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
 
-    # E1 = Holgura - Base por tipo de día
+    # --- E1 = Holgura - Base (no negativo) ---
     df["E1_SEM"] = (df["HOLG_SEM"] - df["BASE_SEM"]).clip(lower=0).astype(int)
     df["E1_SAB"] = (df["HOLG_SAB"] - df["BASE_SAB"]).clip(lower=0).astype(int)
     df["E1_DOM"] = (df["HOLG_DOM"] - df["BASE_DOM"]).clip(lower=0).astype(int)
 
-    # Día de operación
+    # --- Día de operación ---
     wd = op_date.weekday()  # 0..6 => Lun..Dom
     if wd <= 4:
         base_sel = df["BASE_SEM"]
@@ -533,6 +546,8 @@ def load_crowd_caps_for(op_date: _date) -> pd.DataFrame:
     })
     out["FECHA"] = op_date
     return out[wanted]
+
+
 
 def load_crowd_pct_from_capacity() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
