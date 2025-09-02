@@ -862,6 +862,119 @@ def load_spr_mlp() -> pd.DataFrame:
     global_val = mlp_rows["SPR"].median()
     grp_local["SPR_MLP"] = grp_local["SPR_MLP"].fillna(global_val)
     return grp_local
+# ---- SPR por Delivery Model (RENTALS/CROWD/MLP) según modo y día de análisis ----
+def _norm_dm_label(s: str) -> str:
+    s = (s or "").strip().lower()
+    if re.search(r"crowd", s): return "CROWD"
+    if re.search(r"rent",  s): return "RENTALS"
+    # MLP / SDD / SPOT / Backlog en la misma canasta
+    if re.search(r"mlp|sdd|spot|back", s): return "MLP"
+    # DC / SP no participan en SPR de rutas (solo shipments)
+    return ""
+
+def _weekday_tail(df: pd.DataFrame, limit_date: date, same_weekday_only: bool = True) -> pd.DataFrame:
+    """Filtra histórico <= limit_date (mismo weekday si aplica)."""
+    if "FECHA" not in df.columns:
+        return df.iloc[0:0]
+    df2 = df.copy()
+    df2["FECHA"] = pd.to_datetime(df2["FECHA"], errors="coerce").dt.date
+    df2 = df2[df2["FECHA"].notna()]
+    df2 = df2[df2["FECHA"] <= limit_date]
+    if same_weekday_only:
+        w = limit_date.weekday()
+        df2 = df2[df2["FECHA"].apply(lambda d: d.weekday()) == w]
+    return df2
+
+def _agg_prom_last4_same_weekday(s: pd.Series) -> float:
+    # Mediana de los últimos 4 puntos (si hay menos, con lo que haya)
+    vals = pd.to_numeric(s, errors="coerce").dropna()
+    if vals.empty: 
+        return np.nan
+    if len(vals) > 4:
+        vals = vals.iloc[-4:]
+    return float(vals.median())
+
+def _agg_peak_p95_same_weekday(s: pd.Series) -> float:
+    vals = pd.to_numeric(s, errors="coerce").dropna()
+    if vals.empty: 
+        return np.nan
+    return float(np.percentile(vals, 95))
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_spr_dm_by_mode(op_date: date, mode: str) -> pd.DataFrame:
+    """
+    Devuelve, por SVC:
+      - SPR_RENTALS_SEL
+      - SPR_CROWD_SEL
+      - SPR_MLP_SEL
+    Cálculo:
+      - promedio: mediana de los **últimos 4** del mismo weekday (<= op_date)
+      - peak:     p95 del mismo weekday (<= op_date)
+      - plan:     último valor del mismo weekday (<= op_date)
+    Fuente: pestaña SPR (col: DELIVERY_MODEL, FECHA, SVC, SPR)
+    """
+    df = read_sheet(SHEET_ID, SHEET_TABS["spr"])
+    out_cols = ["SVC","SPR_RENTALS_SEL","SPR_CROWD_SEL","SPR_MLP_SEL"]
+    if df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    # Normalización mínima
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SPR")
+    find_and_rename(df, ["SPR","spr","Ships per route"], "SPR", False, "SPR")
+    find_and_rename(df, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "SPR")
+    coerce_date_column(df, ["FECHA","Fecha","DATE","OP_DT"], "FECHA", "SPR", required=False)
+
+    if "SVC" not in df.columns or "SPR" not in df.columns or "DELIVERY_MODEL" not in df.columns:
+        return pd.DataFrame(columns=out_cols)
+
+    df = ensure_columns(df, {"SVC":None, "SPR":np.nan, "DELIVERY_MODEL":"", "FECHA": pd.NaT})
+    df["SPR"] = pd.to_numeric(df["SPR"], errors="coerce")
+    _as_str_cols(df, ["SVC","DELIVERY_MODEL"])
+    df["DM"] = df["DELIVERY_MODEL"].map(_norm_dm_label)
+
+    # Solo DM relevantes
+    df = df[df["DM"].isin(["RENTALS","CROWD","MLP"])].copy()
+    if df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    # Filtrado temporal (<= día y mismo weekday)
+    dfw = _weekday_tail(df, op_date, same_weekday_only=True).sort_values(["SVC","DM","FECHA"])
+    if dfw.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    # Agregadores por modo
+    if mode == "promedio":
+        agg_fun = _agg_prom_last4_same_weekday
+    elif mode == "peak":
+        agg_fun = _agg_peak_p95_same_weekday
+    else:  # plan: último valor del mismo weekday
+        def agg_fun(s):
+            vals = pd.to_numeric(s, errors="coerce").dropna()
+            return float(vals.iloc[-1]) if len(vals) else np.nan
+
+    # Aplica agregación por SVC x DM
+    stats = (
+        dfw.groupby(["SVC","DM"], dropna=False)["SPR"]
+           .apply(agg_fun)
+           .reset_index()
+           .rename(columns={"SPR":"SPR_SEL"})
+    )
+
+    # Pivot a columnas por DM
+    piv = stats.pivot(index="SVC", columns="DM", values="SPR_SEL").reset_index().rename_axis(None, axis=1)
+    # Renombra a columnas objetivo
+    piv = piv.rename(columns={
+        "RENTALS": "SPR_RENTALS_SEL",
+        "CROWD":   "SPR_CROWD_SEL",
+        "MLP":     "SPR_MLP_SEL",
+    })
+
+    # Asegura columnas
+    for c in ["SPR_RENTALS_SEL","SPR_CROWD_SEL","SPR_MLP_SEL"]:
+        if c not in piv.columns: piv[c] = np.nan
+
+    return piv[["SVC","SPR_RENTALS_SEL","SPR_CROWD_SEL","SPR_MLP_SEL"]]
+
 
 def load_spr_dm_stats_from_sheet() -> pd.DataFrame:
     """
@@ -1044,25 +1157,24 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
 
     # ---- carga de datos base ----
     fcst      = load_fcst()
-    spr_base  = load_spr()                              # SPR objetivo general por SVC
-    caps      = load_capacity_caps()                    # DC/SP y caps
-    crowdday  = load_crowd_caps_for(hoy)                # base día + E1 día (Crowd)
-    rents     = load_rentals_caps_from_sheet()          # RUTAS_RENTALS + SPR_RENTALS ponderado
+    spr       = load_spr()                       # OBJ/PEAK/PROM por SVC (solo para SPR_USADO base)
+    caps      = load_capacity_caps()             # DC/SP y legacy crowd cap
+    crowdday  = load_crowd_caps_for(hoy)         # base día + E1 día (Crowd)
+    rents     = load_rentals_caps_from_sheet()   # RUTAS_RENTALS + SPR ponderado histórico
     rents_fb  = load_rentals_fallback()
-    crowd_pct = load_crowd_pct_from_capacity()          # % objetivo crowd
-    spr_crowd = load_spr_crowd()                        # SPR_CROWD (plan)
-    mlp_caps  = load_mlp_caps_from_srm()                # Caps MLP por tipo
-    spr_mlp   = load_spr_mlp()                          # SPR_MLP (plan)
-    spr_dm_rw = load_spr_dm_real_peak_for(hoy)          # REAL4W y PEAK por DM (CROWD/RENTALS/MLP)
+    crowd_pct = load_crowd_pct_from_capacity()   # % crowd objetivo por SVC
+    mlp_caps  = load_mlp_caps_from_srm()         # caps MLP por SVC (SDD/SPOT/Back)
+    # NUEVO: SPR por DM según modo y día
+    spr_dm    = load_spr_dm_by_mode(hoy, spr_mode)
 
-    # normaliza SVC en todos
-    for d in (fcst, spr_base, caps, crowdday, rents, rents_fb, crowd_pct, spr_crowd, mlp_caps, spr_mlp, spr_dm_rw):
+    # normaliza SVC
+    for d in (fcst, spr, caps, crowdday, rents, rents_fb, crowd_pct, mlp_caps, spr_dm):
         if not d.empty and "SVC" in d.columns:
             _as_str_cols(d, ["SVC"])
 
     # ----------------- BASE DE SVCs -----------------
     bases = []
-    for d in [fcst, spr_base, caps, crowdday, rents, rents_fb, crowd_pct, mlp_caps, spr_dm_rw]:
+    for d in [fcst, spr, caps, crowdday, rents, rents_fb, crowd_pct, mlp_caps, spr_dm]:
         if "SVC" in d.columns and not d.empty:
             bases.append(d[["SVC"]])
     base = pd.concat(bases, axis=0).drop_duplicates() if bases else pd.DataFrame(columns=["SVC"])
@@ -1074,22 +1186,22 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     # ----------------- MERGES PRINCIPALES -----------------
     if not fcst.empty:
         out = safe_merge(out, fcst[["SVC","FCST"]], ["SVC"])
-    if not spr_base.empty:
-        out = safe_merge(out, spr_base[["SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"]], ["SVC"])
+    if not spr.empty:
+        out = safe_merge(out, spr[["SVC","SPR_OBJ","SPR_PEAK","SPR_PROM"]], ["SVC"])
 
-    # SPR general para RUTAS_SPR_BASE
+    # SPR base para el cálculo de rutas totales (SPR_USADO)
     spr_mode_col = {"promedio":"SPR_PROM", "peak":"SPR_PEAK", "plan":"SPR_OBJ"}.get(spr_mode, "SPR_PROM")
     out = ensure_columns(out, {"SPR_OBJ":np.nan, "SPR_PEAK":np.nan, "SPR_PROM":np.nan})
     spr_usado = out[spr_mode_col].where(out[spr_mode_col].notna(), out["SPR_OBJ"]).fillna(20)
     out["SPR_USADO"] = pd.to_numeric(spr_usado, errors="coerce").fillna(20).clip(lower=1)
 
-    # Capacity (DC/SP)
+    # Capacity (DC/SP) (Crowd cap legacy lo sobreescribimos luego con 'Crowd')
     if not caps.empty:
         out = safe_merge(out, caps[["SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","SHIPMENTS_DC","SHIPMENTS_SP"]], ["SVC"])
     else:
         out = ensure_columns(out, {"RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0, "RUTAS_RENTALS":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
 
-    # Rentals (caps + SPR ponderado)
+    # Rentals (rutas)
     out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
     if not rents.empty:
         out = safe_merge(out, rents[["SVC","RUTAS_RENTALS","SPR_RENTALS"]], ["SVC"])
@@ -1101,7 +1213,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
         out["SPR_RENTALS"]   = np.nan
     out["RUTAS_RENTALS"] = pd.to_numeric(out.get("RUTAS_RENTALS", 0), errors="coerce").fillna(0).astype(int)
 
-    # Crowd del día
+    # ------ CROWD del día (base + E1) ------
     out = out.drop(columns=["RUTAS_CROWD_CAP"], errors="ignore")
     if not crowdday.empty:
         out = safe_merge(out, crowdday[["SVC","RUTAS_CROWD_CAP","CROWD_E1_CAP"]], ["SVC"])
@@ -1116,29 +1228,33 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
         out["CROWD_PCT"] = 0.0
     out["CROWD_PCT"] = pd.to_numeric(out.get("CROWD_PCT", 0), errors="coerce").fillna(0).clip(0,1)
 
-    # SPR plan por DM (Crowd/MLP)
-    if not spr_crowd.empty:
-        out = safe_merge(out, spr_crowd, ["SVC"])
-    if not spr_mlp.empty:
-        out = safe_merge(out, spr_mlp, ["SVC"])
+    # ======== SPR por Delivery Model (según modo) ========
+    if not spr_dm.empty:
+        out = safe_merge(out, spr_dm, ["SVC"])
+    for c in ["SPR_RENTALS_SEL","SPR_CROWD_SEL","SPR_MLP_SEL"]:
+        if c not in out.columns: out[c] = np.nan
+        out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    # SPR reales/peak por DM (4W/12W mismo weekday)
-    if not spr_dm_rw.empty:
-        out = safe_merge(out, spr_dm_rw, ["SVC"])
-
-    # ---- Selección de SPR por Delivery Model según modo ----
-    def pick(col_real, col_peak, col_plan, fb):
-        if spr_mode == "promedio":
-            s = pd.to_numeric(out.get(col_real, np.nan), errors="coerce")
-        elif spr_mode == "peak":
-            s = pd.to_numeric(out.get(col_peak, np.nan), errors="coerce")
-        else:  # plan
-            s = pd.to_numeric(out.get(col_plan, np.nan), errors="coerce")
-        return s.fillna(fb).clip(lower=1)
-
-    out["SPR_RENTALS_SEL"] = pick("SPR_RENTALS_REAL4W","SPR_RENTALS_PEAK","SPR_RENTALS", out["SPR_USADO"])
-    out["SPR_CROWD_SEL"]   = pick("SPR_CROWD_REAL4W","SPR_CROWD_PEAK","SPR_CROWD",   out["SPR_USADO"])
-    out["SPR_MLP_SEL"]     = pick("SPR_MLP_REAL4W","SPR_MLP_PEAK","SPR_MLP",         out["SPR_USADO"])
+    # Fallbacks seguros por DM
+    # Rentals: si no hay selección, usa el SPR ponderado histórico calculado en Rentals; si tampoco, usa SPR_USADO
+    out["SPR_RENTALS_FINAL"] = (
+        out["SPR_RENTALS_SEL"]
+            .fillna(out.get("SPR_RENTALS", np.nan))
+            .fillna(out["SPR_USADO"])
+            .clip(lower=1)
+    )
+    # Crowd: si no hay selección, usa valores del sheet Crowd SPR si algún día los agregas; por ahora fallback a SPR_USADO
+    out["SPR_CROWD_FINAL"] = (
+        out["SPR_CROWD_SEL"]
+            .fillna(out["SPR_USADO"])
+            .clip(lower=1)
+    )
+    # MLP: fallback a SPR_USADO
+    out["SPR_MLP_FINAL"] = (
+        out["SPR_MLP_SEL"]
+            .fillna(out["SPR_USADO"])
+            .clip(lower=1)
+    )
 
     # ----------------- DEMANDA & SPR BASE -----------------
     out = ensure_columns(out, {"FCST":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
@@ -1153,7 +1269,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     # ----------------- CROWD ASIGNACIÓN -----------------
     out["SHIP_OBJ_CROWD"]  = pd.to_numeric(out["FCST"], errors="coerce").fillna(0) * out["CROWD_PCT"]
     out["RUTAS_CROWD_OBJ"] = np.ceil(
-        pd.to_numeric(out["SHIP_OBJ_CROWD"], errors="coerce").fillna(0) / out["SPR_CROWD_SEL"]
+        pd.to_numeric(out["SHIP_OBJ_CROWD"], errors="coerce").fillna(0) / out["SPR_CROWD_FINAL"]
     ).astype(int)
 
     leftover_vs_spr = np.maximum(out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"], 0)
@@ -1163,9 +1279,9 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     rem_despues_base = (leftover_vs_spr - out["RUTAS_CROWD_BASE"]).clip(lower=0)
     out["RUTAS_CROWD_ESCALADO"] = np.minimum.reduce([exceso_obj, out["CROWD_E1_CAP"], rem_despues_base]).astype(int)
 
-    # Shipments por DM
-    out["SHIP_RENTALS"] = pd.to_numeric(out["RUTAS_RENTALS"], errors="coerce").fillna(0) * out["SPR_RENTALS_SEL"]
-    out["SHIP_CROWD"]   = (out["RUTAS_CROWD_BASE"] + out["RUTAS_CROWD_ESCALADO"]) * out["SPR_CROWD_SEL"]
+    # Shipments por Rentals y Crowd (usando SPR por DM)
+    out["SHIP_RENTALS"] = pd.to_numeric(out["RUTAS_RENTALS"], errors="coerce").fillna(0) * out["SPR_RENTALS_FINAL"]
+    out["SHIP_CROWD"]   = (out["RUTAS_CROWD_BASE"] + out["RUTAS_CROWD_ESCALADO"]) * out["SPR_CROWD_FINAL"]
 
     # Restantes para MLP
     base_otros = pd.to_numeric(out["SHIPMENTS_DC"], errors="coerce").fillna(0) + pd.to_numeric(out["SHIPMENTS_SP"], errors="coerce").fillna(0)
@@ -1173,7 +1289,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
         pd.to_numeric(out["FCST"], errors="coerce").fillna(0) - base_otros - out["SHIP_RENTALS"] - out["SHIP_CROWD"]
     ).clip(lower=0)
 
-    # ----------------- MLP (caps SRM + SPR_MLP_SEL) -----------------
+    # ----------------- MLP (caps SRM + SPR_MLP_FINAL) -----------------
     if not mlp_caps.empty:
         out = safe_merge(out, mlp_caps, ["SVC"])
     else:
@@ -1183,22 +1299,22 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
             "MLP_BACK_CAP":0
         })
 
-    out["SPR_MLP"] = out["SPR_MLP_SEL"]  # usar el seleccionado para cálculo
-
+    # Necesidad de rutas MLP segura
     out["RUTAS_MLP_NEEDED"] = np.ceil(
-        pd.to_numeric(out.get("SHIP_RESTANTES_PRE_MLP", 0), errors="coerce").fillna(0) /
-        out["SPR_MLP"].replace(0, np.nan)
+        pd.to_numeric(out.get("SHIP_RESTANTES_PRE_MLP", 0), errors="coerce").fillna(0)
+        / out["SPR_MLP_FINAL"].replace(0, np.nan)
     ).replace([np.inf, -np.inf], np.nan).fillna(0).astype(int)
 
-    # saneo caps
+    # saneo de caps
     for c in ["MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]:
-        if c not in out.columns: out[c] = 0
+        if c not in out.columns:
+            out[c] = 0
         out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf,-np.inf], np.nan).fillna(0).astype(int)
 
     need     = pd.to_numeric(out["RUTAS_MLP_NEEDED"], errors="coerce").fillna(0)
-    sdd_cap  = pd.to_numeric(out["MLP_SDD_CAP"], errors="coerce").fillna(0)
-    spot_cap = pd.to_numeric(out["MLP_SPOT_CAP"], errors="coerce").fillna(0)
-    back_cap = pd.to_numeric(out["MLP_BACK_CAP"], errors="coerce").fillna(0)
+    sdd_cap  = pd.to_numeric(out["MLP_SDD_CAP"],      errors="coerce").fillna(0)
+    spot_cap = pd.to_numeric(out["MLP_SPOT_CAP"],     errors="coerce").fillna(0)
+    back_cap = pd.to_numeric(out["MLP_BACK_CAP"],     errors="coerce").fillna(0)
 
     use_sdd  = np.minimum(need, sdd_cap)
     need2    = (need - use_sdd).clip(lower=0)
@@ -1214,20 +1330,27 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     out["RUTAS_POST_MLP"]  = out["RUTAS_RESTANTES"]
     out["RUTAS_FALTANTES"] = out["RUTAS_RESTANTES"]
 
-    # KPIs
-    cap_mlp = (out["RUTAS_MLP_SDD_USADAS"] + out["RUTAS_MLP_SPOT_USADAS"] + out["RUTAS_MLP_BACKLOG_USADAS"]) * out["SPR_MLP"]
+    # KPIs finales
+    cap_mlp = (out["RUTAS_MLP_SDD_USADAS"] + out["RUTAS_MLP_SPOT_USADAS"] + out["RUTAS_MLP_BACKLOG_USADAS"]) * out["SPR_MLP_FINAL"]
     out["CAP_TOTAL"]    = base_otros.fillna(0) + out["SHIP_RENTALS"].fillna(0) + out["SHIP_CROWD"].fillna(0) + cap_mlp.fillna(0)
     out["CAP_VS_FCST"]  = (out["CAP_TOTAL"] / out["FCST"].replace(0, np.nan)).fillna(0).round(2)
     out["CAP_DIFF_ABS"] = (pd.to_numeric(out["FCST"], errors="coerce").fillna(0) - out["CAP_TOTAL"]).abs().round(2)
     out["RIESGO"]       = np.where(out["CAP_TOTAL"] + 1e-9 >= pd.to_numeric(out["FCST"], errors="coerce").fillna(0), "OK", "RIESGO")
 
-    # Filtro SVC
+    # Filtro SVC (si aplica)
     if sel_svcs:
         sel_svcs = _clean_svc_values(sel_svcs)
         if sel_svcs:
             out = out[out["SVC"].isin(sel_svcs)]
 
+    # Orden y salida
     out = apply_output_adjustments(out).fillna(0).sort_values("SVC").reset_index(drop=True)
+
+    # Mostrar las 3 columnas DM elegidas (overrides legibles)
+    out["SPR_RENTALS"] = out["SPR_RENTALS_FINAL"]
+    out["SPR_CROWD"]   = out["SPR_CROWD_FINAL"]
+    out["SPR_MLP"]     = out["SPR_MLP_FINAL"]
+
     return out
 
 
