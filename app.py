@@ -78,26 +78,6 @@ def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFram
             df[c] = v
     return df
 
-def _clean_svc_values(series_like) -> list[str]:
-    """
-    Devuelve una lista de SVCs válidos, eliminando None/nan/'' y
-    cadenas 'none'/'nan' y cosas raras.
-    """
-    import pandas as pd, re
-    if series_like is None:
-        return []
-    s = pd.Series(series_like)
-    # quita nulos reales
-    s = s[~s.isna()]
-    # a str para normalizar
-    s = s.astype(str).str.strip()
-    # quita valores vacíos o 'none'/'nan'
-    s = s[~s.str.lower().isin(["", "none", "nan", "(none)"])]
-    # patrón simple de SVC (alfa-num, guion/guion_bajo)
-    s = s[s.str.match(r"^[A-Za-z0-9_\-]{2,}$", na=False)]
-    return sorted(s.unique().tolist())
-
-
 def _as_str_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     for c in cols:
         if c in df.columns:
@@ -224,8 +204,7 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     values = ws.get_all_values()
-    if not values:
-        return pd.DataFrame()
+    if not values: return pd.DataFrame()
 
     def _is_header_row(row: list[str]) -> bool:
         row_can = [_canon_name(c) for c in row]
@@ -240,39 +219,29 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
             break
     if header_idx is None:
         for i in range(limit):
-            if sum(1 for x in values[i] if x.strip()) >= 2:
+            nonempty = sum(1 for x in values[i] if x.strip())
+            if nonempty >= 2:
                 header_idx = i
                 break
     if header_idx is None:
         header_idx = 0
 
-    # --- NUEVO: preferir combinar con la FILA ANTERIOR si es header de grupo ---
     r1 = values[header_idx]
     r1_lower = [c.strip().lower() for c in r1]
-    combine_prev = False
-    combine_next = False
 
-    if header_idx > 0:
-        prev = values[header_idx - 1]
-        prev_lower = [c.strip().lower() for c in prev]
-        if _looks_group_header(prev_lower):
-            combine_prev = True
-
-    if not combine_prev and (header_idx + 1 < len(values)):
+    combine = False
+    if header_idx + 1 < len(values):
         r2 = values[header_idx + 1]
         r2_nonempty = sum(1 for x in r2 if x.strip())
         if _looks_group_header(r1_lower) and r2_nonempty >= max(2, len(r2)//4):
-            combine_next = True
+            combine = True
 
-    if combine_prev:
-        header = _combine_two_header_rows(values[header_idx - 1], values[header_idx])
-        data_rows = values[header_idx + 1:]
-    elif combine_next:
-        header = _combine_two_header_rows(values[header_idx], values[header_idx + 1])
-        data_rows = values[header_idx + 2:]
+    if combine:
+        header = _combine_two_header_rows(values[header_idx], values[header_idx+1])
+        data_rows = values[header_idx+2:]
     else:
         header = values[header_idx]
-        data_rows = values[header_idx + 1:]
+        data_rows = values[header_idx+1:]
 
     header = _make_unique_headers(header)
     df = pd.DataFrame(data_rows, columns=header)
@@ -455,118 +424,89 @@ def load_rentals_fallback() -> pd.DataFrame:
     out["FECHA"] = date.today()
     return _finalize(out, target_cols)
 
-
-
-def _day_kind(d: date) -> str:
-    # L->V = SEM, Sáb= SAB, Dom = DOM
-    wd = d.weekday()  # 0=Mon ... 6=Sun
-    if wd == 5: return "SAB"
-    if wd == 6: return "DOM"
-    return "SEM"
-
-def load_crowd_table_fixed() -> pd.DataFrame:
-    """
-    Lee la pestaña Crowd con columnas fijas:
-      SVC | Base entre semana | Base sabado | Base domingo | Holgura entre semana | Holgura sabado | Holgura domingo
-    Soporta que vengan con encabezado de dos filas (Base/E1) quitando prefijos.
-    Convierte a numérico (tolerando miles con coma).
-    """
+def load_crowd_caps() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
-    wanted = ["SVC","BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]
     if df.empty:
-        return pd.DataFrame(columns=wanted)
+        return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1_CAP"])
+    try:
+        find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", True, "Crowd")
+    except Exception:
+        return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1_CAP"])
 
-    # Normaliza encabezados: quita "Base " / "E1 " de la fila combinada y uniforma acentos/espacios
-    def norm_header(s: str) -> str:
-        s = (s or "").strip()
-        s = re.sub(r"^(Base|E1)\s+", "", s, flags=re.I)  # quita prefijos de grupo
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
+    base_sem_keys = ["Base entre semana","Base entre sem","Base semana","Base entre sem."]
+    base_sab_keys = ["Base sabado","Base sábado"]
+    base_dom_keys = ["Base domingo"]
+    holg_sem_keys = ["Holgura entre semana","Holgura entre sem","Holgura semana"]
+    holg_sab_keys = ["Holgura sabado","Holgura sábado"]
+    holg_dom_keys = ["Holgura domingo"]
 
-    df.rename(columns={c: norm_header(c) for c in df.columns}, inplace=True)
+    def pick(df, keys, name):
+        find_and_rename(df, keys, name, required=False, source_label="Crowd")
 
-    # Mapeo exacto -> canon
-    def canon(x: str) -> str:
-        x = unicodedata.normalize("NFKD", str(x)).encode("ascii","ignore").decode("ascii").lower()
-        x = re.sub(r"[^a-z0-9 ]", "", x)
-        x = re.sub(r"\s+", " ", x).strip()
-        return x
+    pick(df, base_sem_keys, "BASE_SEM")
+    pick(df, base_sab_keys, "BASE_SAB")
+    pick(df, base_dom_keys, "BASE_DOM")
+    pick(df, holg_sem_keys, "HOLG_SEM")
+    pick(df, holg_sab_keys, "HOLG_SAB")
+    pick(df, holg_dom_keys, "HOLG_DOM")
 
-    cmap = {}
-    for c in list(df.columns):
-        cc = canon(c)
-        if cc in ("svc","svcs","logistic center id","facility","lc"):
-            cmap[c] = "SVC"
-        elif "base" in cc and "entre" in cc and "sem" in cc:
-            cmap[c] = "BASE_SEM"
-        elif "base" in cc and "sab" in cc:
-            cmap[c] = "BASE_SAB"
-        elif "base" in cc and "dom" in cc:
-            cmap[c] = "BASE_DOM"
-        elif ("holg" in cc or "holgura" in cc) and "entre" in cc and "sem" in cc:
-            cmap[c] = "HOLG_SEM"
-        elif ("holg" in cc or "holgura" in cc) and "sab" in cc:
-            cmap[c] = "HOLG_SAB"
-        elif ("holg" in cc or "holgura" in cc) and "dom" in cc:
-            cmap[c] = "HOLG_DOM"
+    for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
+        if c not in df.columns: df[c] = 0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    if cmap:
-        df.rename(columns=cmap, inplace=True)
+    df["CROWD_E1_CAP"] = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
 
-    # Fallback posicional: SVC + 6 columnas a la derecha (base_sem, base_sab, base_dom, holg_sem, holg_sab, holg_dom)
-    if "SVC" in df.columns:
-        cols = list(df.columns)
-        idx = cols.index("SVC")
-        right = [c for i,c in enumerate(cols) if i > idx][:6]
-        guess_map = dict(zip(right, ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]))
-        for k,v in guess_map.items():
-            if v not in df.columns and k in df.columns:
-                df.rename(columns={k:v}, inplace=True)
+    if "SVC" not in df.columns:
+        return pd.DataFrame(columns=["FECHA","SVC","CROWD_E1_CAP"])
 
-    # Deja solo lo necesario
-    for col in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
-        if col not in df.columns:
-            df[col] = 0
+    out = df.groupby("SVC", as_index=False)["CROWD_E1_CAP"].max()
+    out["FECHA"] = date.today()
+    return _finalize(out, ["FECHA","SVC","CROWD_E1_CAP"])
 
-    # Asegura tipos
-    df = _as_str_cols(df, ["SVC"])
-    for col in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
-        df[col] = _maybe_to_numeric(df[col]).fillna(0)
+def load_crowd_pct_from_capacity() -> pd.DataFrame:
+    df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
+    if df.empty:
+        return pd.DataFrame(columns=["SVC", "CROWD_PCT"])
 
-    # Si hubiera duplicados por SVC, toma el máximo por seguridad
-    df = df.groupby("SVC", as_index=False).agg({
-        "BASE_SEM":"max","BASE_SAB":"max","BASE_DOM":"max",
-        "HOLG_SEM":"max","HOLG_SAB":"max","HOLG_DOM":"max"
-    })
-    return df[wanted]
+    find_and_rename(df, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "Capacity")
+    find_and_rename(df, ["Tipo","Type","Category"], "TIPO", False, "Capacity")
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Capacity")
+    find_and_rename(df, ["Tipo DM","TipoDM","DM Type"], "TIPO_DM", False, "Capacity")
+    coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Capacity", required=False)
+    find_and_rename(df, ["Cantidad","Qty","Quantity","COUNT","QTY"], "CANT", False, "Capacity")
 
-def load_crowd_caps_for_day(plan_day: date, escenario: str) -> pd.DataFrame:
-    """
-    Devuelve solo dos columnas para el día elegido:
-      - CROWD_BASE_CAP  (si escenario='Base' -> valor Base; si 'E1' -> 0)
-      - CROWD_E1_CAP    (si escenario='E1'  -> valor Holgura; si 'Base' -> 0)
-    """
-    t = load_crowd_table_fixed()
-    want = ["FECHA","SVC","CROWD_BASE_CAP","CROWD_E1_CAP"]
-    if t.empty:
-        return pd.DataFrame(columns=want)
+    df = ensure_columns(df, {"DELIVERY_MODEL":"", "TIPO":"", "TIPO_DM":"", "SVC":None, "FECHA": pd.NaT, "CANT":0})
+    df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
+    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
+    _as_str_cols(df, ["SVC", "DELIVERY_MODEL", "TIPO", "TIPO_DM"])  # <- asegura str
 
-    kind = _day_kind(plan_day)   # 'SEM' | 'SAB' | 'DOM'
-    base_col = f"BASE_{kind}"
-    holg_col = f"HOLG_{kind}"
+    # toma último día por SVC si hay fechas
+    if df["FECHA"].notna().any():
+        last_by_svc = df.groupby("SVC")["FECHA"].transform("max")
+        df = df[df["FECHA"] == last_by_svc]
 
-    out = t[["SVC", base_col, holg_col]].copy()
-    out.rename(columns={base_col:"_BASE", holg_col:"_HOLG"}, inplace=True)
+    # normaliza textos
+    dm     = df["DELIVERY_MODEL"].fillna("").astype(str)
+    tipo   = df["TIPO"].fillna("").astype(str)
+    tipodm = df["TIPO_DM"].fillna("").astype(str)
 
-    if (escenario or "").lower() == "e1":
-        out["CROWD_BASE_CAP"] = 0
-        out["CROWD_E1_CAP"]   = pd.to_numeric(out["_HOLG"], errors="coerce").fillna(0).astype(int)
-    else:
-        out["CROWD_BASE_CAP"] = pd.to_numeric(out["_BASE"], errors="coerce").fillna(0).astype(int)
-        out["CROWD_E1_CAP"]   = 0
+    is_shipments = tipo.str.contains("ship", case=False, regex=False)
+    is_crowd = (
+        dm.str.contains("crowd", case=False, regex=False) |
+        tipodm.str.contains("crowd", case=False, regex=False) |
+        tipo.str.contains("crowd", case=False, regex=False)
+    )
+    is_crowd = is_shipments & is_crowd
 
-    out["FECHA"] = plan_day
-    return out[["FECHA","SVC","CROWD_BASE_CAP","CROWD_E1_CAP"]]
+    tot = df[is_shipments].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_TOT")
+    crd = df[is_crowd].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_CROWD")
+
+    out = pd.concat([tot, crd], axis=1).reset_index()
+    _as_str_cols(out, ["SVC"])
+    out["SHIP_TOT"]   = pd.to_numeric(out["SHIP_TOT"], errors="coerce").fillna(0)
+    out["SHIP_CROWD"] = pd.to_numeric(out["SHIP_CROWD"], errors="coerce").fillna(0)
+    out["CROWD_PCT"]  = (out["SHIP_CROWD"] / out["SHIP_TOT"]).replace([np.inf,-np.inf], 0).fillna(0)
+    return out[["SVC", "CROWD_PCT"]]
 
 
 def load_spr_crowd() -> pd.DataFrame:
@@ -840,148 +780,51 @@ def load_spr_mlp() -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # 5) Cálculo del plan
 # -----------------------------------------------------------------------------
-
-# ----------------------------- REEMPLAZO COMPLETO -----------------------------
 def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
-    """
-    Esta función define el **orden final** de columnas que verás en la tabla.
-    Si quieres ocultar/mostrar columnas, edítalo aquí.
-    """
-    # limpia nombres heredados
     resumen = resumen.drop(columns=["Demanda esperada", "DEMANDA_ESPERADA"], errors="ignore")
-
     orden = [
-        # Identidad
         "SVC","FECHA",
-
-        # Demanda y SPR base
         "FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)","DEMANDA_AJUSTADA",
         "SPR_USADO","RUTAS_SPR_BASE",
-
-        # Rentals
-        "RUTAS_RENTALS","SPR_RENTALS","SHIP_RENTALS",
-
-        # Crowd objetivo + desglose
+        "RUTAS_RENTALS","SPR_RENTALS",
+        # Crowd objetivo
         "CROWD_PCT","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
-        "RUTAS_CROWD_CAP","CROWD_E1_CAP",
-        "RUTAS_CROWD_BASE_ASIGNADO","RUTAS_CROWD_E1_ASIGNADO","SHIP_CROWD",
-
-        # Restantes antes de MLP
-        "SHIP_RESTANTES_PRE_MLP",
-
-        # MLP (capacidad por tipo y totales SRM)
+        "RUTAS_CROWD_CAP","RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO",
+        # Resultado pre-MLP
+        "SHIP_RENTALS","SHIP_CROWD","SHIP_RESTANTES_PRE_MLP",
+        # MLP
         "SPR_MLP",
         "MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR","MLP_SDD_CAP",
         "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR","MLP_SPOT_CAP",
         "MLP_BACK_CAP",
-
-        # Asignación MLP por familia
-        "RUTAS_MLP_NEEDED",
-        "RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_MLP_BACKLOG",
-
-        # Remanentes/Faltantes
-        "RUTAS_RESTANTES","RUTAS_POST_MLP","RUTAS_FALTANTES",
-
-        # Capacidad total y riesgo
-        "CAP_TOTAL","CAP_VS_FCST","CAP_DIFF_ABS","RIESGO",
+        "RUTAS_MLP_NEEDED","RUTAS_MLP_SDD_USADAS","RUTAS_MLP_SPOT_USADAS","RUTAS_MLP_BACKLOG_USADAS",
+        # MLP legado/capacidad de Capacity si se desea comparar
+        "RUTAS_MLP_SDD","RUTAS_MLP_SPOT",
+        # E1/MLP y faltantes
+        "CROWD_E1_CAP","RUTAS_CROWDE1_USADAS",
+        "RUTAS_RESTANTES","RUTAS_FALTANTES",
     ]
-
-    # Aplica orden dejando al final cualquier columna no listada
     cols = [c for c in orden if c in resumen.columns] + [c for c in resumen.columns if c not in orden]
     return resumen[cols]
 
+def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
+    fcst     = load_fcst()
+    spr      = load_spr()
+    caps     = load_capacity_caps()
+    crowdc   = load_crowd_caps()
+    rents    = load_rentals_caps_from_sheet()
+    rents_fb = load_rentals_fallback()
+    crowd_pct = load_crowd_pct_from_capacity()
+    spr_crowd = load_spr_crowd()
+    mlp_caps  = load_mlp_caps_from_srm()
+    spr_mlp   = load_spr_mlp()
 
-def _crowd_pct_from_capacity_fallback() -> pd.DataFrame:
-    df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
-    if df.empty:
-        return pd.DataFrame(columns=["SVC", "CROWD_PCT"])
-
-    find_and_rename(df, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "Capacity")
-    find_and_rename(df, ["Tipo","Type","Category"], "TIPO", False, "Capacity")
-    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Capacity")
-    find_and_rename(df, ["Tipo DM","TipoDM","DM Type"], "TIPO_DM", False, "Capacity")
-    coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Capacity", required=False)
-    find_and_rename(df, ["Cantidad","Qty","Quantity","COUNT","QTY"], "CANT", False, "Capacity")
-
-    df = ensure_columns(df, {"DELIVERY_MODEL":"", "TIPO":"", "TIPO_DM":"", "SVC":None, "FECHA": pd.NaT, "CANT":0})
-    df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
-    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
-    _as_str_cols(df, ["SVC", "DELIVERY_MODEL", "TIPO", "TIPO_DM"])
-
-    if df["FECHA"].notna().any():
-        last_by_svc = df.groupby("SVC")["FECHA"].transform("max")
-        df = df[df["FECHA"] == last_by_svc]
-
-    dm     = df["DELIVERY_MODEL"].fillna("").astype(str)
-    tipo   = df["TIPO"].fillna("").astype(str)
-    tipodm = df["TIPO_DM"].fillna("").astype(str)
-
-    is_shipments = tipo.str.contains("ship", case=False, regex=False)
-    is_crowd = (
-        dm.str.contains("crowd", case=False, regex=False) |
-        tipodm.str.contains("crowd", case=False, regex=False) |
-        tipo.str.contains("crowd", case=False, regex=False)
-    )
-    is_crowd = is_shipments & is_crowd
-
-    tot = df[is_shipments].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_TOT")
-    crd = df[is_crowd].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_CROWD")
-
-    out = pd.concat([tot, crd], axis=1).reset_index()
-    _as_str_cols(out, ["SVC"])
-    out["SHIP_TOT"]   = pd.to_numeric(out["SHIP_TOT"], errors="coerce").fillna(0)
-    out["SHIP_CROWD"] = pd.to_numeric(out["SHIP_CROWD"], errors="coerce").fillna(0)
-    out["CROWD_PCT"]  = (out["SHIP_CROWD"] / out["SHIP_TOT"]).replace([np.inf,-np.inf], 0).fillna(0)
-    return out[["SVC", "CROWD_PCT"]]
-
-
-# Alias de respaldo si la función "oficial" no está visible por algún reload
-if "load_crowd_pct_from_capacity" not in globals():
-    load_crowd_pct_from_capacity = _crowd_pct_from_capacity_fallback
-
-
-
-
-# --------------------------- /REEMPLAZO COMPLETO ------------------------------
-
-def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None,
-                 plan_day: date = None, crowd_escenario: str = "Base") -> pd.DataFrame:
-    if plan_day is None:
-        plan_day = date.today()
-
-    """
-    Calcula el plan por SVC.
-
-    - FCST, SPR base/prom/peak y SPR_USADO (según spr_mode)
-    - Rentals (capacidad + SPR ponderado)
-    - Crowd: usa CROWD_BASE_CAP como capacidad y CROWD_E1_CAP como escalado adicional
-             (E1 es capacidad extra respecto a la base; no se duplica la base)
-    - DEMANDA_AJUSTADA = FCST - DC - SP
-    - RUTAS_SPR_BASE = DEMANDA_AJUSTADA / SPR_USADO
-    - Shipments cubiertos por Rentals + Crowd, y restantes para MLP
-    - MLP (desde SRM): asignación SDD → SPOT → Backlog, con desglose por tipo
-    - Capacidad Total vs FCST, diferencia absoluta y flag de riesgo
-    """
-    # ---- carga de datos ----
-    fcst       = load_fcst()
-    spr        = load_spr()
-    caps       = load_capacity_caps()               # para SHIPMENTS_DC / SHIPMENTS_SP (no crowd)
-    crowdc     = load_crowd_caps_for_day(plan_day, crowd_escenario)                  # NUEVO: base y E1 extra desde pestaña Crowd
-    rents      = load_rentals_caps_from_sheet()
-    rents_fb   = load_rentals_fallback()
-    crowd_pct  = load_crowd_pct_from_capacity()     # % objetivo Crowd (para objetivo)
-    spr_crowd  = load_spr_crowd()                   # SPR específico para Crowd
-    mlp_caps   = load_mlp_caps_from_srm()           # SRM por tipo y totales
-    spr_mlp    = load_spr_mlp()                     # SPR específico para MLP
-
-    # coerción SVC str
     for d in (fcst, spr, caps, crowdc, rents, rents_fb, crowd_pct, spr_crowd, mlp_caps, spr_mlp):
         if not d.empty and "SVC" in d.columns:
             _as_str_cols(d, ["SVC"])
 
     hoy = date.today()
 
-    # ---- universo base de SVCs ----
     bases = []
     for d in [fcst, spr, caps, crowdc, rents, rents_fb, crowd_pct, mlp_caps]:
         if "SVC" in d.columns and not d.empty:
@@ -993,7 +836,6 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None,
     out["FECHA"] = hoy
     out = _as_str_cols(out, ["SVC"])
 
-    # ---- FCST y SPR ----
     if not fcst.empty:
         out = safe_merge(out, fcst[["SVC","FCST"]], ["SVC"])
     if not spr.empty:
@@ -1004,13 +846,12 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None,
     spr_usado = out[spr_mode_col].where(out[spr_mode_col].notna(), out["SPR_OBJ"]).fillna(20)
     out["SPR_USADO"] = pd.to_numeric(spr_usado, errors="coerce").fillna(20).clip(lower=1)
 
-    # ---- SHIPMENTS_DC / SHIPMENTS_SP desde Capacity ----
     if not caps.empty:
-        # (ya NO tomamos crowd de aquí)
-        out = safe_merge(out, caps[["SVC","SHIPMENTS_DC","SHIPMENTS_SP"]], ["SVC"])
-    out = ensure_columns(out, {"SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
+        out = safe_merge(out, caps[["SVC","RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","SHIPMENTS_DC","SHIPMENTS_SP"]], ["SVC"])
+    else:
+        out = ensure_columns(out, {"RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0, "RUTAS_CROWD_CAP":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
 
-    # ---- Rentals ----
+    # Rentals: sobrescribir lo que vino de Capacity
     out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
     if not rents.empty:
         out = safe_merge(out, rents[["SVC","RUTAS_RENTALS","SPR_RENTALS"]], ["SVC"])
@@ -1020,15 +861,14 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None,
     else:
         out["RUTAS_RENTALS"] = 0
         out["SPR_RENTALS"]   = np.nan
-
     out["RUTAS_RENTALS"] = pd.to_numeric(out.get("RUTAS_RENTALS", 0), errors="coerce").fillna(0).astype(int)
     out["SPR_RENTALS"]   = pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce")
-    out["SPR_RENTALS"]   = out["SPR_RENTALS"].fillna(out["SPR_USADO"]).clip(lower=1)
+    out["SPR_RENTALS"]   = out["SPR_RENTALS"].fillna(out["SPR_USADO"])
 
-    # ---- CROWD (base + E1 extra) ----
+    # CROWD
     if not crowdc.empty:
-        out = safe_merge(out, crowdc[["SVC","CROWD_BASE_CAP","CROWD_E1_CAP"]], ["SVC"])
-    out = ensure_columns(out, {"CROWD_BASE_CAP":0, "CROWD_E1_CAP":0})
+        out = safe_merge(out, crowdc[["SVC","CROWD_E1_CAP"]], ["SVC"])
+    out = ensure_columns(out, {"CROWD_E1_CAP":0})
 
     if not crowd_pct.empty:
         out = safe_merge(out, crowd_pct, ["SVC"])
@@ -1039,9 +879,9 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None,
         out = safe_merge(out, spr_crowd, ["SVC"])
     out["SPR_CROWD"] = pd.to_numeric(out.get("SPR_CROWD", np.nan), errors="coerce")
     out["SPR_CROWD"] = out["SPR_CROWD"].fillna(out["SPR_USADO"]).clip(lower=1)
-    out["CROWD_PCT"]  = pd.to_numeric(out.get("CROWD_PCT", 0), errors="coerce").fillna(0).clip(0,1)
+    out["CROWD_PCT"] = pd.to_numeric(out.get("CROWD_PCT", 0), errors="coerce").fillna(0).clip(0,1)
 
-    # ---- FCST (sin DC & sin SP) y DEMANDA_AJUSTADA ----
+    # FCST (sin DC & sin SP) y DEMANDA_AJUSTADA
     out = ensure_columns(out, {"FCST":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
     out["FCST (sin DC & sin SP)"] = (
         pd.to_numeric(out["FCST"], errors="coerce").fillna(0)
@@ -1050,30 +890,32 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None,
     ).clip(lower=0)
     out["DEMANDA_AJUSTADA"] = out["FCST (sin DC & sin SP)"]
 
-    # ---- RUTAS_SPR_BASE ----
     out["RUTAS_SPR_BASE"] = np.ceil(out["DEMANDA_AJUSTADA"] / out["SPR_USADO"]).astype(int)
 
-    # ---- Objetivo Crowd y asignación base + E1 ----
+    for c in ["RUTAS_MLP_SDD","RUTAS_MLP_SPOT","RUTAS_RENTALS","RUTAS_CROWD_CAP","CROWD_E1_CAP"]:
+        out[c] = pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0)
+
+    # Crowd objetivo / asignación
     out["SHIP_OBJ_CROWD"]  = pd.to_numeric(out["FCST"], errors="coerce").fillna(0) * out["CROWD_PCT"]
     out["RUTAS_CROWD_OBJ"] = np.ceil(out["SHIP_OBJ_CROWD"] / out["SPR_CROWD"]).astype(int)
+    out["RUTAS_CROWD_BASE"] = np.minimum.reduce([
+        np.maximum(out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"], 0),
+        out["RUTAS_CROWD_CAP"],
+        out["RUTAS_CROWD_OBJ"]
+    ]).astype(int)
+    exceso_obj = (out["RUTAS_CROWD_OBJ"] - out["RUTAS_CROWD_BASE"]).clip(lower=0)
+    rem_despues_base = (np.maximum(out["RUTAS_SPR_BASE"] - out["RUTAS_RENTALS"], 0) - out["RUTAS_CROWD_BASE"]).clip(lower=0)
+    out["RUTAS_CROWD_ESCALADO"] = np.minimum.reduce([exceso_obj, out["CROWD_E1_CAP"], rem_despues_base]).astype(int)
+    out["RUTAS_CROWDE1_USADAS"] = out["RUTAS_CROWD_ESCALADO"]
 
-    out["RUTAS_CROWD_CAP"] = pd.to_numeric(out["CROWD_BASE_CAP"], errors="coerce").fillna(0).astype(int)
-    base_posible = np.minimum(out["RUTAS_CROWD_OBJ"], out["RUTAS_CROWD_CAP"]).astype(int)
-    out["RUTAS_CROWD_BASE_ASIGNADO"] = base_posible
-
-    exceso_obj = (out["RUTAS_CROWD_OBJ"] - base_posible).clip(lower=0)
-    e1_limite  = pd.to_numeric(out["CROWD_E1_CAP"], errors="coerce").fillna(0).astype(int)
-    out["RUTAS_CROWD_E1_ASIGNADO"] = np.minimum(exceso_obj, e1_limite).astype(int)
-
-    # ---- Shipments cubiertos por Rentals y Crowd ----
+    # Shipments cubiertos por Rentals y Crowd
     out["SHIP_RENTALS"] = out["RUTAS_RENTALS"] * out["SPR_RENTALS"]
-    out["SHIP_CROWD"]   = (out["RUTAS_CROWD_BASE_ASIGNADO"] + out["RUTAS_CROWD_E1_ASIGNADO"]) * out["SPR_CROWD"]
+    out["SHIP_CROWD"]   = (out["RUTAS_CROWD_BASE"] + out["RUTAS_CROWD_ESCALADO"]) * out["SPR_CROWD"]
 
-    # ---- Restantes para MLP ----
     base_otros = pd.to_numeric(out["SHIPMENTS_DC"], errors="coerce").fillna(0) + pd.to_numeric(out["SHIPMENTS_SP"], errors="coerce").fillna(0)
     out["SHIP_RESTANTES_PRE_MLP"] = (pd.to_numeric(out["FCST"], errors="coerce").fillna(0) - base_otros - out["SHIP_RENTALS"] - out["SHIP_CROWD"]).clip(lower=0)
 
-    # ---- MLP: capacidades (SRM) y SPR_MLP ----
+    # MLP: capacidades (SRM) y SPR_MLP
     if not mlp_caps.empty:
         out = safe_merge(out, mlp_caps, ["SVC"])
     else:
@@ -1088,74 +930,28 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None,
     out["SPR_MLP"] = pd.to_numeric(out.get("SPR_MLP", np.nan), errors="coerce")
     out["SPR_MLP"] = out["SPR_MLP"].fillna(out["SPR_USADO"]).clip(lower=1)
 
-    # ---- Rutas MLP necesarias ----
     out["RUTAS_MLP_NEEDED"] = np.ceil(out["SHIP_RESTANTES_PRE_MLP"] / out["SPR_MLP"]).astype(int)
 
-    # ---- Asignación por tipo: SDD → SPOT → BACKLOG ----
-    def alloc_types(need, lv, sv, car):
-        use_lv = int(min(need, lv));   need -= use_lv
-        use_sv = int(min(need, sv));   need -= use_sv
-        use_car= int(min(need, car));  need -= use_car
-        total  = use_lv + use_sv + use_car
-        return use_lv, use_sv, use_car, total, int(max(0, need))
+    need = out["RUTAS_MLP_NEEDED"]
+    use_sdd  = np.minimum(need, out["MLP_SDD_CAP"])
+    need2    = (need - use_sdd).clip(lower=0)
+    use_spot = np.minimum(need2, out["MLP_SPOT_CAP"])
+    need3    = (need2 - use_spot).clip(lower=0)
+    use_back = np.minimum(need3, out["MLP_BACK_CAP"])
 
-    # SDD
-    uses = out.apply(lambda r: alloc_types(
-        r["RUTAS_MLP_NEEDED"],
-        int(r.get("MLP_SDD_LV",0)), int(r.get("MLP_SDD_SV",0)), int(r.get("MLP_SDD_CAR",0))
-    ), axis=1, result_type="expand")
-    out["MLP_SDD_LV_USADAS"], out["MLP_SDD_SV_USADAS"], out["MLP_SDD_CAR_USADAS"], out["RUTAS_MLP_SDD"], rem1 = uses[0], uses[1], uses[2], uses[3], uses[4]
+    out["RUTAS_MLP_SDD_USADAS"]     = use_sdd.astype(int)
+    out["RUTAS_MLP_SPOT_USADAS"]    = use_spot.astype(int)
+    out["RUTAS_MLP_BACKLOG_USADAS"] = use_back.astype(int)
 
-    # SPOT con el remanente
-    uses2 = out.apply(lambda r: alloc_types(
-        rem1.loc[r.name],
-        int(r.get("MLP_SPOT_LV",0)), int(r.get("MLP_SPOT_SV",0)), int(r.get("MLP_SPOT_CAR",0))
-    ), axis=1, result_type="expand")
-    out["MLP_SPOT_LV_USADAS"], out["MLP_SPOT_SV_USADAS"], out["MLP_SPOT_CAR_USADAS"], out["RUTAS_MLP_SPOT"], rem2 = uses2[0], uses2[1], uses2[2], uses2[3], uses2[4]
-
-    # BACKLOG
-    out["RUTAS_MLP_BACKLOG_USADAS"] = np.minimum(rem2, pd.to_numeric(out.get("MLP_BACK_CAP",0), errors="coerce").fillna(0)).astype(int)
-
-    # Restantes después de MLP
-    out["RUTAS_RESTANTES"] = (rem2 - out["RUTAS_MLP_BACKLOG_USADAS"]).clip(lower=0).astype(int)
+    out["RUTAS_RESTANTES"] = (need3 - use_back).clip(lower=0).astype(int)
     out["RUTAS_POST_MLP"]  = out["RUTAS_RESTANTES"]
     out["RUTAS_FALTANTES"] = out["RUTAS_RESTANTES"]
 
-
-
-    # ---- Capacidad total (shipments) vs FCST ----
-    cap_mlp_ship = (out["RUTAS_MLP_SDD"] + out["RUTAS_MLP_SPOT"] + out["RUTAS_MLP_BACKLOG_USADAS"]) * out["SPR_MLP"]
-    cap_total = (
-        pd.to_numeric(out["SHIPMENTS_DC"], errors="coerce").fillna(0)
-      + pd.to_numeric(out["SHIPMENTS_SP"], errors="coerce").fillna(0)
-      + pd.to_numeric(out["SHIP_RENTALS"],  errors="coerce").fillna(0)
-      + pd.to_numeric(out["SHIP_CROWD"],    errors="coerce").fillna(0)
-      + pd.to_numeric(cap_mlp_ship,         errors="coerce").fillna(0)
-    )
-    out["CAP_TOTAL"] = cap_total
-
-    # Usa Series de pandas para evitar el .fillna sobre ndarrays
-    fcst_series = pd.to_numeric(out["FCST"], errors="coerce")
-
-    # Proporción de capacidad sobre FCST (si FCST==0 -> 0)
-    out["CAP_VS_FCST"] = (out["CAP_TOTAL"] / fcst_series.replace(0, np.nan)).fillna(0)
-
-    # Diferencia absoluta (|FCST - CAP_TOTAL|)
-    out["CAP_DIFF_ABS"] = (fcst_series.fillna(0) - out["CAP_TOTAL"]).abs()
-
-    # Flag de riesgo (OK si CAP_TOTAL >= FCST)
-    out["RIESGO"] = np.where(out["CAP_TOTAL"] + 1e-9 >= fcst_series.fillna(0), "OK", "RIESGO")
-
-
-    # ---- Filtro por SVC (si se solicita) ----
     if sel_svcs:
         out = out[out["SVC"].isin(sel_svcs)]
 
-    # ---- Orden/limpieza final ----
     out = apply_output_adjustments(out).fillna(0).sort_values("SVC").reset_index(drop=True)
     return out
-
-
 
 # -----------------------------------------------------------------------------
 # 6) UI
@@ -1190,12 +986,6 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
         st.error("No se pudo validar acceso.")
         st.caption(str(e))
 
-# --- Parámetros del día ---
-PLAN_DATE = st.sidebar.date_input("Fecha a planear", value=date.today())
-CROWD_ESC = st.sidebar.radio("Capacidad Crowd del día", ["Base", "E1"], index=0, horizontal=True)
-st.sidebar.caption(f"Día detectado: {PLAN_DATE.strftime('%A').capitalize()}")
-
-
 st.title("Mel-IA — Plan táctico (diario por SVC)")
 spr_mode = st.radio("SPR objetivo", options=["promedio","peak","plan"], horizontal=True, index=0)
 
@@ -1228,6 +1018,17 @@ with st.expander("▶️ Cargando datos...", expanded=True):
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
 
+# Diagnóstico rápido (opcional)
+try:
+    _srm_df = read_sheet(SHEET_ID, SHEET_TABS["srm"])
+    _cols_preview = list(_srm_df.columns[:12])
+    _rows = len(_srm_df)
+    st.caption("Diagnóstico rápido de lectura (pestaña SRM):")
+    st.write({"filas": _rows, "primeras columnas": _cols_preview})
+except Exception:
+    pass
+
+
 
 if 'auto_run_once' not in st.session_state:
     st.session_state['auto_run_once'] = True
@@ -1238,7 +1039,7 @@ try:
         if not SHEET_ID:
             st.warning("Proporciona `SHEET_ID` para calcular.")
         else:
-            plan = compute_plan(spr_mode, sel_svcs or DEFAULT_SVCS, PLAN_DATE, CROWD_ESC)
+            plan = compute_plan(spr_mode, sel_svcs or DEFAULT_SVCS)
             if plan.empty:
                 st.warning("No hay datos para mostrar con los filtros seleccionados.")
             else:
