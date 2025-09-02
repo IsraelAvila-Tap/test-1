@@ -1011,7 +1011,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
         pd.to_numeric(out["FCST"], errors="coerce").fillna(0) - base_otros - out["SHIP_RENTALS"] - out["SHIP_CROWD"]
     ).clip(lower=0)
 
-    # ----------------- MLP (caps SRM + SPR_MLP) -----------------
+        # ----------------- MLP (caps SRM + SPR_MLP) -----------------
     if not mlp_caps.empty:
         out = safe_merge(out, mlp_caps, ["SVC"])
     else:
@@ -1023,22 +1023,47 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
 
     if not spr_mlp.empty:
         out = safe_merge(out, spr_mlp, ["SVC"])
-    out["SPR_MLP"] = pd.to_numeric(out.get("SPR_MLP", np.nan), errors="coerce").fillna(out["SPR_USADO"]).clip(lower=1)
 
-    out["RUTAS_MLP_NEEDED"] = np.ceil(out["SHIP_RESTANTES_PRE_MLP"] / out["SPR_MLP"]).astype(int)
+    # SPR_MLP seguro (fallback a SPR_USADO)
+    out["SPR_MLP"] = (
+        pd.to_numeric(out.get("SPR_MLP", np.nan), errors="coerce")
+          .fillna(out["SPR_USADO"])
+          .clip(lower=1)
+    )
 
-    need     = out["RUTAS_MLP_NEEDED"]
-    use_sdd  = np.minimum(need, out.get("MLP_SDD_CAP", 0))
+    # Necesidad de rutas MLP segura
+    out["RUTAS_MLP_NEEDED"] = np.ceil(
+        pd.to_numeric(out.get("SHIP_RESTANTES_PRE_MLP", 0), errors="coerce").fillna(0)
+        / out["SPR_MLP"].replace(0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0).astype(int)
+
+    # ---- saneo de capacidades (evita NaN/inf y columnas faltantes) ----
+    for c in ["MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]:
+        if c not in out.columns:
+            out[c] = 0
+        out[c] = (
+            pd.to_numeric(out[c], errors="coerce")
+              .replace([np.inf, -np.inf], np.nan)
+              .fillna(0)
+              .astype(int)
+        )
+
+    need     = pd.to_numeric(out["RUTAS_MLP_NEEDED"], errors="coerce").fillna(0)
+    sdd_cap  = pd.to_numeric(out["MLP_SDD_CAP"],      errors="coerce").fillna(0)
+    spot_cap = pd.to_numeric(out["MLP_SPOT_CAP"],     errors="coerce").fillna(0)
+    back_cap = pd.to_numeric(out["MLP_BACK_CAP"],     errors="coerce").fillna(0)
+
+    use_sdd  = np.minimum(need, sdd_cap)
     need2    = (need - use_sdd).clip(lower=0)
-    use_spot = np.minimum(need2, out.get("MLP_SPOT_CAP", 0))
+    use_spot = np.minimum(need2, spot_cap)
     need3    = (need2 - use_spot).clip(lower=0)
-    use_back = np.minimum(need3, out.get("MLP_BACK_CAP", 0))
+    use_back = np.minimum(need3, back_cap)
 
-    out["RUTAS_MLP_SDD_USADAS"]     = use_sdd.astype(int)
-    out["RUTAS_MLP_SPOT_USADAS"]    = use_spot.astype(int)
-    out["RUTAS_MLP_BACKLOG_USADAS"] = use_back.astype(int)
+    out["RUTAS_MLP_SDD_USADAS"]     = use_sdd.round(0).astype(int)
+    out["RUTAS_MLP_SPOT_USADAS"]    = use_spot.round(0).astype(int)
+    out["RUTAS_MLP_BACKLOG_USADAS"] = use_back.round(0).astype(int)
 
-    out["RUTAS_RESTANTES"] = (need3 - use_back).clip(lower=0).astype(int)
+    out["RUTAS_RESTANTES"] = (need3 - use_back).clip(lower=0).round(0).astype(int)
     out["RUTAS_POST_MLP"]  = out["RUTAS_RESTANTES"]
     out["RUTAS_FALTANTES"] = out["RUTAS_RESTANTES"]
 
