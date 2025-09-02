@@ -1119,7 +1119,9 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
         st.caption(str(e))
 
 st.title("Mel-IA — Plan táctico (diario por SVC)")
+
 spr_mode = st.radio("SPR objetivo", options=["promedio","peak","plan"], horizontal=True, index=0)
+spr_mode = spr_mode.strip().lower()   # 👈 aquí normalizas
 
 run_btn = False
 auto_run = False
