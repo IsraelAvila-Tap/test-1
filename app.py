@@ -919,6 +919,59 @@ def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
     # Aplica orden dejando al final cualquier columna no listada
     cols = [c for c in orden if c in resumen.columns] + [c for c in resumen.columns if c not in orden]
     return resumen[cols]
+
+
+def _crowd_pct_from_capacity_fallback() -> pd.DataFrame:
+    df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
+    if df.empty:
+        return pd.DataFrame(columns=["SVC", "CROWD_PCT"])
+
+    find_and_rename(df, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "Capacity")
+    find_and_rename(df, ["Tipo","Type","Category"], "TIPO", False, "Capacity")
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Capacity")
+    find_and_rename(df, ["Tipo DM","TipoDM","DM Type"], "TIPO_DM", False, "Capacity")
+    coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Capacity", required=False)
+    find_and_rename(df, ["Cantidad","Qty","Quantity","COUNT","QTY"], "CANT", False, "Capacity")
+
+    df = ensure_columns(df, {"DELIVERY_MODEL":"", "TIPO":"", "TIPO_DM":"", "SVC":None, "FECHA": pd.NaT, "CANT":0})
+    df["CANT"] = pd.to_numeric(df["CANT"], errors="coerce").fillna(0)
+    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce").dt.date
+    _as_str_cols(df, ["SVC", "DELIVERY_MODEL", "TIPO", "TIPO_DM"])
+
+    if df["FECHA"].notna().any():
+        last_by_svc = df.groupby("SVC")["FECHA"].transform("max")
+        df = df[df["FECHA"] == last_by_svc]
+
+    dm     = df["DELIVERY_MODEL"].fillna("").astype(str)
+    tipo   = df["TIPO"].fillna("").astype(str)
+    tipodm = df["TIPO_DM"].fillna("").astype(str)
+
+    is_shipments = tipo.str.contains("ship", case=False, regex=False)
+    is_crowd = (
+        dm.str.contains("crowd", case=False, regex=False) |
+        tipodm.str.contains("crowd", case=False, regex=False) |
+        tipo.str.contains("crowd", case=False, regex=False)
+    )
+    is_crowd = is_shipments & is_crowd
+
+    tot = df[is_shipments].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_TOT")
+    crd = df[is_crowd].groupby("SVC", dropna=False)["CANT"].sum().rename("SHIP_CROWD")
+
+    out = pd.concat([tot, crd], axis=1).reset_index()
+    _as_str_cols(out, ["SVC"])
+    out["SHIP_TOT"]   = pd.to_numeric(out["SHIP_TOT"], errors="coerce").fillna(0)
+    out["SHIP_CROWD"] = pd.to_numeric(out["SHIP_CROWD"], errors="coerce").fillna(0)
+    out["CROWD_PCT"]  = (out["SHIP_CROWD"] / out["SHIP_TOT"]).replace([np.inf,-np.inf], 0).fillna(0)
+    return out[["SVC", "CROWD_PCT"]]
+
+
+# Alias de respaldo si la función "oficial" no está visible por algún reload
+if "load_crowd_pct_from_capacity" not in globals():
+    load_crowd_pct_from_capacity = _crowd_pct_from_capacity_fallback
+
+
+
+
 # --------------------------- /REEMPLAZO COMPLETO ------------------------------
 
 def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
