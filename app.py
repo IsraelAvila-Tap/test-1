@@ -459,144 +459,84 @@ def load_rentals_fallback() -> pd.DataFrame:
 
 def load_crowd_caps() -> pd.DataFrame:
     """
-    Lee Crowd y calcula:
-      CROWD_BASE_CAP = max(Base entre semana, Base sábado, Base domingo)
-      CROWD_E1_CAP   = max(Holgura entre semana, Holgura sábado, Holgura domingo) - CROWD_BASE_CAP
-    Matching laxo + 2 fallbacks posicionales y expone diagnóstico en un expander.
+    Crowd caps por **día**:
+      - Detecta si hoy es entre semana, sábado o domingo.
+      - Toma exactamente las columnas 'Base <día>' y 'Holgura <día>'.
+      - E1_CAP = Holgura<día> - Base<día> (>=0).
+    Las columnas están siempre en las mismas posiciones/nombres del Sheet 'Crowd'.
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
-    wanted = ["FECHA","SVC","CROWD_BASE_CAP","CROWD_E1_CAP"]
+    wanted = ["FECHA", "SVC", "CROWD_BASE_CAP", "CROWD_E1_CAP"]
     if df.empty:
         return pd.DataFrame(columns=wanted)
 
-    # --- SVC ---
+    # SVC (obligatorio)
     try:
         find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", True, "Crowd")
     except Exception:
         return pd.DataFrame(columns=wanted)
     df = _as_str_cols(df, ["SVC"])
 
-    # --- Fecha (opcional) ---
+    # Fecha (opcional)
     coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Crowd", required=False)
 
-    # ---------- helpers ----------
-    def canon(x: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(x).lower()).encode("ascii","ignore").decode("ascii"))
-    cols = list(df.columns)
-    can  = {c: canon(c) for c in cols}
+    # Normaliza encabezados para cubrir:
+    # - "Base entre semana"  / "Base sabado" / "Base domingo"
+    # - "Holgura entre semana" / "Holgura sabado" / "Holgura domingo"
+    # y también cuando vienen con prefijos de grupo: "Base Base …", "E1 Holgura …"
+    def _ren(df, new_name, *cands):
+        find_and_rename(df, list(cands), new_name, required=False, source_label="Crowd")
 
-    def pick_by_tokens(family_tokens: list[str], include_any: list[str]) -> list[str]:
-        fam = [canon(t) for t in family_tokens]
-        inc = [canon(t) for t in include_any]
-        out = []
-        for c, cc in can.items():
-            if all(t in cc for t in fam) and any(t in cc for t in inc) and "total" not in cc:
-                out.append(c)
-        return out
+    _ren(df, "BASE_SEM",
+         "Base entre semana", "Base  entre semana", "Base Base entre semana",
+         "Base semana", "Base weekday")
+    _ren(df, "BASE_SAB",
+         "Base sabado", "Base sábado", "Base  sabado", "Base  sábado", "Base Base sabado", "Base Base sábado")
+    _ren(df, "BASE_DOM",
+         "Base domingo", "Base  domingo", "Base Base domingo")
 
-    # ---------- intento 1: nombres ----------
-    base_sem_cols = pick_by_tokens(["base"], ["entre","entres","entreser","sem","semana","weekday"])
-    base_sab_cols = pick_by_tokens(["base"], ["sab","sabad","sabado","sábado"])
-    base_dom_cols = pick_by_tokens(["base"], ["dom","domingo"])
+    _ren(df, "HOLG_SEM",
+         "Holgura entre semana", "E1 Holgura entre semana", "Holg. entre semana")
+    _ren(df, "HOLG_SAB",
+         "Holgura sabado", "Holgura sábado", "E1 Holgura sabado", "E1 Holgura sábado")
+    _ren(df, "HOLG_DOM",
+         "Holgura domingo", "E1 Holgura domingo")
 
-    holg_sem_cols = pick_by_tokens(["holg"], ["entre","entres","entreser","sem","semana","weekday"]) or pick_by_tokens(["e1"], ["entre","sem","weekday"])
-    holg_sab_cols = pick_by_tokens(["holg"], ["sab","sabad","sabado","sábado"]) or pick_by_tokens(["e1"], ["sab","sabad","sabado","sábado"])
-    holg_dom_cols = pick_by_tokens(["holg"], ["dom","domingo"]) or pick_by_tokens(["e1"], ["dom","domingo"])
-
-    picked = {
-        "BASE_SEM": base_sem_cols[:1],
-        "BASE_SAB": base_sab_cols[:1],
-        "BASE_DOM": base_dom_cols[:1],
-        "HOLG_SEM": holg_sem_cols[:1],
-        "HOLG_SAB": holg_sab_cols[:1],
-        "HOLG_DOM": holg_dom_cols[:1],
-    }
-
-    # ---------- intento 2: a la derecha de SVC por palabras clave ----------
-    need_positional = not all(v for v in picked.values())
-    if need_positional:
-        try:
-            idx_svc = cols.index("SVC")
-        except ValueError:
-            idx_svc = -1
-        right_cols = [c for i, c in enumerate(cols) if i > idx_svc and c not in ("FECHA",)]
-        right_can  = [can[c] for c in right_cols]
-
-        def first_with(token_list: list[str]) -> str | None:
-            for c, cc in zip(right_cols, right_can):
-                if any(t in cc for t in token_list):
-                    return c
-            return None
-
-        picked.setdefault("BASE_SEM", [])
-        picked.setdefault("BASE_SAB", [])
-        picked.setdefault("BASE_DOM", [])
-        picked.setdefault("HOLG_SEM", [])
-        picked.setdefault("HOLG_SAB", [])
-        picked.setdefault("HOLG_DOM", [])
-
-        if not picked["BASE_SEM"]: picked["BASE_SEM"] = [first_with(["base","baseentre","baseentres","baseentreser"])]
-        if not picked["BASE_SAB"]: picked["BASE_SAB"] = [first_with(["basesab","basesabado","basesábado"])]
-        if not picked["BASE_DOM"]: picked["BASE_DOM"] = [first_with(["basedom","basedomingo"])]
-
-        if not picked["HOLG_SEM"]: picked["HOLG_SEM"] = [first_with(["holgentre","holgentres","holgentreser","holgsem","holgsemana","e1entre","e1sem"])]
-        if not picked["HOLG_SAB"]: picked["HOLG_SAB"] = [first_with(["holgsab","holgsabado","holgsábado","e1sab","e1sabado"])]
-        if not picked["HOLG_DOM"]: picked["HOLG_DOM"] = [first_with(["holgdom","holgdomingo","e1dom"])]
-
-    # ---------- intento 3: 6 primeras numéricas a la derecha de SVC ----------
-    need_numeric = not all(picked.get(k) and picked[k][0] for k in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"])
-    if need_numeric:
-        try:
-            idx_svc = cols.index("SVC")
-        except ValueError:
-            idx_svc = -1
-        right_cols = [c for i, c in enumerate(cols) if i > idx_svc and c not in ("FECHA",)]
-        num_right = []
-        for c in right_cols:
-            s = pd.to_numeric(df[c], errors="coerce")
-            if s.notna().any():
-                num_right.append(c)
-            if len(num_right) >= 6:
-                break
-        if len(num_right) >= 6:
-            picked["BASE_SEM"] = [picked["BASE_SEM"][0] or num_right[0]]
-            picked["BASE_SAB"] = [picked["BASE_SAB"][0] or num_right[1]]
-            picked["BASE_DOM"] = [picked["BASE_DOM"][0] or num_right[2]]
-            picked["HOLG_SEM"] = [picked["HOLG_SEM"][0] or num_right[3]]
-            picked["HOLG_SAB"] = [picked["HOLG_SAB"][0] or num_right[4]]
-            picked["HOLG_DOM"] = [picked["HOLG_DOM"][0] or num_right[5]]
-
-    # --- aplica renombres (y crea en 0 si faltara algo) ---
-    mapping = {}
-    for new_name, lst in picked.items():
-        if lst and lst[0]:
-            mapping[lst[0]] = new_name
-    if mapping:
-        df.rename(columns=mapping, inplace=True)
-
+    # A numérico (soporta comas/espacios de miles)
     for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
         if c not in df.columns:
             df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # --- cálculos ---
-    df["BASE_MAX"] = df[["BASE_SEM","BASE_SAB","BASE_DOM"]].max(axis=1)
-    df["HOLG_MAX"] = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
-    df["E1_EXTRA"] = (df["HOLG_MAX"] - df["BASE_MAX"]).clip(lower=0)
+    # Qué día estamos planeando (hoy)
+    dow = date.today().weekday()  # 0=Lun … 6=Dom
+    if dow == 5:
+        base_col, holg_col = "BASE_SAB", "HOLG_SAB"
+        _dia = "sábado"
+    elif dow == 6:
+        base_col, holg_col = "BASE_DOM", "HOLG_DOM"
+        _dia = "domingo"
+    else:
+        base_col, holg_col = "BASE_SEM", "HOLG_SEM"
+        _dia = "entre semana"
 
+    # Agregación por SVC (si hubiese filas duplicadas)
     out = df.groupby("SVC", as_index=False).agg(
-        CROWD_BASE_CAP=("BASE_MAX","max"),
-        CROWD_E1_CAP=("E1_EXTRA","max"),
+        CROWD_BASE_CAP=(base_col, "max"),
+        _HOLG_DIA=(holg_col, "max"),
     )
-    out["FECHA"] = date.today()
+    out["CROWD_E1_CAP"] = (out["_HOLG_DIA"] - out["CROWD_BASE_CAP"]).clip(lower=0)
+    out.drop(columns=["_HOLG_DIA"], inplace=True)
 
-    # --- diagnóstico visible para ti ---
-    with st.expander("🔎 Debug Crowd (encabezados & mapeo)", expanded=False):
-        st.write("Columnas originales:", cols)
-        st.write("Elegidas:", {k: (v[0] if v and v[0] else None) for k, v in picked.items()})
+    out["FECHA"] = date.today()
+    out = _finalize(out, wanted)
+
+    # Diagnóstico breve para que veas qué columnas usó
+    with st.expander("🔎 Crowd — columnas usadas (día detectado)", expanded=False):
+        st.write(f"Día detectado: **{_dia}** → Base: **{base_col}**, Holgura: **{holg_col}**")
         st.dataframe(out, use_container_width=True)
 
-    return _finalize(out, wanted)
+    return out
 
 
 def load_spr_crowd() -> pd.DataFrame:
