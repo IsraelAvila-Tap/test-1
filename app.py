@@ -1280,7 +1280,7 @@ try:
         if not SHEET_ID:
             st.warning("Proporciona `SHEET_ID` para calcular.")
         else:
-            plan = compute_plan(spr_mode, sel_svcs or DEFAULT_SVCS, spr_propagate=spr_propagate)
+            plan = compute_plan(spr_mode, sel_svcs or DEFAULT_SVCS)
             if plan.empty:
                 st.warning("No hay datos para mostrar con los filtros seleccionados.")
             else:
