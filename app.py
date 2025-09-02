@@ -951,24 +951,24 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None, spr_propag
 
     # Rentals
     # Rentals
-out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
-if not rents.empty:
-    out = safe_merge(out, rents[["SVC","RUTAS_RENTALS","SPR_RENTALS"]], ["SVC"])
-elif not rents_fb.empty:
-    out = safe_merge(out, rents_fb[["SVC","RUTAS_RENTALS"]], ["SVC"])
-    out["SPR_RENTALS"] = np.nan
-else:
-    out["RUTAS_RENTALS"] = 0
-    out["SPR_RENTALS"]   = np.nan
+    out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
+    if not rents.empty:
+        out = safe_merge(out, rents[["SVC","RUTAS_RENTALS","SPR_RENTALS"]], ["SVC"])
+    elif not rents_fb.empty:
+        out = safe_merge(out, rents_fb[["SVC","RUTAS_RENTALS"]], ["SVC"])
+        out["SPR_RENTALS"] = np.nan
+    else:
+        out["RUTAS_RENTALS"] = 0
+        out["SPR_RENTALS"]   = np.nan
 
-out["RUTAS_RENTALS"] = pd.to_numeric(out.get("RUTAS_RENTALS", 0), errors="coerce").fillna(0).astype(int)
+    out["RUTAS_RENTALS"] = pd.to_numeric(out.get("RUTAS_RENTALS", 0), errors="coerce").fillna(0).astype(int)
 
-# 👇 Si el toggle está activo, fuerza el SPR de Rentals = SPR_USADO; si no, respeta el sheet con fallback.
-if spr_propagate:
-    out["SPR_RENTALS"] = out["SPR_USADO"]
-else:
-    out["SPR_RENTALS"] = pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce") \
-                            .fillna(out["SPR_USADO"])
+    # 👇 Si el toggle está activo, fuerza el SPR de Rentals = SPR_USADO; si no, respeta el sheet con fallback.
+    if spr_propagate:
+        out["SPR_RENTALS"] = out["SPR_USADO"]
+    else:
+        out["SPR_RENTALS"] = pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce") \
+                                .fillna(out["SPR_USADO"])
 
 
     
@@ -984,20 +984,20 @@ else:
 
     # % objetivo Crowd y SPR_CROWD
     # % objetivo Crowd y SPR_CROWD
-if not crowd_pct.empty:
-    out = safe_merge(out, crowd_pct, ["SVC"])
-else:
-    out["CROWD_PCT"] = 0.0
+    if not crowd_pct.empty:
+        out = safe_merge(out, crowd_pct, ["SVC"])
+    else:
+        out["CROWD_PCT"] = 0.0
 
-if not spr_crowd.empty and not spr_propagate:
-    out = safe_merge(out, spr_crowd, ["SVC"])
-    out["SPR_CROWD"] = pd.to_numeric(out.get("SPR_CROWD", np.nan), errors="coerce") \
-                        .fillna(out["SPR_USADO"]).clip(lower=1)
-else:
-    # 👇 Con propagate activo, usa SPR_USADO para Crowd
-    out["SPR_CROWD"] = out["SPR_USADO"]
+    if not spr_crowd.empty and not spr_propagate:
+        out = safe_merge(out, spr_crowd, ["SVC"])
+        out["SPR_CROWD"] = pd.to_numeric(out.get("SPR_CROWD", np.nan), errors="coerce") \
+                            .fillna(out["SPR_USADO"]).clip(lower=1)
+    else:
+        # 👇 Con propagate activo, usa SPR_USADO para Crowd
+        out["SPR_CROWD"] = out["SPR_USADO"]
 
-out["CROWD_PCT"] = pd.to_numeric(out.get("CROWD_PCT", 0), errors="coerce").fillna(0).clip(0,1)
+    out["CROWD_PCT"] = pd.to_numeric(out.get("CROWD_PCT", 0), errors="coerce").fillna(0).clip(0,1)
 
 
     # ----------------- DEMANDA & SPR BASE -----------------
