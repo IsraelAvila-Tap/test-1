@@ -1094,7 +1094,7 @@ with st.expander("▶️ Cargando datos...", expanded=True):
             fcst_svcs    = load_fcst()[["SVC"]]
             caps         = load_capacity_caps()
             cap_svcs     = caps[["SVC"]] if "SVC" in caps.columns else caps.to_frame(name="SVC")
-            crowd_svcs   = load_crowd_caps()[["SVC"]]
+            crowd_svcs   = load_crowd_caps_for(date.today())[["SVC"]]
             rents_svcs   = load_rentals_caps_from_sheet()[["SVC"]]
             rent_fb_svcs = load_rentals_fallback()[["SVC"]]
             mlp_svcs     = load_mlp_caps_from_srm()[["SVC"]]
