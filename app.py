@@ -937,38 +937,45 @@ def compute_plan(
     out["SPR_RENTALS"]   = pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce")
     out["SPR_RENTALS"]   = out["SPR_RENTALS"].fillna(out["SPR_USADO"])
 
- # Crowd determinista (cap por día/escenario) + % objetivo + SPR_CROWD
-# `crowd_det` debe venir de load_crowd_caps_for(planning_date, crowd_escenario)
-if "crowd_det" in locals() and crowd_det is not None and not crowd_det.empty:
-    cols_to_merge = [c for c in [
-        "SVC","RUTAS_CROWD_CAP",
-        "BASE_ENTRE_SEM","BASE_SAB","BASE_DOM",
-        "E1_ENTRE_SEM","E1_SAB","E1_DOM"
-    ] if c in crowd_det.columns]
-    out = safe_merge(out, crowd_det[cols_to_merge], ["SVC"])
+        # ----------------- CROWD determinista (cap por día/escenario) + % objetivo + SPR_CROWD -----------------
+    # (Si aún no definiste crowd_det arriba, evita NameError)
+    try:
+        crowd_det
+    except NameError:
+        crowd_det = pd.DataFrame()
 
-# Asegura columnas numéricas (aunque no vengan en el merge)
-for c in ["BASE_ENTRE_SEM","BASE_SAB","BASE_DOM","E1_ENTRE_SEM","E1_SAB","E1_DOM","RUTAS_CROWD_CAP"]:
-    out[c] = pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0).astype(int)
+    if not (crowd_det is None or crowd_det.empty):
+        out = safe_merge(out, crowd_det, ["SVC"])
 
-# Como el escenario ya incorpora la capacidad, no usamos escalado adicional
-out["CROWD_E1_CAP"] = 0
+    for c in ["BASE_ENTRE_SEM", "BASE_SAB", "BASE_DOM", "E1_ENTRE_SEM", "E1_SAB", "E1_DOM", "RUTAS_CROWD_CAP"]:
+        out[c] = pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0).astype(int)
 
-# % objetivo crowd
-if not crowd_pct.empty:
-    out = safe_merge(out, crowd_pct[["SVC","CROWD_PCT"]], ["SVC"])
-else:
-    out["CROWD_PCT"] = 0.0
+    if not crowd_pct.empty:
+        out = safe_merge(out, crowd_pct, ["SVC"])
+    else:
+        out["CROWD_PCT"] = 0.0
 
-# SPR para crowd
-if not spr_crowd.empty:
-    out = safe_merge(out, spr_crowd[["SVC","SPR_CROWD"]], ["SVC"])
-out["SPR_CROWD"] = pd.to_numeric(out.get("SPR_CROWD", np.nan), errors="coerce").fillna(out["SPR_USADO"]).clip(lower=1)
+    if not spr_crowd.empty:
+        out = safe_merge(out, spr_crowd, ["SVC"])
 
-# Normaliza %
-out["CROWD_PCT"] = pd.to_numeric(out.get("CROWD_PCT", 0), errors="coerce").fillna(0).clip(0, 1)
+    out["SPR_CROWD"] = pd.to_numeric(out.get("SPR_CROWD", np.nan), errors="coerce")
+    out["SPR_CROWD"] = out["SPR_CROWD"].fillna(out["SPR_USADO"]).clip(lower=1)
+    out["CROWD_PCT"] = pd.to_numeric(out.get("CROWD_PCT", 0), errors="coerce").fillna(0).clip(0, 1)
+
+    # ----------------- DEMANDA & SPR BASE -----------------
+    out = ensure_columns(out, {"FCST": 0, "SHIPMENTS_DC": 0, "SHIPMENTS_SP": 0})
+
+    out["FCST (sin DC & sin SP)"] = (
+        pd.to_numeric(out["FCST"], errors="coerce").fillna(0)
+        - pd.to_numeric(out["SHIPMENTS_DC"], errors="coerce").fillna(0)
+        - pd.to_numeric(out["SHIPMENTS_SP"], errors="coerce").fillna(0)
+    ).clip(lower=0)
+
+    out["DEMANDA_AJUSTADA"] = out["FCST (sin DC & sin SP)"]
+    out["RUTAS_SPR_BASE"] = np.ceil(out["DEMANDA_AJUSTADA"] / out["SPR_USADO"]).astype(int)
 
 
+    
     # ----------------- DEMANDA & SPR BASE -----------------
     out = ensure_columns(out, {"FCST":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
     out["FCST (sin DC & sin SP)"] = (
