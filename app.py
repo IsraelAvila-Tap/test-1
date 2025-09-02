@@ -445,51 +445,105 @@ def load_rentals_fallback() -> pd.DataFrame:
     return _finalize(out, target_cols)
 
 
-def load_crowd_caps_for(planning_date: date, escenario: str) -> pd.DataFrame:
+def load_crowd_caps_for(op_date: date, escenario: str) -> pd.DataFrame:
     """
-    Lee 'Crowd' y devuelve:
-      SVC + columnas crudas:
-        BASE_ENTRE_SEM, BASE_SAB, BASE_DOM, E1_ENTRE_SEM, E1_SAB, E1_DOM
-      y la columna determinista usada: RUTAS_CROWD_CAP
-    - Si escenario == 'Base': usa Base (weekday/sábado/domingo según fecha)
-    - Si escenario == 'E1'  : usa Holgura/E1 (weekday/sábado/domingo según fecha)
+    Lee Crowd y entrega capacidad determinista por día:
+      - BASE_ENTRE_SEM / BASE_SAB / BASE_DOM
+      - E1_ENTRE_SEM / E1_SAB / E1_DOM   (E1 = Holgura - Base, acotado a >=0)
+      - RUTAS_CROWD_CAP  (Base del día seleccionado)
+      - CROWD_E1_CAP     (0 si escenario='base'; E1 del día si escenario contiene 'e1')
+    Retorna al menos: ['SVC', ..., 'RUTAS_CROWD_CAP', 'CROWD_E1_CAP', 'FECHA'].
     """
-    df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
-    cols_out = ["SVC","BASE_ENTRE_SEM","BASE_SAB","BASE_DOM","E1_ENTRE_SEM","E1_SAB","E1_DOM","RUTAS_CROWD_CAP"]
-    if df.empty:
-        return pd.DataFrame(columns=cols_out)
+    wanted = [
+        "SVC",
+        "BASE_ENTRE_SEM","BASE_SAB","BASE_DOM",
+        "E1_ENTRE_SEM","E1_SAB","E1_DOM",
+        "RUTAS_CROWD_CAP","CROWD_E1_CAP","FECHA"
+    ]
 
-    # SVC
-    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", False, "Crowd")
+    df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
+    if df.empty:
+        return pd.DataFrame(columns=wanted)
+
+    # --- SVC robusto ---
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", required=False, source_label="Crowd")
+    if "SVC" not in df.columns:
+        cmap = {_canon_name(c): c for c in df.columns}
+        for key, real in cmap.items():
+            if key.startswith("svc") or key in {"svcs","logisticcenterid","facility","lc"}:
+                if real != "SVC":
+                    df.rename(columns={real: "SVC"}, inplace=True)
+                break
+    if "SVC" not in df.columns:
+        # Sin SVC no hay merge confiable
+        return pd.DataFrame(columns=wanted)
+
     _as_str_cols(df, ["SVC"])
 
-    # Aliases típicos
-    mapping = {
-        "BASE_ENTRE_SEM": ["Base entre semana","Base entre sem","Base semana","Base weekday","Base entre"],
-        "BASE_SAB":       ["Base sabado","Base sábado","Base sab"],
-        "BASE_DOM":       ["Base domingo","Base dom"],
-        "E1_ENTRE_SEM":   ["Holgura entre semana","E1 entre semana","Holgura entre","E1 entre"],
-        "E1_SAB":         ["Holgura sabado","Holgura sábado","E1 sabado","E1 sábado","E1 sab"],
-        "E1_DOM":         ["Holgura domingo","E1 domingo","Holgura dom","E1 dom"],
-    }
-    for new, cands in mapping.items():
-        find_and_rename(df, cands, new, required=False, source_label="Crowd")
+    # --- Base y Holgura por día (renombres flexibles) ---
+    base_sem_keys = ["Base entre semana","Base entre sem","Base semana","Base entre sem."]
+    base_sab_keys = ["Base sabado","Base sábado"]
+    base_dom_keys = ["Base domingo"]
+    holg_sem_keys = ["Holgura entre semana","Holgura entre sem","Holgura semana"]
+    holg_sab_keys = ["Holgura sabado","Holgura sábado"]
+    holg_dom_keys = ["Holgura domingo"]
 
-    for c in ["BASE_ENTRE_SEM","BASE_SAB","BASE_DOM","E1_ENTRE_SEM","E1_SAB","E1_DOM"]:
-        if c not in df.columns: df[c] = 0
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    def pick(df_, keys, name):
+        find_and_rename(df_, keys, name, required=False, source_label="Crowd")
 
-    # Selección determinista según día/escenario
-    dow = planning_date.weekday()  # 0=Lun ... 6=Dom
-    esc = (escenario or "Base").strip().lower()
-    if esc == "e1":
-        col_usada = "E1_ENTRE_SEM" if dow < 5 else ("E1_SAB" if dow == 5 else "E1_DOM")
+    pick(df, base_sem_keys, "BASE_SEM")
+    pick(df, base_sab_keys, "BASE_SAB")
+    pick(df, base_dom_keys, "BASE_DOM")
+    pick(df, holg_sem_keys, "HOLG_SEM")
+    pick(df, holg_sab_keys, "HOLG_SAB")
+    pick(df, holg_dom_keys, "HOLG_DOM")
+
+    for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
+        df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0).astype(int)
+
+    # E1 = Holgura - Base (>=0)
+    df["E1_SEM"] = (df["HOLG_SEM"] - df["BASE_SEM"]).clip(lower=0)
+    df["E1_SAB"] = (df["HOLG_SAB"] - df["BASE_SAB"]).clip(lower=0)
+    df["E1_DOM"] = (df["HOLG_DOM"] - df["BASE_DOM"]).clip(lower=0)
+
+    # Estandariza nombres expuestos
+    df["BASE_ENTRE_SEM"] = df["BASE_SEM"].astype(int)
+    df["E1_ENTRE_SEM"]   = df["E1_SEM"].astype(int)
+    df["E1_SAB"]         = df["E1_SAB"].astype(int)
+    df["E1_DOM"]         = df["E1_DOM"].astype(int)
+
+    # Día seleccionado
+    wd = op_date.weekday()  # 0=Mon..6=Sun
+    if wd <= 4:
+        base_sel = df["BASE_ENTRE_SEM"]
+        e1_sel   = df["E1_ENTRE_SEM"]
+    elif wd == 5:
+        base_sel = df["BASE_SAB"]
+        e1_sel   = df["E1_SAB"]
     else:
-        col_usada = "BASE_ENTRE_SEM" if dow < 5 else ("BASE_SAB" if dow == 5 else "BASE_DOM")
+        base_sel = df["BASE_DOM"]
+        e1_sel   = df["E1_DOM"]
 
-    out = df[["SVC","BASE_ENTRE_SEM","BASE_SAB","BASE_DOM","E1_ENTRE_SEM","E1_SAB","E1_DOM"]].copy()
-    out["RUTAS_CROWD_CAP"] = pd.to_numeric(df[col_usada], errors="coerce").fillna(0).astype(int)
-    return out
+    # Escenario
+    esc = (escenario or "").strip().lower()
+    if ("e1" in esc) or ("+" in esc):
+        e1_effect = e1_sel
+    else:
+        e1_effect = 0
+
+    out = pd.DataFrame({
+        "SVC": df["SVC"].astype(str).values,
+        "BASE_ENTRE_SEM": df["BASE_ENTRE_SEM"].astype(int).values,
+        "BASE_SAB":       df["BASE_SAB"].astype(int).values,
+        "BASE_DOM":       df["BASE_DOM"].astype(int).values,
+        "E1_ENTRE_SEM":   df["E1_ENTRE_SEM"].astype(int).values,
+        "E1_SAB":         df["E1_SAB"].astype(int).values,
+        "E1_DOM":         df["E1_DOM"].astype(int).values,
+        "RUTAS_CROWD_CAP": base_sel.astype(int).values,
+        "CROWD_E1_CAP":    pd.to_numeric(e1_effect, errors="coerce").fillna(0).astype(int).values,
+    })
+    out["FECHA"] = op_date
+    return out[wanted]
 
 
 def load_crowd_pct_from_capacity() -> pd.DataFrame:
