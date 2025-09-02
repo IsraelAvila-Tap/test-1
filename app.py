@@ -449,6 +449,7 @@ def load_crowd_caps() -> pd.DataFrame:
     Lee la pestaña Crowd y calcula:
       - CROWD_BASE_CAP = max(Base entre semana, Base sábado, Base domingo)
       - CROWD_E1_CAP   = max(Holgura entre semana, Holgura sábado, Holgura domingo) - CROWD_BASE_CAP (>=0)
+    Tolera encabezados combinados (dos filas) tipo: "Crowd base - Entre semana", "Holgura domingo", etc.
     Devuelve: FECHA, SVC, CROWD_BASE_CAP, CROWD_E1_CAP
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
@@ -456,53 +457,23 @@ def load_crowd_caps() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=wanted_cols)
 
-    # Identificación de columnas
+    # --- SVC ---
     try:
         find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", True, "Crowd")
     except Exception:
         return pd.DataFrame(columns=wanted_cols)
+    df = _as_str_cols(df, ["SVC"])
 
-    # Permite fechas si existen, pero no es requerido
+    # --- Fecha (opcional) ---
     coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Crowd", required=False)
 
-    base_sem_keys = ["Base entre semana","Base entre sem","Base semana","Base entre sem."]
-    base_sab_keys = ["Base sabado","Base sábado"]
-    base_dom_keys = ["Base domingo"]
-    holg_sem_keys = ["Holgura entre semana","Holgura entre sem","Holgura semana"]
-    holg_sab_keys = ["Holgura sabado","Holgura sábado"]
-    holg_dom_keys = ["Holgura domingo"]
+    # --------- Helper: fuzzy por tokens sobre encabezados combinados ----------
+    def canon(x: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(x).lower()).encode("ascii","ignore").decode("ascii"))
 
-    def pick(df, keys, name):
-        find_and_rename(df, keys, name, required=False, source_label="Crowd")
+    canon_cols = {c: canon(c) for c in df.columns}
 
-    pick(df, base_sem_keys, "BASE_SEM")
-    pick(df, base_sab_keys, "BASE_SAB")
-    pick(df, base_dom_keys, "BASE_DOM")
-    pick(df, holg_sem_keys, "HOLG_SEM")
-    pick(df, holg_sab_keys, "HOLG_SAB")
-    pick(df, holg_dom_keys, "HOLG_DOM")
-
-    for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
-        if c not in df.columns: df[c] = 0
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-
-    # Capacidad base y holgura máxima
-    df["BASE_MAX"] = df[["BASE_SEM","BASE_SAB","BASE_DOM"]].max(axis=1)
-    df["HOLG_MAX"] = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
-
-    # E1 adicional (no duplica la base)
-    df["E1_EXTRA"] = (df["HOLG_MAX"] - df["BASE_MAX"]).clip(lower=0)
-
-    # Agregamos por SVC (tomamos el máximo)
-    out = df.groupby("SVC", as_index=False).agg(
-        CROWD_BASE_CAP=("BASE_MAX","max"),
-        CROWD_E1_CAP=("E1_EXTRA","max"),
-    )
-
-    # FECHA de referencia (hoy si no había)
-    hoy = date.today()
-    out["FECHA"] = hoy
-    return _finalize(out, wanted_cols)
+    def rename_by_tokens(tokens: list[str], new_name_
 
 def load_crowd_pct_from_capacity() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
