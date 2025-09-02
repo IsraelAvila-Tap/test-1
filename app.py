@@ -1188,6 +1188,45 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     out["CAP_DIFF_ABS"] = (pd.to_numeric(out["FCST"], errors="coerce").fillna(0) - out["CAP_TOTAL"]).abs().round(2)
     out["RIESGO"]       = np.where(out["CAP_TOTAL"] + 1e-9 >= pd.to_numeric(out["FCST"], errors="coerce").fillna(0), "OK", "RIESGO")
 
+    # === SPR por Delivery Model (PROM/PEAK/PLAN) con fallbacks seguros ===
+    # Asegura bases
+    out = ensure_columns(out, {"SPR_RENTALS": np.nan, "SPR_CROWD": np.nan, "SPR_MLP": np.nan})
+
+    # Stats por DM desde SPR (puede venir vacío)
+    spr_stats_dm = load_spr_dm_stats_from_sheet()
+    if not spr_stats_dm.empty:
+        out = safe_merge(out, spr_stats_dm, ["SVC"])
+
+    # Garantiza que existan las columnas de stats (en caso de que no haya SPR histórico)
+    for c in [
+        "SPR_RENTALS_PROM","SPR_RENTALS_PEAK",
+        "SPR_CROWD_PROM","SPR_CROWD_PEAK",
+        "SPR_MLP_PROM","SPR_MLP_PEAK",
+    ]:
+        if c not in out.columns:
+            out[c] = np.nan
+
+    # Selector por modo
+    def _pick_by_mode(prom, peak, plan_val, fb):
+        s = prom if spr_mode == "promedio" else (peak if spr_mode == "peak" else plan_val)
+        return pd.to_numeric(s, errors="coerce").fillna(fb)
+
+    # Rentals: prom/peak/plan (plan = SPR_RENTALS del sheet ponderado)
+    out["SPR_RENTALS_SEL"] = _pick_by_mode(
+        out["SPR_RENTALS_PROM"], out["SPR_RENTALS_PEAK"], out["SPR_RENTALS"], out["SPR_USADO"]
+    ).clip(lower=1)
+
+    # Crowd: prom/peak/plan (plan = SPR_CROWD del sheet)
+    out["SPR_CROWD_SEL"] = _pick_by_mode(
+        out["SPR_CROWD_PROM"], out["SPR_CROWD_PEAK"], out["SPR_CROWD"], out["SPR_USADO"]
+    ).clip(lower=1)
+
+    # MLP: prom/peak/plan (plan = SPR_MLP del sheet; fallback SPR_USADO)
+    out["SPR_MLP_SEL"] = _pick_by_mode(
+        out["SPR_MLP_PROM"], out["SPR_MLP_PEAK"], out["SPR_MLP"], out["SPR_USADO"]
+    ).clip(lower=1)
+
+    
     # Filtro SVC (si aplica)
     if sel_svcs:
         sel_svcs = _clean_svc_values(sel_svcs)
@@ -1197,6 +1236,8 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     # Orden y salida
     out = apply_output_adjustments(out).fillna(0).sort_values("SVC").reset_index(drop=True)
     return out
+
+
 
 
 # -----------------------------------------------------------------------------
