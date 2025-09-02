@@ -224,7 +224,8 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     values = ws.get_all_values()
-    if not values: return pd.DataFrame()
+    if not values:
+        return pd.DataFrame()
 
     def _is_header_row(row: list[str]) -> bool:
         row_can = [_canon_name(c) for c in row]
@@ -239,29 +240,39 @@ def read_sheet(sheet_id: str, tab_name: str) -> pd.DataFrame:
             break
     if header_idx is None:
         for i in range(limit):
-            nonempty = sum(1 for x in values[i] if x.strip())
-            if nonempty >= 2:
+            if sum(1 for x in values[i] if x.strip()) >= 2:
                 header_idx = i
                 break
     if header_idx is None:
         header_idx = 0
 
+    # --- NUEVO: preferir combinar con la FILA ANTERIOR si es header de grupo ---
     r1 = values[header_idx]
     r1_lower = [c.strip().lower() for c in r1]
+    combine_prev = False
+    combine_next = False
 
-    combine = False
-    if header_idx + 1 < len(values):
+    if header_idx > 0:
+        prev = values[header_idx - 1]
+        prev_lower = [c.strip().lower() for c in prev]
+        if _looks_group_header(prev_lower):
+            combine_prev = True
+
+    if not combine_prev and (header_idx + 1 < len(values)):
         r2 = values[header_idx + 1]
         r2_nonempty = sum(1 for x in r2 if x.strip())
         if _looks_group_header(r1_lower) and r2_nonempty >= max(2, len(r2)//4):
-            combine = True
+            combine_next = True
 
-    if combine:
-        header = _combine_two_header_rows(values[header_idx], values[header_idx+1])
-        data_rows = values[header_idx+2:]
+    if combine_prev:
+        header = _combine_two_header_rows(values[header_idx - 1], values[header_idx])
+        data_rows = values[header_idx + 1:]
+    elif combine_next:
+        header = _combine_two_header_rows(values[header_idx], values[header_idx + 1])
+        data_rows = values[header_idx + 2:]
     else:
         header = values[header_idx]
-        data_rows = values[header_idx+1:]
+        data_rows = values[header_idx + 1:]
 
     header = _make_unique_headers(header)
     df = pd.DataFrame(data_rows, columns=header)
