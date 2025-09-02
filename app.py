@@ -457,86 +457,116 @@ def load_rentals_fallback() -> pd.DataFrame:
 
 
 
-def load_crowd_caps() -> pd.DataFrame:
+def _day_kind(d: date) -> str:
+    # L->V = SEM, Sáb= SAB, Dom = DOM
+    wd = d.weekday()  # 0=Mon ... 6=Sun
+    if wd == 5: return "SAB"
+    if wd == 6: return "DOM"
+    return "SEM"
+
+def load_crowd_table_fixed() -> pd.DataFrame:
     """
-    Crowd caps por **día**:
-      - Detecta si hoy es entre semana, sábado o domingo.
-      - Toma exactamente las columnas 'Base <día>' y 'Holgura <día>'.
-      - E1_CAP = Holgura<día> - Base<día> (>=0).
-    Las columnas están siempre en las mismas posiciones/nombres del Sheet 'Crowd'.
+    Lee la pestaña Crowd con columnas fijas:
+      SVC | Base entre semana | Base sabado | Base domingo | Holgura entre semana | Holgura sabado | Holgura domingo
+    Soporta que vengan con encabezado de dos filas (Base/E1) quitando prefijos.
+    Convierte a numérico (tolerando miles con coma).
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["crowd"])
-    wanted = ["FECHA", "SVC", "CROWD_BASE_CAP", "CROWD_E1_CAP"]
+    wanted = ["SVC","BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]
     if df.empty:
         return pd.DataFrame(columns=wanted)
 
-    # SVC (obligatorio)
-    try:
-        find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","FACILITY","LC"], "SVC", True, "Crowd")
-    except Exception:
-        return pd.DataFrame(columns=wanted)
+    # Normaliza encabezados: quita "Base " / "E1 " de la fila combinada y uniforma acentos/espacios
+    def norm_header(s: str) -> str:
+        s = (s or "").strip()
+        s = re.sub(r"^(Base|E1)\s+", "", s, flags=re.I)  # quita prefijos de grupo
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    df.rename(columns={c: norm_header(c) for c in df.columns}, inplace=True)
+
+    # Mapeo exacto -> canon
+    def canon(x: str) -> str:
+        x = unicodedata.normalize("NFKD", str(x)).encode("ascii","ignore").decode("ascii").lower()
+        x = re.sub(r"[^a-z0-9 ]", "", x)
+        x = re.sub(r"\s+", " ", x).strip()
+        return x
+
+    cmap = {}
+    for c in list(df.columns):
+        cc = canon(c)
+        if cc in ("svc","svcs","logistic center id","facility","lc"):
+            cmap[c] = "SVC"
+        elif "base" in cc and "entre" in cc and "sem" in cc:
+            cmap[c] = "BASE_SEM"
+        elif "base" in cc and "sab" in cc:
+            cmap[c] = "BASE_SAB"
+        elif "base" in cc and "dom" in cc:
+            cmap[c] = "BASE_DOM"
+        elif ("holg" in cc or "holgura" in cc) and "entre" in cc and "sem" in cc:
+            cmap[c] = "HOLG_SEM"
+        elif ("holg" in cc or "holgura" in cc) and "sab" in cc:
+            cmap[c] = "HOLG_SAB"
+        elif ("holg" in cc or "holgura" in cc) and "dom" in cc:
+            cmap[c] = "HOLG_DOM"
+
+    if cmap:
+        df.rename(columns=cmap, inplace=True)
+
+    # Fallback posicional: SVC + 6 columnas a la derecha (base_sem, base_sab, base_dom, holg_sem, holg_sab, holg_dom)
+    if "SVC" in df.columns:
+        cols = list(df.columns)
+        idx = cols.index("SVC")
+        right = [c for i,c in enumerate(cols) if i > idx][:6]
+        guess_map = dict(zip(right, ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]))
+        for k,v in guess_map.items():
+            if v not in df.columns and k in df.columns:
+                df.rename(columns={k:v}, inplace=True)
+
+    # Deja solo lo necesario
+    for col in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
+        if col not in df.columns:
+            df[col] = 0
+
+    # Asegura tipos
     df = _as_str_cols(df, ["SVC"])
+    for col in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
+        df[col] = _maybe_to_numeric(df[col]).fillna(0)
 
-    # Fecha (opcional)
-    coerce_date_column(df, ["Fecha","FECHA","Date","OP_DT"], "FECHA", "Crowd", required=False)
+    # Si hubiera duplicados por SVC, toma el máximo por seguridad
+    df = df.groupby("SVC", as_index=False).agg({
+        "BASE_SEM":"max","BASE_SAB":"max","BASE_DOM":"max",
+        "HOLG_SEM":"max","HOLG_SAB":"max","HOLG_DOM":"max"
+    })
+    return df[wanted]
 
-    # Normaliza encabezados para cubrir:
-    # - "Base entre semana"  / "Base sabado" / "Base domingo"
-    # - "Holgura entre semana" / "Holgura sabado" / "Holgura domingo"
-    # y también cuando vienen con prefijos de grupo: "Base Base …", "E1 Holgura …"
-    def _ren(df, new_name, *cands):
-        find_and_rename(df, list(cands), new_name, required=False, source_label="Crowd")
+def load_crowd_caps_for_day(plan_day: date, escenario: str) -> pd.DataFrame:
+    """
+    Devuelve solo dos columnas para el día elegido:
+      - CROWD_BASE_CAP  (si escenario='Base' -> valor Base; si 'E1' -> 0)
+      - CROWD_E1_CAP    (si escenario='E1'  -> valor Holgura; si 'Base' -> 0)
+    """
+    t = load_crowd_table_fixed()
+    want = ["FECHA","SVC","CROWD_BASE_CAP","CROWD_E1_CAP"]
+    if t.empty:
+        return pd.DataFrame(columns=want)
 
-    _ren(df, "BASE_SEM",
-         "Base entre semana", "Base  entre semana", "Base Base entre semana",
-         "Base semana", "Base weekday")
-    _ren(df, "BASE_SAB",
-         "Base sabado", "Base sábado", "Base  sabado", "Base  sábado", "Base Base sabado", "Base Base sábado")
-    _ren(df, "BASE_DOM",
-         "Base domingo", "Base  domingo", "Base Base domingo")
+    kind = _day_kind(plan_day)   # 'SEM' | 'SAB' | 'DOM'
+    base_col = f"BASE_{kind}"
+    holg_col = f"HOLG_{kind}"
 
-    _ren(df, "HOLG_SEM",
-         "Holgura entre semana", "E1 Holgura entre semana", "Holg. entre semana")
-    _ren(df, "HOLG_SAB",
-         "Holgura sabado", "Holgura sábado", "E1 Holgura sabado", "E1 Holgura sábado")
-    _ren(df, "HOLG_DOM",
-         "Holgura domingo", "E1 Holgura domingo")
+    out = t[["SVC", base_col, holg_col]].copy()
+    out.rename(columns={base_col:"_BASE", holg_col:"_HOLG"}, inplace=True)
 
-    # A numérico (soporta comas/espacios de miles)
-    for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
-        if c not in df.columns:
-            df[c] = 0
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-
-    # Qué día estamos planeando (hoy)
-    dow = date.today().weekday()  # 0=Lun … 6=Dom
-    if dow == 5:
-        base_col, holg_col = "BASE_SAB", "HOLG_SAB"
-        _dia = "sábado"
-    elif dow == 6:
-        base_col, holg_col = "BASE_DOM", "HOLG_DOM"
-        _dia = "domingo"
+    if (escenario or "").lower() == "e1":
+        out["CROWD_BASE_CAP"] = 0
+        out["CROWD_E1_CAP"]   = pd.to_numeric(out["_HOLG"], errors="coerce").fillna(0).astype(int)
     else:
-        base_col, holg_col = "BASE_SEM", "HOLG_SEM"
-        _dia = "entre semana"
+        out["CROWD_BASE_CAP"] = pd.to_numeric(out["_BASE"], errors="coerce").fillna(0).astype(int)
+        out["CROWD_E1_CAP"]   = 0
 
-    # Agregación por SVC (si hubiese filas duplicadas)
-    out = df.groupby("SVC", as_index=False).agg(
-        CROWD_BASE_CAP=(base_col, "max"),
-        _HOLG_DIA=(holg_col, "max"),
-    )
-    out["CROWD_E1_CAP"] = (out["_HOLG_DIA"] - out["CROWD_BASE_CAP"]).clip(lower=0)
-    out.drop(columns=["_HOLG_DIA"], inplace=True)
-
-    out["FECHA"] = date.today()
-    out = _finalize(out, wanted)
-
-    # Diagnóstico breve para que veas qué columnas usó
-    with st.expander("🔎 Crowd — columnas usadas (día detectado)", expanded=False):
-        st.write(f"Día detectado: **{_dia}** → Base: **{base_col}**, Holgura: **{holg_col}**")
-        st.dataframe(out, use_container_width=True)
-
-    return out
+    out["FECHA"] = plan_day
+    return out[["FECHA","SVC","CROWD_BASE_CAP","CROWD_E1_CAP"]]
 
 
 def load_spr_crowd() -> pd.DataFrame:
@@ -914,7 +944,11 @@ if "load_crowd_pct_from_capacity" not in globals():
 
 # --------------------------- /REEMPLAZO COMPLETO ------------------------------
 
-def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
+def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None,
+                 plan_day: date = None, crowd_escenario: str = "Base") -> pd.DataFrame:
+    if plan_day is None:
+        plan_day = date.today()
+
     """
     Calcula el plan por SVC.
 
@@ -932,7 +966,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     fcst       = load_fcst()
     spr        = load_spr()
     caps       = load_capacity_caps()               # para SHIPMENTS_DC / SHIPMENTS_SP (no crowd)
-    crowdc     = load_crowd_caps()                  # NUEVO: base y E1 extra desde pestaña Crowd
+    crowdc     = load_crowd_caps_for_day(plan_day, crowd_escenario)                  # NUEVO: base y E1 extra desde pestaña Crowd
     rents      = load_rentals_caps_from_sheet()
     rents_fb   = load_rentals_fallback()
     crowd_pct  = load_crowd_pct_from_capacity()     # % objetivo Crowd (para objetivo)
@@ -1156,6 +1190,12 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
         st.error("No se pudo validar acceso.")
         st.caption(str(e))
 
+# --- Parámetros del día ---
+PLAN_DATE = st.sidebar.date_input("Fecha a planear", value=date.today())
+CROWD_ESC = st.sidebar.radio("Capacidad Crowd del día", ["Base", "E1"], index=0, horizontal=True)
+st.sidebar.caption(f"Día detectado: {PLAN_DATE.strftime('%A').capitalize()}")
+
+
 st.title("Mel-IA — Plan táctico (diario por SVC)")
 spr_mode = st.radio("SPR objetivo", options=["promedio","peak","plan"], horizontal=True, index=0)
 
@@ -1198,7 +1238,7 @@ try:
         if not SHEET_ID:
             st.warning("Proporciona `SHEET_ID` para calcular.")
         else:
-            plan = compute_plan(spr_mode, sel_svcs or DEFAULT_SVCS)
+            plan = compute_plan(spr_mode, sel_svcs or DEFAULT_SVCS, PLAN_DATE, CROWD_ESC)
             if plan.empty:
                 st.warning("No hay datos para mostrar con los filtros seleccionados.")
             else:
