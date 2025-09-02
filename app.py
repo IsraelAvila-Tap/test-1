@@ -1156,10 +1156,10 @@ with col_d2:
     crowd_escenario = st.selectbox("Escenario Crowd", ["Base", "E1"], index=0,
                                    help="Elige la columna de Crowd que se usará para esa fecha.")
 
+# Guarda en sesión (opcional, por si lo usas en más lugares)
+st.session_state["planning_date"] = planning_date
+st.session_state["crowd_escenario"] = crowd_escenario
 
-run_btn = False
-auto_run = False
-sel_svcs: List[str] = []
 
 with st.expander("▶️ Cargando datos...", expanded=True):
     try:
@@ -1167,32 +1167,25 @@ with st.expander("▶️ Cargando datos...", expanded=True):
             st.warning("Falta `SHEET_ID`. Pégalo en la barra lateral.")
             svc_list = []
         else:
-            # FCST
             fcst_svcs = load_fcst()[["SVC"]]
 
-            # Capacity
             caps = load_capacity_caps()
             cap_svcs = caps[["SVC"]] if "SVC" in caps.columns else pd.DataFrame(columns=["SVC"])
 
-            # --- CROWD determinista (usa la función nueva) ---
-            planning_date   = st.session_state.get("planning_date", date.today())
-            crowd_escenario = st.session_state.get("crowd_escenario", "base")  # "base" o "base+e1"
+            # Crowd determinista con los controles de arriba
             crowdc_det = load_crowd_caps_for(planning_date, crowd_escenario)
-            crowd_det  = crowdc_det  # por si compute_plan lo usa como global
+            crowd_det  = crowdc_det
             crowd_svcs = crowdc_det[["SVC"]] if not crowdc_det.empty else pd.DataFrame(columns=["SVC"])
 
-            # Rentals (caps y fallback)
             rents = load_rentals_caps_from_sheet()
             rents_svcs = rents[["SVC"]] if not rents.empty else pd.DataFrame(columns=["SVC"])
 
             rent_fb = load_rentals_fallback()
             rent_fb_svcs = rent_fb[["SVC"]] if not rent_fb.empty else pd.DataFrame(columns=["SVC"])
 
-            # MLP (SRM)
             mlp = load_mlp_caps_from_srm()
             mlp_svcs = mlp[["SVC"]] if not mlp.empty else pd.DataFrame(columns=["SVC"])
 
-            # Universo SVC
             base_svcs = pd.concat(
                 [fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs, mlp_svcs],
                 axis=0, ignore_index=True
@@ -1207,6 +1200,41 @@ with st.expander("▶️ Cargando datos...", expanded=True):
     except Exception as e:
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
+
+    # Auto-run una vez al abrir
+if 'auto_run_once' not in st.session_state:
+    st.session_state['auto_run_once'] = True
+    auto_run = True
+else:
+    auto_run = False
+
+try:
+    if run_btn or auto_run:
+        if not SHEET_ID:
+            st.warning("Proporciona `SHEET_ID` para calcular.")
+        else:
+            plan = compute_plan(
+                spr_mode,
+                sel_svcs or DEFAULT_SVCS,
+                planning_date=planning_date,
+                crowd_escenario=crowd_escenario,
+            )
+
+            if plan.empty:
+                st.warning("No hay datos para mostrar con los filtros seleccionados.")
+            else:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("SVCs", plan["SVC"].nunique())
+                c2.metric("Demanda ajustada", int(plan["DEMANDA_AJUSTADA"].sum()))
+                c3.metric("Rutas (SPR base)", int(plan["RUTAS_SPR_BASE"].sum()))
+                c4.metric("Rutas faltantes", int(plan["RUTAS_FALTANTES"].sum()))
+                st.dataframe(plan, use_container_width=True, hide_index=True)
+except Exception as e:
+    st.error("Ocurrió un error durante el cálculo.")
+    show_exception(e, "Traceback completo")
+
+
+
 
 with st.expander("ℹ️ Notas de esta versión"):
     st.markdown(textwrap.dedent("""
