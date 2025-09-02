@@ -473,7 +473,60 @@ def load_crowd_caps() -> pd.DataFrame:
 
     canon_cols = {c: canon(c) for c in df.columns}
 
-    def rename_by_tokens(tokens: list[str], new_name_
+    def rename_by_tokens(tokens: list[str], new_name: str) -> bool:
+        """
+        Renombra la PRIMERA columna cuyo nombre canónico contenga TODOS los tokens indicados.
+        Ej.: tokens ['base','entre','sem'] matchea 'crowdbaseentresemana__2'
+        """
+        toks = [canon(t) for t in tokens]
+        for col, cc in canon_cols.items():
+            if all(t in cc for t in toks):
+                if col != new_name:
+                    df.rename(columns={col: new_name}, inplace=True)
+                    canon_cols[new_name] = canon(new_name)
+                return True
+        return False
+
+    # --------- Mapear columnas posibles (varias variantes de tokens) ----------
+    # Base
+    found = False
+    found |= rename_by_tokens(["base","entre","sem"], "BASE_SEM")
+    found |= rename_by_tokens(["base","weekday"],     "BASE_SEM")
+
+    found |= rename_by_tokens(["base","sab"],         "BASE_SAB") or \
+             rename_by_tokens(["base","sabad"],       "BASE_SAB")
+
+    found |= rename_by_tokens(["base","dom"],         "BASE_DOM") or \
+             rename_by_tokens(["base","domingo"],     "BASE_DOM")
+
+    # Holgura
+    rename_by_tokens(["holg","entre","sem"], "HOLG_SEM") or rename_by_tokens(["holgura","entre","sem"], "HOLG_SEM")
+    rename_by_tokens(["holg","sab"], "HOLG_SAB") or rename_by_tokens(["holgura","sabad"], "HOLG_SAB")
+    rename_by_tokens(["holg","dom"], "HOLG_DOM") or rename_by_tokens(["holgura","domingo"], "HOLG_DOM")
+
+    # Asegura existencia y numérico
+    for c in ["BASE_SEM","BASE_SAB","BASE_DOM","HOLG_SEM","HOLG_SAB","HOLG_DOM"]:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    # Capacidad base y holgura máxima
+    df["BASE_MAX"] = df[["BASE_SEM","BASE_SAB","BASE_DOM"]].max(axis=1)
+    df["HOLG_MAX"] = df[["HOLG_SEM","HOLG_SAB","HOLG_DOM"]].max(axis=1)
+
+    # E1 adicional (no duplica la base)
+    df["E1_EXTRA"] = (df["HOLG_MAX"] - df["BASE_MAX"]).clip(lower=0)
+
+    # Agregamos por SVC (máximo por SVC)
+    out = df.groupby("SVC", as_index=False).agg(
+        CROWD_BASE_CAP=("BASE_MAX","max"),
+        CROWD_E1_CAP=("E1_EXTRA","max"),
+    )
+
+    # FECHA de referencia (hoy si no había)
+    out["FECHA"] = date.today()
+    return _finalize(out, wanted_cols)
+
 
 def load_crowd_pct_from_capacity() -> pd.DataFrame:
     df = read_sheet(SHEET_ID, SHEET_TABS["capacity"])
