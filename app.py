@@ -1583,27 +1583,33 @@ def _largest_remainder_allocation(total: int, weights: pd.Series) -> pd.Series:
 
 def _read_vehicle_mix_from_spr(op_date: date, dm_bucket: str, weeks: int = 2) -> pd.DataFrame:
     """
-    Lee SPR y arma el mix por SVC para el DM indicado usando suma de 'Rutas'
-    de las últimas 'weeks' semanas (mismo weekday).
-    Salida: SVC, VEHICULO_TIPO_HOM, PESO_RUTAS
+    Lee la pestaña SPR y arma el mix de vehículos por SVC para el DM indicado
+    usando la **suma de 'Rutas'** de las últimas 'weeks' semanas (mismo weekday).
+    Devuelve columnas: SVC, VEHICULO_TIPO_HOM, PESO_RUTAS
     """
     spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
-    out_cols = ["SVC","VEHICULO_TIPO_HOM","PESO_RUTAS"]
-    if spr.empty: return pd.DataFrame(columns=out_cols)
+    out_cols = ["SVC", "VEHICULO_TIPO_HOM", "PESO_RUTAS"]
+    if spr.empty:
+        return pd.DataFrame(columns=out_cols)
 
+    # Normalización mínima de columnas
     find_and_rename(spr, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SPR")
     find_and_rename(spr, ["SHP_LG_VEHICLE_TYPE","Vehicle type","Tipo de vehículo","Tipo de vehiculo"], "VEH_TYPE", False, "SPR")
+    # La columna 'Rutas' la usaremos como peso para el mix
     find_and_rename(spr, ["Rutas","RUTAS","Routes"], "RUTAS", False, "SPR")
-    find_and_rename(spr, ["DELIVERY_MODEL","Delivery model","Model","DM"], "DELIVERY_MODEL", False, "SPR")
+    find_and_rename(spr, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "SPR")
     coerce_date_column(spr, ["FECHA","Fecha","DATE","OP_DT"], "FECHA", "SPR", required=False)
 
-    if "RUTAS" not in spr.columns: return pd.DataFrame(columns=out_cols)
+    if "RUTAS" not in spr.columns:
+        return pd.DataFrame(columns=out_cols)
+
+    # Tipos básicos
     spr["RUTAS"] = pd.to_numeric(spr["RUTAS"], errors="coerce").fillna(0)
     _as_str_cols(spr, ["SVC","VEH_TYPE","DELIVERY_MODEL"])
-    spr["VEHICULO_TIPO_HOM"] = spr["VEH_TYPE"].map(homologar_vehicle_type)
 
-    def bucket(dm: str) -> str:
-        dm = (dm or "").lower()
+    # --- Bucket de DM (CROWD / RENTALS / MLP / DC / SP) ---
+    def dm_bucket_map(dm: str) -> str:
+        dm = (dm or "").strip().lower()
         if "crowd" in dm: return "CROWD"
         if "rent"  in dm: return "RENTALS"
         if ("mlp" in dm) or ("sdd" in dm) or ("spot" in dm) or ("back" in dm): return "MLP"
@@ -1611,23 +1617,52 @@ def _read_vehicle_mix_from_spr(op_date: date, dm_bucket: str, weeks: int = 2) ->
         if dm in ("sp","s.p.","service partner") or ("service" in dm and "partner" in dm): return "SP"
         return "__OTHER__"
 
-    spr["DM_BKT"] = spr["DELIVERY_MODEL"].map(bucket)
+    spr["DM_BKT"] = spr["DELIVERY_MODEL"].map(dm_bucket_map)
 
+    # --- Homologación de tipo de vehículo para el mix ---
+    # Unifica variantes de Car (Car 5h/8h/SH...), normaliza vans y preserva Bike.
+    def veh_hom(v: str) -> str:
+        t = (v or "").strip().lower()
+        if "bike" in t:                 return "Bike"
+        if "car"  in t:                 return "Car"
+        # Para vans usamos la homologación existente y quitamos 'Electric' al mix
+        h = homologar_vehicle_type(v)
+        h_l = (h or "").lower()
+        if "small van" in h_l:          return "Small Van"
+        if "large van" in h_l:          return "Large Van"
+        return "Others"
+
+    spr["VEHICULO_TIPO_HOM"] = spr["VEH_TYPE"].map(veh_hom)
+
+    # --- Ventana temporal: últimas N semanas, mismo weekday que op_date ---
     op_ts = pd.Timestamp(op_date)
-    start = op_ts - pd.Timedelta(days=7*weeks)
-    wd = op_ts.weekday()
-    m = (
+    start = op_ts - pd.Timedelta(days=7 * weeks)
+    wd    = op_ts.weekday()
+
+    mask = (
         spr["FECHA"].notna()
         & (pd.to_datetime(spr["FECHA"]) <= op_ts)
         & (pd.to_datetime(spr["FECHA"]) >= start)
         & (pd.to_datetime(spr["FECHA"]).dt.weekday == wd)
         & (spr["DM_BKT"] == dm_bucket)
     )
-    recent = spr[m].copy()
-    if recent.empty: return pd.DataFrame(columns=out_cols)
 
-    g = recent.groupby(["SVC","VEHICULO_TIPO_HOM"], dropna=False)["RUTAS"].sum().rename("PESO_RUTAS").reset_index()
-    return _as_str_cols(g, ["SVC","VEHICULO_TIPO_HOM"])
+    recent = spr[mask].copy()
+    if recent.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    # --- Mix por SVC a partir de la suma de Rutas homologadas ---
+    g = (
+        recent.groupby(["SVC","VEHICULO_TIPO_HOM"], dropna=False)["RUTAS"]
+              .sum()
+              .rename("PESO_RUTAS")
+              .reset_index()
+    )
+
+    g = _as_str_cols(g, ["SVC","VEHICULO_TIPO_HOM"])
+    return g[out_cols]
+
+
 
 def _spr_por_vehiculo_hist() -> pd.DataFrame:
     """SPR histórico por SVC y tipo homologado (local con fallback global)."""
@@ -1765,7 +1800,32 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or 25))
                 ships = int(round(int(rutas_v) * spr_v))
                 rows.append(["MLP SPOT", fch, svc, veh, float(spr_v), int(rutas_v), ships])
-               
+                # ---------- MLP BACKLOG (mostrar en la tabla 2) ----------
+        used_back = _to_int(r.get("RUTAS_MLP_BACKLOG_USADAS", 0))
+        if used_back > 0:
+            # Prioridad LV → SV → Car. No solemos tener caps por tipo en backlog,
+            # así que dejamos capacidad "ilimitada" y sólo respetamos el orden.
+            alloc_back = _alloc_mlp_by_type(
+                used_back,
+                caps_lv=10**9,  # effectively unlimited
+                caps_sv=10**9,
+                caps_car=10**9
+            )
+            for veh, rutas_v in alloc_back.items():
+                if rutas_v <= 0: 
+                    continue
+                # SPR_MLP como fallback (o SPR_USADO si faltara)
+                spr_v = spr_for(
+                    svc, veh, 
+                    fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or 
+                                   pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25)
+                )
+                ships = int(round(int(rutas_v) * spr_v))
+                rows.append(["MLP BACKLOG", fch, svc, veh, float(spr_v), int(rutas_v), ships])
+
+
+
+        
         # ---------- MLP BACKLOG (prioridad LV → SV → Car; cuadra total) ----------
         used_back = _to_int(r.get("RUTAS_MLP_BACKLOG_USADAS", 0))
         if used_back > 0:
