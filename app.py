@@ -862,6 +862,63 @@ def load_spr_mlp() -> pd.DataFrame:
     global_val = mlp_rows["SPR"].median()
     grp_local["SPR_MLP"] = grp_local["SPR_MLP"].fillna(global_val)
     return grp_local
+
+# --- SPR por Delivery Model (4 semanas previas, mismo día de la semana) ---
+def load_spr_dm_recent_weekday_stats(op_date: date) -> pd.DataFrame:
+    """
+    Devuelve SPR por SVC y Delivery Model (RENTALS/CROWD/MLP) con:
+      - SPR_PROM4: mediana de los últimos 4 mismos días de la semana previos a op_date
+      - SPR_P95_4: p95 del mismo set (≈max si son 4 puntos)
+      - SPR_TODAY: valor del día op_date (si existe) para 'plan'
+    """
+    spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
+    if spr.empty:
+        return pd.DataFrame(columns=["SVC","DM","SPR_PROM4","SPR_P95_4","SPR_TODAY"])
+
+    # Normaliza columnas
+    find_and_rename(spr, ["DELIVERY_MODEL","Delivery model","Model","DM"], "DELIVERY_MODEL", False, "SPR")
+    find_and_rename(spr, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SPR")
+    find_and_rename(spr, ["SPR","spr","Ships per route"], "SPR", False, "SPR")
+    coerce_date_column(spr, ["FECHA","Fecha","DATE","OP_DT"], "FECHA", "SPR", required=False)
+
+    spr = ensure_columns(spr, {"DELIVERY_MODEL":"", "SVC":None, "FECHA": pd.NaT, "SPR": np.nan})
+    spr["SPR"] = pd.to_numeric(spr["SPR"], errors="coerce")
+    spr = _as_str_cols(spr, ["SVC","DELIVERY_MODEL"])
+    spr["FECHA_TS"] = pd.to_datetime(spr["FECHA"], errors="coerce")
+    spr["WD"] = spr["FECHA_TS"].dt.weekday
+
+    # Bucket de Delivery Model → {RENTALS, CROWD, MLP}
+    def dm_bucket(x: str) -> str:
+        x = (x or "").lower()
+        if "crowd" in x: return "CROWD"
+        if "rent"  in x: return "RENTALS"
+        if ("mlp" in x) or ("sdd" in x) or ("spot" in x) or ("back" in x): return "MLP"
+        return "__OTHER__"
+
+    spr["DM"] = spr["DELIVERY_MODEL"].map(dm_bucket)
+    spr = spr[spr["DM"] != "__OTHER__"]
+
+    # Ventana: 4 semanas previas, mismo weekday
+    op_ts  = pd.Timestamp(op_date)
+    start  = op_ts - pd.Timedelta(days=28)
+    wd     = op_ts.weekday()
+    mask4w = spr["FECHA_TS"].notna() & (spr["FECHA_TS"] < op_ts) & (spr["FECHA_TS"] >= start) & (spr["WD"] == wd)
+    recent = spr[mask4w].copy()
+
+    g = recent.groupby(["SVC","DM"])["SPR"]
+    stats = pd.DataFrame({
+        "SPR_PROM4": g.median(),
+        "SPR_P95_4": g.apply(lambda x: np.nanpercentile(x.dropna(), 95) if x.notna().any() else np.nan)
+    }).reset_index()
+
+    # Valor del propio día (para 'plan')
+    today = spr[spr["FECHA_TS"] == op_ts].copy()
+    today_v = today.groupby(["SVC","DM"])["SPR"].median().rename("SPR_TODAY").reset_index()
+
+    out = stats.merge(today_v, on=["SVC","DM"], how="outer")
+    return out
+
+
 # ---- SPR por Delivery Model (RENTALS/CROWD/MLP) según modo y día de análisis ----
 def _norm_dm_label(s: str) -> str:
     s = (s or "").strip().lower()
