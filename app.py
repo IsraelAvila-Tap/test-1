@@ -1709,15 +1709,13 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
     for _, r in plan.iterrows():
         svc = str(r.get("SVC", ""))
         fch = r.get("FECHA", op_date)
-    
-                # ---------- RENTALS (apertura nativa desde Rentals y cuadra total) ----------
+
+        # ---------- RENTALS (apertura nativa desde Rentals y cuadra total) ----------
         rutas_r = _to_int(r.get("RUTAS_RENTALS", 0))
         if rutas_r > 0:
-            # 1) Mix por SVC a partir de la pestaña Rentals (UNIDADES por tipo)
             rentals_raw = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
             find_and_rename(rentals_raw, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "Rentals")
             find_and_rename(rentals_raw, ["Tipo de vehiculo","Tipo de vehículo","Vehicle type","Tipo"], "TIPO_VEHICULO", False, "Rentals")
-
             # columna unidades (tolerante)
             units_col = None
             for k in ["Unidades disponibles","Unidades dispon","Units","Cantidad","Qty","QTY","COUNT"]:
@@ -1736,7 +1734,7 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 rentals_raw["VEHICULO_TIPO_HOM"] = rentals_raw["TIPO_VEHICULO"].map(homologar_vehicle_type)
                 mix_tbl = rentals_raw.groupby("VEHICULO_TIPO_HOM")["UNIDADES"].sum().rename("PESO").reset_index()
 
-            # Fallback: si no hay mix SVC, usa mix global de Rentals desde SPR 2 semanas
+            # Fallback: mix global de Rentals desde SPR (2 semanas)
             if mix_tbl.empty:
                 mix_glob = _read_vehicle_mix_from_spr(op_date, "RENTALS", weeks=2)
                 if not mix_glob.empty:
@@ -1747,7 +1745,7 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
             weights = mix_tbl.set_index("VEHICULO_TIPO_HOM")["PESO"]
             alloc = _largest_remainder_allocation(rutas_r, weights)
 
-            # Reconciliación: asegurar que la suma == rutas_r (absorbe la diferencia al mayor peso)
+            # Reconciliación
             diff = rutas_r - int(alloc.sum())
             if diff != 0 and not alloc.empty:
                 top = weights.sort_values(ascending=False).index[0]
@@ -1759,7 +1757,6 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 ships = int(round(int(rutas_v) * spr_v))
                 rows.append(["Rentals", fch, svc, veh, float(spr_v), int(rutas_v), ships])
 
-        
         # ---------- CROWD (sin apertura → distribución 2 semanas) ----------
         rutas_crowd = _to_int(r.get("RUTAS_CROWD_BASE", 0)) + _to_int(r.get("RUTAS_CROWD_ESCALADO", 0))
         if rutas_crowd > 0:
@@ -1800,11 +1797,10 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or 25))
                 ships = int(round(int(rutas_v) * spr_v))
                 rows.append(["MLP SPOT", fch, svc, veh, float(spr_v), int(rutas_v), ships])
-                # ---------- MLP BACKLOG (mostrar en la tabla 2) ----------
+
+        # ---------- MLP BACKLOG (una sola vez; prioridad LV→SV→Car) ----------
         used_back = _to_int(r.get("RUTAS_MLP_BACKLOG_USADAS", 0))
         if used_back > 0:
-            # Prioridad LV → SV → Car. No solemos tener caps por tipo en backlog,
-            # así que dejamos capacidad "ilimitada" y sólo respetamos el orden.
             alloc_back = _alloc_mlp_by_type(
                 used_back,
                 caps_lv=10**9,  # effectively unlimited
@@ -1814,7 +1810,6 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
             for veh, rutas_v in alloc_back.items():
                 if rutas_v <= 0: 
                     continue
-                # SPR_MLP como fallback (o SPR_USADO si faltara)
                 spr_v = spr_for(
                     svc, veh, 
                     fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or 
@@ -1823,32 +1818,13 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 ships = int(round(int(rutas_v) * spr_v))
                 rows.append(["MLP BACKLOG", fch, svc, veh, float(spr_v), int(rutas_v), ships])
 
-
-
-        
-        # ---------- MLP BACKLOG (prioridad LV → SV → Car; cuadra total) ----------
-        used_back = _to_int(r.get("RUTAS_MLP_BACKLOG_USADAS", 0))
-        if used_back > 0:
-            # Sin caps por tipo para backlog: prioriza LV, luego SV, luego Car
-            alloc_back = {"Large Van": used_back, "Small Van": 0, "Car": 0}
-            # Si quisieras repartir algo a SV/Car, aquí podrías mover parte según alguna proporción
-            for veh, rutas_v in alloc_back.items():
-                if rutas_v <= 0: continue
-                spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or 25))
-                ships = int(round(int(rutas_v) * spr_v))
-                rows.append(["MLP BACKLOG", fch, svc, veh, float(spr_v), int(rutas_v), ships])
-
-
-        
-        # ---------- DC / SP (sin apertura → distribuir por mix 2 semanas; rutas = shipments / SPR_v) ----------
-        # DC
+        # ---------- DC / SP (sin apertura → mix 2 semanas; rutas = shipments / SPR_v) ----------
         ship_dc = _to_int(r.get("SHIPMENTS_DC", 0))
         if ship_dc > 0:
             mix_svc = mix_dc[mix_dc["SVC"] == svc]
             if mix_svc.empty:
                 mix_svc = mix_dc.groupby("VEHICULO_TIPO_HOM")["PESO_RUTAS"].sum().rename("PESO_RUTAS").reset_index()
                 mix_svc["SVC"] = svc
-            # Repartimos shipments por mix; luego calculamos rutas = shipments_v / SPR_v
             alloc_ship = _largest_remainder_allocation(ship_dc, mix_svc.set_index("VEHICULO_TIPO_HOM")["PESO_RUTAS"])
             for veh, ships_v in alloc_ship.items():
                 if ships_v <= 0: continue
@@ -1856,7 +1832,6 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 rutas_v = int(round(ships_v / max(1.0, spr_v)))
                 rows.append(["DC", fch, svc, veh, float(spr_v), int(rutas_v), int(ships_v)])
 
-        # SP
         ship_sp = _to_int(r.get("SHIPMENTS_SP", 0))
         if ship_sp > 0:
             mix_svc = mix_sp[mix_sp["SVC"] == svc]
@@ -1870,29 +1845,13 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 rutas_v = int(round(ships_v / max(1.0, spr_v)))
                 rows.append(["SP", fch, svc, veh, float(spr_v), int(rutas_v), int(ships_v)])
 
-        # ---------- SUBTOTAL SVC ----------
-        # Se agrega al final, después de procesar todos los DMs del SVC (se calculará luego).
-
-    # Armar DataFrame
+    # Armar DataFrame (SIN subtotales)
     detalle = pd.DataFrame(rows, columns=[
         "DELIVERY_MOD","FECHA","SVC","SHP_LG_VEHICLE_TYPE","SPR","Rutas","Shipments"
     ])
 
-    # Subtotales por SVC (fila espejo)
-    if not detalle.empty:
-        subs = (
-            detalle.groupby(["FECHA","SVC"], as_index=False)
-                   .agg({"Rutas":"sum","Shipments":"sum"})
-        )
-        subs["DELIVERY_MOD"] = "TOTAL SVC"
-        subs["SHP_LG_VEHICLE_TYPE"] = ""
-        subs["SPR"] = np.nan
-        # Reordena columnas
-        subs = subs[["DELIVERY_MOD","FECHA","SVC","SHP_LG_VEHICLE_TYPE","SPR","Rutas","Shipments"]]
-        detalle = pd.concat([detalle, subs], axis=0, ignore_index=True)
-
-    # Orden visual: por SVC, luego orden lógico de DM
-    dm_order = pd.CategoricalDtype(["Rentals","CROWD","MLP SDD","MLP SPOT","DC","SP","TOTAL SVC"], ordered=True)
+    # Orden visual por SVC y DM (ya sin 'TOTAL SVC')
+    dm_order = pd.CategoricalDtype(["Rentals","CROWD","MLP SDD","MLP SPOT","MLP BACKLOG","DC","SP"], ordered=True)
     if "DELIVERY_MOD" in detalle.columns:
         try:
             detalle["DELIVERY_MOD"] = detalle["DELIVERY_MOD"].astype(dm_order)
@@ -1900,13 +1859,9 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
         except Exception:
             detalle = detalle.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"]).reset_index(drop=True)
 
-    # Formateo ligero igual que tabla 1 (solo mostramos enteros)
     detalle["Rutas"] = detalle["Rutas"].astype(int)
     detalle["Shipments"] = detalle["Shipments"].astype(int)
-
     return detalle
-
-
 
 
 
