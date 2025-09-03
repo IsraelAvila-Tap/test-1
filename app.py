@@ -1675,7 +1675,6 @@ def _alloc_mlp_by_type(used_total: int, caps_lv: int, caps_sv: int, caps_car: in
     sv = min(rem, int(caps_sv));  rem -= sv
     car = min(rem, int(caps_car)); rem -= car
     return {"Large Van": lv, "Small Van": sv, "Car": car}
-
 def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
     """
     Expande la tabla 'plan' a nivel vehículo–SVC–día.
@@ -1683,12 +1682,15 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
     """
     op_date = date.today()
 
-    # SPR por vehículo (local + global)
+    # SPR histórico por vehículo (local + global) para fallbacks finos
     sprveh = _spr_por_vehiculo_hist()
     sprveh_glob = sprveh[sprveh["SVC"] == "__GLOBAL__"][["VEHICULO_TIPO_HOM","SPR_HIST"]].rename(
         columns={"SPR_HIST":"SPR_GLOBAL"}
     )
     sprveh_loc  = sprveh[sprveh["SVC"] != "__GLOBAL__"][["SVC","VEHICULO_TIPO_HOM","SPR_HIST"]]
+
+    # SPR seleccionado por SVC × DM × VEH (según 'spr_mode')
+    spr_dmveh = load_spr_by_dm_vehicle(op_date, spr_mode)
 
     # Mix de 2 semanas SOLO para DM sin apertura (Crowd, DC, SP)
     mix_crowd = _read_vehicle_mix_from_spr(op_date, "CROWD", weeks=2)
@@ -1697,32 +1699,35 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
 
     rows = []
 
-    def spr_for(svc: str, veh: str, fallback: float) -> float:
-        """SPR histórico por vehículo (local con fallback global), o 'fallback'."""
+    def spr_for(svc: str, dm: str, veh: str, fallback: float) -> float:
+        """Prioridad: SPR_dmveh(SVC,DM,veh) → SPR_hist_local(SVC,veh) → SPR_hist_global(veh) → fallback."""
+        # 1) por DM × veh
+        if not spr_dmveh.empty:
+            hit = spr_dmveh[(spr_dmveh["SVC"] == svc) & (spr_dmveh["DM"] == dm) & (spr_dmveh["VEH"] == veh)]
+            if not hit.empty:
+                v = float(pd.to_numeric(hit["SPR_SEL"].iloc[0], errors="coerce"))
+                if np.isfinite(v) and v > 0:
+                    return v
+        # 2) local por SVC × veh
         loc = sprveh_loc[(sprveh_loc["SVC"] == svc) & (sprveh_loc["VEHICULO_TIPO_HOM"] == veh)]
         if not loc.empty:
-            return float(pd.to_numeric(loc["SPR_HIST"].iloc[0], errors="coerce"))
+            v = float(pd.to_numeric(loc["SPR_HIST"].iloc[0], errors="coerce"))
+            if np.isfinite(v) and v > 0:
+                return v
+        # 3) global por veh
         glob = sprveh_glob[sprveh_glob["VEHICULO_TIPO_HOM"] == veh]
         if not glob.empty:
-            return float(pd.to_numeric(glob["SPR_GLOBAL"].iloc[0], errors="coerce"))
+            v = float(pd.to_numeric(glob["SPR_GLOBAL"].iloc[0], errors="coerce"))
+            if np.isfinite(v) and v > 0:
+                return v
+        # 4) fallback final
         return float(fallback)
-
-    def _dm_spr_selected(row, dm: str) -> float | None:
-        """
-        Lee el SPR seleccionado por Delivery Model desde la fila del plan (arriba).
-        dm in {"Rentals","CROWD","MLP"}. Devuelve float o None si no existe.
-        """
-        col = {"Rentals": "SPR_RENTALS", "CROWD": "SPR_CROWD", "MLP": "SPR_MLP"}.get(dm)
-        if not col:
-            return None
-        v = pd.to_numeric(row.get(col, np.nan), errors="coerce")
-        return float(v) if pd.notna(v) else None
 
     for _, r in plan.iterrows():
         svc = str(r.get("SVC", ""))
         fch = r.get("FECHA", op_date)
 
-        # ---------- RENTALS (apertura nativa desde Rentals y cuadra total) ----------
+        # ---------- RENTALS (apertura nativa; SPR por vehículo y DM='RENTALS') ----------
         rutas_r = _to_int(r.get("RUTAS_RENTALS", 0))
         if rutas_r > 0:
             rentals_raw = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
@@ -1746,7 +1751,6 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 rentals_raw["VEHICULO_TIPO_HOM"] = rentals_raw["TIPO_VEHICULO"].map(homologar_vehicle_type)
                 mix_tbl = rentals_raw.groupby("VEHICULO_TIPO_HOM")["UNIDADES"].sum().rename("PESO").reset_index()
 
-            # Fallback: mix global de Rentals desde SPR (2 semanas)
             if mix_tbl.empty:
                 mix_glob = _read_vehicle_mix_from_spr(op_date, "RENTALS", weeks=2)
                 if not mix_glob.empty:
@@ -1756,25 +1760,21 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
 
             weights = mix_tbl.set_index("VEHICULO_TIPO_HOM")["PESO"]
             alloc = _largest_remainder_allocation(rutas_r, weights)
-
-            # Reconciliación
             diff = rutas_r - int(alloc.sum())
             if diff != 0 and not alloc.empty:
                 top = weights.sort_values(ascending=False).index[0]
                 alloc.loc[top] = int(alloc.loc[top]) + diff
 
             for veh, rutas_v in alloc.items():
-                if rutas_v <= 0:
-                    continue
-                # SPR del modo seleccionado (plan/avg/peak) con fallback a histórico por vehículo
-                spr_sel = _dm_spr_selected(r, "Rentals")
-                spr_v = spr_sel if spr_sel is not None else spr_for(
-                    svc, veh, fallback=float(pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 20)
+                if rutas_v <= 0: continue
+                spr_v = spr_for(
+                    svc, "RENTALS", veh,
+                    fallback=float(pd.to_numeric(r.get("SPR_RENTALS", np.nan), errors="coerce") or 20)
                 )
                 ships = int(round(int(rutas_v) * spr_v))
                 rows.append(["Rentals", fch, svc, veh, float(spr_v), int(rutas_v), ships])
 
-        # ---------- CROWD (sin apertura → distribución 2 semanas) ----------
+        # ---------- CROWD (mix 2 semanas; SPR por DM='CROWD' y vehículo) ----------
         rutas_crowd = _to_int(r.get("RUTAS_CROWD_BASE", 0)) + _to_int(r.get("RUTAS_CROWD_ESCALADO", 0))
         if rutas_crowd > 0:
             mix_svc = mix_crowd[mix_crowd["SVC"] == svc]
@@ -1783,16 +1783,15 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 mix_svc["SVC"] = svc
             alloc = _largest_remainder_allocation(rutas_crowd, mix_svc.set_index("VEHICULO_TIPO_HOM")["PESO_RUTAS"])
             for veh, rutas_v in alloc.items():
-                if rutas_v <= 0:
-                    continue
-                spr_sel = _dm_spr_selected(r, "CROWD")
-                spr_v = spr_sel if spr_sel is not None else spr_for(
-                    svc, veh, fallback=float(pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 20)
+                if rutas_v <= 0: continue
+                spr_v = spr_for(
+                    svc, "CROWD", veh,
+                    fallback=float(pd.to_numeric(r.get("SPR_CROWD", np.nan), errors="coerce") or 20)
                 )
                 ships = int(round(int(rutas_v) * spr_v))
                 rows.append(["CROWD", fch, svc, veh, float(spr_v), int(rutas_v), ships])
 
-        # ---------- MLP (apertura nativa desde SRM; prioridad LV→SV→Car) ----------
+        # ---------- MLP (apertura por caps; SPR por DM='MLP' y vehículo) ----------
         # SDD
         used_sdd  = _to_int(r.get("RUTAS_MLP_SDD_USADAS", 0))
         caps_lv   = _to_int(r.get("MLP_SDD_LV", 0))
@@ -1801,11 +1800,10 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
         if used_sdd > 0:
             alloc = _alloc_mlp_by_type(used_sdd, caps_lv, caps_sv, caps_car)
             for veh, rutas_v in alloc.items():
-                if rutas_v <= 0:
-                    continue
-                spr_sel = _dm_spr_selected(r, "MLP")
-                spr_v = spr_sel if spr_sel is not None else spr_for(
-                    svc, veh, fallback=float(pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25)
+                if rutas_v <= 0: continue
+                spr_v = spr_for(
+                    svc, "MLP", veh,
+                    fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or 25)
                 )
                 ships = int(round(int(rutas_v) * spr_v))
                 rows.append(["MLP SDD", fch, svc, veh, float(spr_v), int(rutas_v), ships])
@@ -1818,36 +1816,29 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
         if used_spot > 0:
             alloc = _alloc_mlp_by_type(used_spot, caps_lv, caps_sv, caps_car)
             for veh, rutas_v in alloc.items():
-                if rutas_v <= 0:
-                    continue
-                spr_sel = _dm_spr_selected(r, "MLP")
-                spr_v = spr_sel if spr_sel is not None else spr_for(
-                    svc, veh, fallback=float(pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25)
+                if rutas_v <= 0: continue
+                spr_v = spr_for(
+                    svc, "MLP", veh,
+                    fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or 25)
                 )
                 ships = int(round(int(rutas_v) * spr_v))
                 rows.append(["MLP SPOT", fch, svc, veh, float(spr_v), int(rutas_v), ships])
 
-        # ---------- MLP BACKLOG (una sola vez; prioridad LV→SV→Car) ----------
+        # BACKLOG (prioridad LV→SV→Car; sin caps por tipo)
         used_back = _to_int(r.get("RUTAS_MLP_BACKLOG_USADAS", 0))
         if used_back > 0:
-            alloc_back = _alloc_mlp_by_type(
-                used_back,
-                caps_lv=10**9,  # effectively unlimited
-                caps_sv=10**9,
-                caps_car=10**9
-            )
+            alloc_back = _alloc_mlp_by_type(used_back, 10**9, 10**9, 10**9)
             for veh, rutas_v in alloc_back.items():
-                if rutas_v <= 0:
-                    continue
-                spr_sel = _dm_spr_selected(r, "MLP")
-                spr_v = spr_sel if spr_sel is not None else spr_for(
-                    svc, veh,
-                    fallback=float(pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25)
+                if rutas_v <= 0: continue
+                spr_v = spr_for(
+                    svc, "MLP", veh,
+                    fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or
+                                   pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25)
                 )
                 ships = int(round(int(rutas_v) * spr_v))
                 rows.append(["MLP BACKLOG", fch, svc, veh, float(spr_v), int(rutas_v), ships])
 
-        # ---------- DC / SP (sin apertura → mix 2 semanas; rutas = shipments / SPR_v) ----------
+        # ---------- DC / SP (mix 2 semanas; rutas = shipments/SPR_v, usando SPR_USADO como fallback) ----------
         ship_dc = _to_int(r.get("SHIPMENTS_DC", 0))
         if ship_dc > 0:
             mix_svc = mix_dc[mix_dc["SVC"] == svc]
@@ -1856,9 +1847,8 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 mix_svc["SVC"] = svc
             alloc_ship = _largest_remainder_allocation(ship_dc, mix_svc.set_index("VEHICULO_TIPO_HOM")["PESO_RUTAS"])
             for veh, ships_v in alloc_ship.items():
-                if ships_v <= 0:
-                    continue
-                spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25))
+                if ships_v <= 0: continue
+                spr_v = spr_for(svc, "DC", veh, fallback=float(pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25))
                 rutas_v = int(round(ships_v / max(1.0, spr_v)))
                 rows.append(["DC", fch, svc, veh, float(spr_v), int(rutas_v), int(ships_v)])
 
@@ -1870,20 +1860,18 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 mix_svc["SVC"] = svc
             alloc_ship = _largest_remainder_allocation(ship_sp, mix_svc.set_index("VEHICULO_TIPO_HOM")["PESO_RUTAS"])
             for veh, ships_v in alloc_ship.items():
-                if ships_v <= 0:
-                    continue
-                spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25))
+                if ships_v <= 0: continue
+                spr_v = spr_for(svc, "SP", veh, fallback=float(pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25))
                 rutas_v = int(round(ships_v / max(1.0, spr_v)))
                 rows.append(["SP", fch, svc, veh, float(spr_v), int(rutas_v), int(ships_v)])
 
-    # Armar DataFrame (SIN subtotales)
     detalle = pd.DataFrame(rows, columns=[
         "DELIVERY_MOD","FECHA","SVC","SHP_LG_VEHICLE_TYPE","SPR","Rutas","Shipments"
     ])
 
-    # Orden visual por SVC y DM (ya sin 'TOTAL SVC')
+    # Orden visual
     dm_order = pd.CategoricalDtype(["Rentals","CROWD","MLP SDD","MLP SPOT","MLP BACKLOG","DC","SP"], ordered=True)
-    if "DELIVERY_MOD" in detalle.columns:
+    if "DELIVERY_MOD" in detalle.columns and not detalle.empty:
         try:
             detalle["DELIVERY_MOD"] = detalle["DELIVERY_MOD"].astype(dm_order)
             detalle = detalle.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"]).reset_index(drop=True)
