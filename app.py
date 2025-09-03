@@ -1675,6 +1675,94 @@ def _alloc_mlp_by_type(used_total: int, caps_lv: int, caps_sv: int, caps_car: in
     sv = min(rem, int(caps_sv));  rem -= sv
     car = min(rem, int(caps_car)); rem -= car
     return {"Large Van": lv, "Small Van": sv, "Car": car}
+
+def _veh_mix_hom(v: str) -> str:
+    t = (v or "").strip().lower()
+    if "bike" in t:  return "Bike"
+    if "car"  in t:  return "Car"
+    h = homologar_vehicle_type(v)
+    hl = (h or "").lower()
+    if "small van" in hl: return "Small Van"
+    if "large van" in hl: return "Large Van"
+    return "Others"
+
+def _dm_bucket_for_mix(dm: str) -> str:
+    dm = (dm or "").strip().lower()
+    if "crowd" in dm: return "CROWD"
+    if "rent"  in dm: return "RENTALS"
+    if ("mlp" in dm) or ("sdd" in dm) or ("spot" in dm) or ("back" in dm): return "MLP"
+    if "dc" in dm or "delivery cell" in dm or dm in ("dc","cell"): return "DC"
+    if dm in ("sp","s.p.","service partner") or ("service" in dm and "partner" in dm): return "SP"
+    return "__OTHER__"
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_spr_by_dm_vehicle(op_date: date, mode: str) -> pd.DataFrame:
+    """
+    SPR seleccionado por SVC × (RENTALS/CROWD/MLP) × Vehículo (LV/SV/Car/Bike/Others),
+    usando el mismo criterio que la cabecera:
+      - promedio: mediana de los últimos 4 del mismo weekday (<= op_date)
+      - peak:     p95 de los últimos 12 del mismo weekday (<= op_date)
+      - plan:     último valor del mismo weekday (<= op_date)
+    """
+    spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
+    want = ["SVC","DM","VEH","SPR_SEL"]
+    if spr.empty:
+        return pd.DataFrame(columns=want)
+
+    # Normalización de columnas
+    find_and_rename(spr, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SPR")
+    find_and_rename(spr, ["Delivery model","Deliverymodel","Model","DM"], "DELIVERY_MODEL", False, "SPR")
+    find_and_rename(spr, ["SHP_LG_VEHICLE_TYPE","Vehicle type","Tipo de vehículo","Tipo de vehiculo"], "VEH_TYPE", False, "SPR")
+    find_and_rename(spr, ["SPR","spr","Ships per route"], "SPR", False, "SPR")
+    coerce_date_column(spr, ["FECHA","Fecha","DATE","OP_DT"], "FECHA", "SPR", required=False)
+
+    spr = ensure_columns(spr, {"SVC":None,"DELIVERY_MODEL":"","VEH_TYPE":"","SPR":np.nan,"FECHA":pd.NaT})
+    spr["SPR"] = pd.to_numeric(spr["SPR"], errors="coerce")
+    _as_str_cols(spr, ["SVC","DELIVERY_MODEL","VEH_TYPE"])
+    spr["DM_BKT"] = spr["DELIVERY_MODEL"].map(_dm_bucket_for_mix)
+    spr["VEH_HOM"] = spr["VEH_TYPE"].map(_veh_mix_hom)
+
+    # Sólo DM relevantes
+    spr = spr[spr["DM_BKT"].isin(["RENTALS","CROWD","MLP"])].copy()
+    spr["FECHA"] = pd.to_datetime(spr["FECHA"], errors="coerce")
+    if spr["FECHA"].isna().all():
+        return pd.DataFrame(columns=want)
+
+    # Misma day-of-week y <= op_date
+    op_ts = pd.Timestamp(op_date)
+    wd    = op_ts.weekday()
+    spr = spr[(spr["FECHA"].dt.weekday == wd) & (spr["FECHA"] <= op_ts)].copy()
+    if spr.empty:
+        return pd.DataFrame(columns=want)
+
+    # Agregadores por modo
+    def agg_prom(g):
+        vals = pd.to_numeric(g["SPR"], errors="coerce").dropna()
+        if len(vals) > 4: vals = vals.iloc[-4:]
+        return float(vals.median()) if len(vals) else np.nan
+
+    def agg_peak(g):
+        vals = pd.to_numeric(g["SPR"], errors="coerce").dropna()
+        if len(vals) > 12: vals = vals.iloc[-12:]
+        return float(np.nanpercentile(vals, 95)) if len(vals) else np.nan
+
+    def agg_plan(g):
+        vals = pd.to_numeric(g["SPR"], errors="coerce").dropna()
+        return float(vals.iloc[-1]) if len(vals) else np.nan
+
+    if mode == "promedio":
+        sel = spr.groupby(["SVC","DM_BKT","VEH_HOM"], dropna=False).apply(agg_prom).reset_index(name="SPR_SEL")
+    elif mode == "peak":
+        sel = spr.groupby(["SVC","DM_BKT","VEH_HOM"], dropna=False).apply(agg_peak).reset_index(name="SPR_SEL")
+    else:  # plan
+        sel = spr.groupby(["SVC","DM_BKT","VEH_HOM"], dropna=False).apply(agg_plan).reset_index(name="SPR_SEL")
+
+    sel.rename(columns={"DM_BKT":"DM","VEH_HOM":"VEH"}, inplace=True)
+    return sel[want]
+
+
+
+
 def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
     """
     Expande la tabla 'plan' a nivel vehículo–SVC–día.
