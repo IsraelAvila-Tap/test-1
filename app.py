@@ -1201,7 +1201,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     else:
         out = ensure_columns(out, {"RUTAS_MLP_SDD":0, "RUTAS_MLP_SPOT":0, "RUTAS_RENTALS":0, "SHIPMENTS_DC":0, "SHIPMENTS_SP":0})
 
-    # Rentals (rutas)
+    # ------ RENTALS ------
     out = out.drop(columns=["RUTAS_RENTALS"], errors="ignore")
     if not rents.empty:
         out = safe_merge(out, rents[["SVC","RUTAS_RENTALS","SPR_RENTALS"]], ["SVC"])
@@ -1211,7 +1211,19 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     else:
         out["RUTAS_RENTALS"] = 0
         out["SPR_RENTALS"]   = np.nan
-    out["RUTAS_RENTALS"] = pd.to_numeric(out.get("RUTAS_RENTALS", 0), errors="coerce").fillna(0).astype(int)
+
+    out["RUTAS_RENTALS"] = (
+        pd.to_numeric(out.get("RUTAS_RENTALS", 0), errors="coerce")
+          .fillna(0).astype(int)
+    )
+
+    out["SPR_RENTALS"] = (
+        pd.to_numeric(out.get("SPR_RENTALS", np.nan), errors="coerce")
+          .replace([np.inf, -np.inf], np.nan)
+          .fillna(out["SPR_USADO"])
+          .clip(lower=1)
+    )    
+
 
     # ------ CROWD del día (base + E1) ------
     out = out.drop(columns=["RUTAS_CROWD_CAP"], errors="ignore")
