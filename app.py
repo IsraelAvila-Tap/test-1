@@ -1552,6 +1552,283 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     return out
 
 
+# -----------------------------------------------------------------------------
+# 5.1) Detalle por vehículo – SVC – día (respetando estructura)
+# -----------------------------------------------------------------------------
+
+def _to_int(x):
+    if pd.isna(x): return 0
+    if isinstance(x, (int, np.integer)): return int(x)
+    s = str(x).replace(",", "").replace("%", "").strip()
+    try:
+        return int(float(s))
+    except Exception:
+        return 0
+
+def _largest_remainder_allocation(total: int, weights: pd.Series) -> pd.Series:
+    """Asigna enteros que sumen 'total' según 'weights'."""
+    w = pd.to_numeric(weights, errors="coerce").fillna(0)
+    if total <= 0 or w.sum() <= 0:
+        return pd.Series(0, index=w.index)
+    p = w / w.sum()
+    raw = p * total
+    flo = np.floor(raw).astype(int)
+    rem = raw - flo
+    short = total - int(flo.sum())
+    if short > 0:
+        order = np.argsort(-rem.values)
+        for i in order[:short]:
+            flo.iloc[i] += 1
+    return flo
+
+def _read_vehicle_mix_from_spr(op_date: date, dm_bucket: str, weeks: int = 2) -> pd.DataFrame:
+    """
+    Lee SPR y arma el mix por SVC para el DM indicado usando suma de 'Rutas'
+    de las últimas 'weeks' semanas (mismo weekday).
+    Salida: SVC, VEHICULO_TIPO_HOM, PESO_RUTAS
+    """
+    spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
+    out_cols = ["SVC","VEHICULO_TIPO_HOM","PESO_RUTAS"]
+    if spr.empty: return pd.DataFrame(columns=out_cols)
+
+    find_and_rename(spr, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SPR")
+    find_and_rename(spr, ["SHP_LG_VEHICLE_TYPE","Vehicle type","Tipo de vehículo","Tipo de vehiculo"], "VEH_TYPE", False, "SPR")
+    find_and_rename(spr, ["Rutas","RUTAS","Routes"], "RUTAS", False, "SPR")
+    find_and_rename(spr, ["DELIVERY_MODEL","Delivery model","Model","DM"], "DELIVERY_MODEL", False, "SPR")
+    coerce_date_column(spr, ["FECHA","Fecha","DATE","OP_DT"], "FECHA", "SPR", required=False)
+
+    if "RUTAS" not in spr.columns: return pd.DataFrame(columns=out_cols)
+    spr["RUTAS"] = pd.to_numeric(spr["RUTAS"], errors="coerce").fillna(0)
+    _as_str_cols(spr, ["SVC","VEH_TYPE","DELIVERY_MODEL"])
+    spr["VEHICULO_TIPO_HOM"] = spr["VEH_TYPE"].map(homologar_vehicle_type)
+
+    def bucket(dm: str) -> str:
+        dm = (dm or "").lower()
+        if "crowd" in dm: return "CROWD"
+        if "rent"  in dm: return "RENTALS"
+        if ("mlp" in dm) or ("sdd" in dm) or ("spot" in dm) or ("back" in dm): return "MLP"
+        if "dc" in dm or "delivery cell" in dm or dm in ("dc","cell"): return "DC"
+        if dm in ("sp","s.p.","service partner") or ("service" in dm and "partner" in dm): return "SP"
+        return "__OTHER__"
+
+    spr["DM_BKT"] = spr["DELIVERY_MODEL"].map(bucket)
+
+    op_ts = pd.Timestamp(op_date)
+    start = op_ts - pd.Timedelta(days=7*weeks)
+    wd = op_ts.weekday()
+    m = (
+        spr["FECHA"].notna()
+        & (pd.to_datetime(spr["FECHA"]) <= op_ts)
+        & (pd.to_datetime(spr["FECHA"]) >= start)
+        & (pd.to_datetime(spr["FECHA"]).dt.weekday == wd)
+        & (spr["DM_BKT"] == dm_bucket)
+    )
+    recent = spr[m].copy()
+    if recent.empty: return pd.DataFrame(columns=out_cols)
+
+    g = recent.groupby(["SVC","VEHICULO_TIPO_HOM"], dropna=False)["RUTAS"].sum().rename("PESO_RUTAS").reset_index()
+    return _as_str_cols(g, ["SVC","VEHICULO_TIPO_HOM"])
+
+def _spr_por_vehiculo_hist() -> pd.DataFrame:
+    """SPR histórico por SVC y tipo homologado (local con fallback global)."""
+    return load_spr_hist_from_sheet()
+
+def _alloc_mlp_by_type(used_total: int, caps_lv: int, caps_sv: int, caps_car: int) -> dict:
+    """Prioridad LV → SV → Car, acotado por caps."""
+    rem = max(0, int(used_total))
+    lv = min(rem, int(caps_lv));  rem -= lv
+    sv = min(rem, int(caps_sv));  rem -= sv
+    car = min(rem, int(caps_car)); rem -= car
+    return {"Large Van": lv, "Small Van": sv, "Car": car}
+
+def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
+    """
+    Expande la tabla 'plan' a nivel vehículo–SVC–día.
+    Columnas: DELIVERY_MOD, FECHA, SVC, SHP_LG_VEHICLE_TYPE, SPR, Rutas, Shipments
+    """
+    op_date = date.today()
+
+    # SPR por vehículo (local + global)
+    sprveh = _spr_por_vehiculo_hist()
+    sprveh_glob = sprveh[sprveh["SVC"] == "__GLOBAL__"][["VEHICULO_TIPO_HOM","SPR_HIST"]].rename(
+        columns={"SPR_HIST":"SPR_GLOBAL"}
+    )
+    sprveh_loc  = sprveh[sprveh["SVC"] != "__GLOBAL__"][["SVC","VEHICULO_TIPO_HOM","SPR_HIST"]]
+
+    # Mix de 2 semanas SOLO para DM sin apertura (Crowd, DC, SP)
+    mix_crowd = _read_vehicle_mix_from_spr(op_date, "CROWD", weeks=2)
+    mix_dc    = _read_vehicle_mix_from_spr(op_date, "DC",    weeks=2)
+    mix_sp    = _read_vehicle_mix_from_spr(op_date, "SP",    weeks=2)
+
+    rows = []
+
+    def spr_for(svc: str, veh: str, fallback: float) -> float:
+        loc = sprveh_loc[(sprveh_loc["SVC"] == svc) & (sprveh_loc["VEHICULO_TIPO_HOM"] == veh)]
+        if not loc.empty:
+            return float(pd.to_numeric(loc["SPR_HIST"].iloc[0], errors="coerce"))
+        glob = sprveh_glob[sprveh_glob["VEHICULO_TIPO_HOM"] == veh]
+        if not glob.empty:
+            return float(pd.to_numeric(glob["SPR_GLOBAL"].iloc[0], errors="coerce"))
+        return float(fallback)
+
+    for _, r in plan.iterrows():
+        svc = str(r.get("SVC", ""))
+        fch = r.get("FECHA", op_date)
+
+        # ---------- RENTALS (apertura nativa desde Rentals) ----------
+        rutas_r = _to_int(r.get("RUTAS_RENTALS", 0))
+        if rutas_r > 0:
+            # Tomamos el mix de Rentals desde la pestaña Rentals (unidades por tipo)
+            mix = load_rentals_caps_from_sheet()
+            mix = _as_str_cols(mix, ["SVC"])
+            mix_svc = mix[mix["SVC"] == svc]
+            if not mix_svc.empty:
+                # reconstruir mix a nivel tipo
+                rentals_raw = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
+                find_and_rename(rentals_raw, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "Rentals")
+                find_and_rename(rentals_raw, ["Tipo de vehiculo","Tipo de vehículo","Vehicle type","Tipo"], "TIPO_VEHICULO", False, "Rentals")
+                # columna unidades tolerante
+                units_col = None
+                for k in ["Unidades disponibles","Unidades dispon","Units","Cantidad","Qty","QTY","COUNT"]:
+                    if find_and_rename(rentals_raw, [k], "UNIDADES", required=False, source_label="Rentals"):
+                        units_col = "UNIDADES"; break
+                if not units_col:
+                    gcol = _find_units_like_column(rentals_raw)
+                    if gcol:
+                        rentals_raw.rename(columns={gcol:"UNIDADES"}, inplace=True)
+                        units_col = "UNIDADES"
+                if units_col:
+                    rentals_raw["UNIDADES"] = pd.to_numeric(rentals_raw["UNIDADES"], errors="coerce").fillna(0)
+                    rentals_raw = rentals_raw[rentals_raw["SVC"] == svc].copy()
+                    rentals_raw["VEHICULO_TIPO_HOM"] = rentals_raw["TIPO_VEHICULO"].map(homologar_vehicle_type)
+                    mix_tbl = rentals_raw.groupby("VEHICULO_TIPO_HOM")["UNIDADES"].sum().rename("PESO").reset_index()
+                else:
+                    mix_tbl = pd.DataFrame(columns=["VEHICULO_TIPO_HOM","PESO"])
+                if mix_tbl.empty:
+                    # si no hay, usar mix global de Rentals (SPR sheet) como último recurso
+                    mix_tbl = _read_vehicle_mix_from_spr(op_date, "RENTALS", weeks=2)
+                    if mix_tbl.empty:
+                        mix_tbl = pd.DataFrame({"VEHICULO_TIPO_HOM":["Large Van","Small Van","Car"], "PESO":[3,2,1]})
+                    else:
+                        mix_tbl = mix_tbl.groupby("VEHICULO_TIPO_HOM")["PESO_RUTAS"].sum().rename("PESO").reset_index()
+
+                alloc = _largest_remainder_allocation(rutas_r, mix_tbl.set_index("VEHICULO_TIPO_HOM")["PESO"])
+                for veh, rutas_v in alloc.items():
+                    if rutas_v <= 0: continue
+                    spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_RENTALS", np.nan), errors="coerce") or 20))
+                    ships = int(round(int(rutas_v) * spr_v))
+                    rows.append(["Rentals", fch, svc, veh, float(spr_v), int(rutas_v), ships])
+
+        # ---------- CROWD (sin apertura → distribución 2 semanas) ----------
+        rutas_crowd = _to_int(r.get("RUTAS_CROWD_BASE", 0)) + _to_int(r.get("RUTAS_CROWD_ESCALADO", 0))
+        if rutas_crowd > 0:
+            mix_svc = mix_crowd[mix_crowd["SVC"] == svc]
+            if mix_svc.empty:
+                mix_svc = mix_crowd.groupby("VEHICULO_TIPO_HOM")["PESO_RUTAS"].sum().rename("PESO_RUTAS").reset_index()
+                mix_svc["SVC"] = svc
+            alloc = _largest_remainder_allocation(rutas_crowd, mix_svc.set_index("VEHICULO_TIPO_HOM")["PESO_RUTAS"])
+            for veh, rutas_v in alloc.items():
+                if rutas_v <= 0: continue
+                spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_CROWD", np.nan), errors="coerce") or 20))
+                ships = int(round(int(rutas_v) * spr_v))
+                rows.append(["CROWD", fch, svc, veh, float(spr_v), int(rutas_v), ships])
+
+        # ---------- MLP (apertura nativa desde SRM; prioridad LV→SV→Car) ----------
+        # SDD
+        used_sdd  = _to_int(r.get("RUTAS_MLP_SDD_USADAS", 0))
+        caps_lv   = _to_int(r.get("MLP_SDD_LV", 0))
+        caps_sv   = _to_int(r.get("MLP_SDD_SV", 0))
+        caps_car  = _to_int(r.get("MLP_SDD_CAR", 0))
+        if used_sdd > 0:
+            alloc = _alloc_mlp_by_type(used_sdd, caps_lv, caps_sv, caps_car)
+            for veh, rutas_v in alloc.items():
+                if rutas_v <= 0: continue
+                spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or 25))
+                ships = int(round(int(rutas_v) * spr_v))
+                rows.append(["MLP SDD", fch, svc, veh, float(spr_v), int(rutas_v), ships])
+
+        # SPOT
+        used_spot = _to_int(r.get("RUTAS_MLP_SPOT_USADAS", 0))
+        caps_lv   = _to_int(r.get("MLP_SPOT_LV", 0))
+        caps_sv   = _to_int(r.get("MLP_SPOT_SV", 0))
+        caps_car  = _to_int(r.get("MLP_SPOT_CAR", 0))
+        if used_spot > 0:
+            alloc = _alloc_mlp_by_type(used_spot, caps_lv, caps_sv, caps_car)
+            for veh, rutas_v in alloc.items():
+                if rutas_v <= 0: continue
+                spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or 25))
+                ships = int(round(int(rutas_v) * spr_v))
+                rows.append(["MLP SPOT", fch, svc, veh, float(spr_v), int(rutas_v), ships])
+
+        # ---------- DC / SP (sin apertura → distribuir por mix 2 semanas; rutas = shipments / SPR_v) ----------
+        # DC
+        ship_dc = _to_int(r.get("SHIPMENTS_DC", 0))
+        if ship_dc > 0:
+            mix_svc = mix_dc[mix_dc["SVC"] == svc]
+            if mix_svc.empty:
+                mix_svc = mix_dc.groupby("VEHICULO_TIPO_HOM")["PESO_RUTAS"].sum().rename("PESO_RUTAS").reset_index()
+                mix_svc["SVC"] = svc
+            # Repartimos shipments por mix; luego calculamos rutas = shipments_v / SPR_v
+            alloc_ship = _largest_remainder_allocation(ship_dc, mix_svc.set_index("VEHICULO_TIPO_HOM")["PESO_RUTAS"])
+            for veh, ships_v in alloc_ship.items():
+                if ships_v <= 0: continue
+                spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25))
+                rutas_v = int(round(ships_v / max(1.0, spr_v)))
+                rows.append(["DC", fch, svc, veh, float(spr_v), int(rutas_v), int(ships_v)])
+
+        # SP
+        ship_sp = _to_int(r.get("SHIPMENTS_SP", 0))
+        if ship_sp > 0:
+            mix_svc = mix_sp[mix_sp["SVC"] == svc]
+            if mix_svc.empty:
+                mix_svc = mix_sp.groupby("VEHICULO_TIPO_HOM")["PESO_RUTAS"].sum().rename("PESO_RUTAS").reset_index()
+                mix_svc["SVC"] = svc
+            alloc_ship = _largest_remainder_allocation(ship_sp, mix_svc.set_index("VEHICULO_TIPO_HOM")["PESO_RUTAS"])
+            for veh, ships_v in alloc_ship.items():
+                if ships_v <= 0: continue
+                spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25))
+                rutas_v = int(round(ships_v / max(1.0, spr_v)))
+                rows.append(["SP", fch, svc, veh, float(spr_v), int(rutas_v), int(ships_v)])
+
+        # ---------- SUBTOTAL SVC ----------
+        # Se agrega al final, después de procesar todos los DMs del SVC (se calculará luego).
+
+    # Armar DataFrame
+    detalle = pd.DataFrame(rows, columns=[
+        "DELIVERY_MOD","FECHA","SVC","SHP_LG_VEHICLE_TYPE","SPR","Rutas","Shipments"
+    ])
+
+    # Subtotales por SVC (fila espejo)
+    if not detalle.empty:
+        subs = (
+            detalle.groupby(["FECHA","SVC"], as_index=False)
+                   .agg({"Rutas":"sum","Shipments":"sum"})
+        )
+        subs["DELIVERY_MOD"] = "TOTAL SVC"
+        subs["SHP_LG_VEHICLE_TYPE"] = ""
+        subs["SPR"] = np.nan
+        # Reordena columnas
+        subs = subs[["DELIVERY_MOD","FECHA","SVC","SHP_LG_VEHICLE_TYPE","SPR","Rutas","Shipments"]]
+        detalle = pd.concat([detalle, subs], axis=0, ignore_index=True)
+
+    # Orden visual: por SVC, luego orden lógico de DM
+    dm_order = pd.CategoricalDtype(["Rentals","CROWD","MLP SDD","MLP SPOT","DC","SP","TOTAL SVC"], ordered=True)
+    if "DELIVERY_MOD" in detalle.columns:
+        try:
+            detalle["DELIVERY_MOD"] = detalle["DELIVERY_MOD"].astype(dm_order)
+            detalle = detalle.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"]).reset_index(drop=True)
+        except Exception:
+            detalle = detalle.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"]).reset_index(drop=True)
+
+    # Formateo ligero igual que tabla 1 (solo mostramos enteros)
+    detalle["Rutas"] = detalle["Rutas"].astype(int)
+    detalle["Shipments"] = detalle["Shipments"].astype(int)
+
+    return detalle
+
+
+
+
 
 # -----------------------------------------------------------------------------
 # 6) UI
@@ -1661,6 +1938,18 @@ try:
                 c4.metric("Rutas faltantes", f"{_sum_numeric_col(plan, 'RUTAS_FALTANTES'):,}")
 
                 st.dataframe(plan, use_container_width=True, hide_index=True)
+
+# --- Debajo de st.dataframe(plan, ...) ---
+try:
+    detalles = expand_to_vehicle_level(plan, spr_mode)
+    st.markdown("### Detalle por vehículo – SVC – día")
+    st.dataframe(detalles, use_container_width=True, hide_index=True)
+except Exception as e:
+    st.error("No se pudo construir el detalle por vehículo.")
+    show_exception(e, "Detalle vehículo (traceback)")
+
+
+
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
     show_exception(e, "Traceback completo")
