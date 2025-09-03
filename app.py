@@ -1949,7 +1949,6 @@ except Exception as e:
     show_exception(e, "Detalle vehículo (traceback)")
 
 
-
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
     show_exception(e, "Traceback completo")
