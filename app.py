@@ -1674,51 +1674,57 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
     for _, r in plan.iterrows():
         svc = str(r.get("SVC", ""))
         fch = r.get("FECHA", op_date)
-
-        # ---------- RENTALS (apertura nativa desde Rentals) ----------
+    
+                # ---------- RENTALS (apertura nativa desde Rentals y cuadra total) ----------
         rutas_r = _to_int(r.get("RUTAS_RENTALS", 0))
         if rutas_r > 0:
-            # Tomamos el mix de Rentals desde la pestaña Rentals (unidades por tipo)
-            mix = load_rentals_caps_from_sheet()
-            mix = _as_str_cols(mix, ["SVC"])
-            mix_svc = mix[mix["SVC"] == svc]
-            if not mix_svc.empty:
-                # reconstruir mix a nivel tipo
-                rentals_raw = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
-                find_and_rename(rentals_raw, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "Rentals")
-                find_and_rename(rentals_raw, ["Tipo de vehiculo","Tipo de vehículo","Vehicle type","Tipo"], "TIPO_VEHICULO", False, "Rentals")
-                # columna unidades tolerante
-                units_col = None
-                for k in ["Unidades disponibles","Unidades dispon","Units","Cantidad","Qty","QTY","COUNT"]:
-                    if find_and_rename(rentals_raw, [k], "UNIDADES", required=False, source_label="Rentals"):
-                        units_col = "UNIDADES"; break
-                if not units_col:
-                    gcol = _find_units_like_column(rentals_raw)
-                    if gcol:
-                        rentals_raw.rename(columns={gcol:"UNIDADES"}, inplace=True)
-                        units_col = "UNIDADES"
-                if units_col:
-                    rentals_raw["UNIDADES"] = pd.to_numeric(rentals_raw["UNIDADES"], errors="coerce").fillna(0)
-                    rentals_raw = rentals_raw[rentals_raw["SVC"] == svc].copy()
-                    rentals_raw["VEHICULO_TIPO_HOM"] = rentals_raw["TIPO_VEHICULO"].map(homologar_vehicle_type)
-                    mix_tbl = rentals_raw.groupby("VEHICULO_TIPO_HOM")["UNIDADES"].sum().rename("PESO").reset_index()
+            # 1) Mix por SVC a partir de la pestaña Rentals (UNIDADES por tipo)
+            rentals_raw = read_sheet(SHEET_ID, SHEET_TABS["rentals"])
+            find_and_rename(rentals_raw, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "Rentals")
+            find_and_rename(rentals_raw, ["Tipo de vehiculo","Tipo de vehículo","Vehicle type","Tipo"], "TIPO_VEHICULO", False, "Rentals")
+
+            # columna unidades (tolerante)
+            units_col = None
+            for k in ["Unidades disponibles","Unidades dispon","Units","Cantidad","Qty","QTY","COUNT"]:
+                if find_and_rename(rentals_raw, [k], "UNIDADES", required=False, source_label="Rentals"):
+                    units_col = "UNIDADES"; break
+            if not units_col:
+                gcol = _find_units_like_column(rentals_raw)
+                if gcol:
+                    rentals_raw.rename(columns={gcol:"UNIDADES"}, inplace=True)
+                    units_col = "UNIDADES"
+
+            mix_tbl = pd.DataFrame(columns=["VEHICULO_TIPO_HOM","PESO"])
+            if units_col:
+                rentals_raw["UNIDADES"] = pd.to_numeric(rentals_raw["UNIDADES"], errors="coerce").fillna(0)
+                rentals_raw = rentals_raw[rentals_raw["SVC"].astype(str) == svc].copy()
+                rentals_raw["VEHICULO_TIPO_HOM"] = rentals_raw["TIPO_VEHICULO"].map(homologar_vehicle_type)
+                mix_tbl = rentals_raw.groupby("VEHICULO_TIPO_HOM")["UNIDADES"].sum().rename("PESO").reset_index()
+
+            # Fallback: si no hay mix SVC, usa mix global de Rentals desde SPR 2 semanas
+            if mix_tbl.empty:
+                mix_glob = _read_vehicle_mix_from_spr(op_date, "RENTALS", weeks=2)
+                if not mix_glob.empty:
+                    mix_tbl = mix_glob.groupby("VEHICULO_TIPO_HOM")["PESO_RUTAS"].sum().rename("PESO").reset_index()
                 else:
-                    mix_tbl = pd.DataFrame(columns=["VEHICULO_TIPO_HOM","PESO"])
-                if mix_tbl.empty:
-                    # si no hay, usar mix global de Rentals (SPR sheet) como último recurso
-                    mix_tbl = _read_vehicle_mix_from_spr(op_date, "RENTALS", weeks=2)
-                    if mix_tbl.empty:
-                        mix_tbl = pd.DataFrame({"VEHICULO_TIPO_HOM":["Large Van","Small Van","Car"], "PESO":[3,2,1]})
-                    else:
-                        mix_tbl = mix_tbl.groupby("VEHICULO_TIPO_HOM")["PESO_RUTAS"].sum().rename("PESO").reset_index()
+                    mix_tbl = pd.DataFrame({"VEHICULO_TIPO_HOM":["Large Van","Small Van","Car"], "PESO":[3,2,1]})
 
-                alloc = _largest_remainder_allocation(rutas_r, mix_tbl.set_index("VEHICULO_TIPO_HOM")["PESO"])
-                for veh, rutas_v in alloc.items():
-                    if rutas_v <= 0: continue
-                    spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_RENTALS", np.nan), errors="coerce") or 20))
-                    ships = int(round(int(rutas_v) * spr_v))
-                    rows.append(["Rentals", fch, svc, veh, float(spr_v), int(rutas_v), ships])
+            weights = mix_tbl.set_index("VEHICULO_TIPO_HOM")["PESO"]
+            alloc = _largest_remainder_allocation(rutas_r, weights)
 
+            # Reconciliación: asegurar que la suma == rutas_r (absorbe la diferencia al mayor peso)
+            diff = rutas_r - int(alloc.sum())
+            if diff != 0 and not alloc.empty:
+                top = weights.sort_values(ascending=False).index[0]
+                alloc.loc[top] = int(alloc.loc[top]) + diff
+
+            for veh, rutas_v in alloc.items():
+                if rutas_v <= 0: continue
+                spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_RENTALS", np.nan), errors="coerce") or 20))
+                ships = int(round(int(rutas_v) * spr_v))
+                rows.append(["Rentals", fch, svc, veh, float(spr_v), int(rutas_v), ships])
+
+        
         # ---------- CROWD (sin apertura → distribución 2 semanas) ----------
         rutas_crowd = _to_int(r.get("RUTAS_CROWD_BASE", 0)) + _to_int(r.get("RUTAS_CROWD_ESCALADO", 0))
         if rutas_crowd > 0:
@@ -1759,7 +1765,21 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or 25))
                 ships = int(round(int(rutas_v) * spr_v))
                 rows.append(["MLP SPOT", fch, svc, veh, float(spr_v), int(rutas_v), ships])
+               
+        # ---------- MLP BACKLOG (prioridad LV → SV → Car; cuadra total) ----------
+        used_back = _to_int(r.get("RUTAS_MLP_BACKLOG_USADAS", 0))
+        if used_back > 0:
+            # Sin caps por tipo para backlog: prioriza LV, luego SV, luego Car
+            alloc_back = {"Large Van": used_back, "Small Van": 0, "Car": 0}
+            # Si quisieras repartir algo a SV/Car, aquí podrías mover parte según alguna proporción
+            for veh, rutas_v in alloc_back.items():
+                if rutas_v <= 0: continue
+                spr_v = spr_for(svc, veh, fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or 25))
+                ships = int(round(int(rutas_v) * spr_v))
+                rows.append(["MLP BACKLOG", fch, svc, veh, float(spr_v), int(rutas_v), ships])
 
+
+        
         # ---------- DC / SP (sin apertura → distribuir por mix 2 semanas; rutas = shipments / SPR_v) ----------
         # DC
         ship_dc = _to_int(r.get("SHIPMENTS_DC", 0))
