@@ -1621,10 +1621,29 @@ with st.expander("▶️ Cargando datos...", expanded=True):
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
 
+with st.expander("ℹ️ Notas de esta versión"):
+    st.markdown(textwrap.dedent("""
+    - Rentals desde **Rentals** (fuzzy en “Unidades dispon…”) con **SPR_RENTALS** ponderado; siempre se usa 100% antes de Crowd/MLP.
+    - Crowd por % de **Capacity**: **CROWD_PCT**, **SHIP_OBJ_CROWD**, **SPR_CROWD**, base y escalado (E1).
+    - **MLP** (SRM): se ignoran columnas **Total** y se suma por tipo de vehículo (**Large/Small/Car**) para **SDD** y **SPOT**.
+      Se muestran columnas de desglose y se asignan rutas por prioridad **SDD → SPOT → Backlog**.
+    """))
 
+# --- Helper para sumar columnas con números formateados ---
+def _sum_numeric_col(df, col):
+    s = (
+        df[col].astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+    )
+    return int(pd.to_numeric(s, errors="coerce").fillna(0).sum())
+
+# --- Ejecución del plan ---
 if 'auto_run_once' not in st.session_state:
     st.session_state['auto_run_once'] = True
     auto_run = True
+else:
+    auto_run = False
 
 try:
     if run_btn or auto_run:
@@ -1635,36 +1654,14 @@ try:
             if plan.empty:
                 st.warning("No hay datos para mostrar con los filtros seleccionados.")
             else:
-               
-                
-                
-                
-                
-                def _sum_numeric_col(df, col):
-    # quita comas y % y convierte a número para poder sumar
-    s = (
-        df[col].astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace("%", "", regex=False)
-    )
-    return int(pd.to_numeric(s, errors="coerce").fillna(0).sum())
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("SVCs", plan["SVC"].nunique())
+                c2.metric("Demanda ajustada", f"{_sum_numeric_col(plan, 'DEMANDA_AJUSTADA'):,}")
+                c3.metric("Rutas (SPR base)", f"{_sum_numeric_col(plan, 'RUTAS_SPR_BASE'):,}")
+                c4.metric("Rutas faltantes", f"{_sum_numeric_col(plan, 'RUTAS_FALTANTES'):,}")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("SVCs", plan["SVC"].nunique())
-c2.metric("Demanda ajustada", _sum_numeric_col(plan, "DEMANDA_AJUSTADA"))
-c3.metric("Rutas (SPR base)", _sum_numeric_col(plan, "RUTAS_SPR_BASE"))
-c4.metric("Rutas faltantes", _sum_numeric_col(plan, "RUTAS_FALTANTES"))
-
-st.dataframe(plan, use_container_width=True, hide_index=True)
-
+                st.dataframe(plan, use_container_width=True, hide_index=True)
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
     show_exception(e, "Traceback completo")
 
-with st.expander("ℹ️ Notas de esta versión"):
-    st.markdown(textwrap.dedent("""
-    - Rentals desde **Rentals** (fuzzy en “Unidades dispon…”) con **SPR_RENTALS** ponderado; siempre se usa 100% antes de Crowd/MLP.
-    - Crowd por % de **Capacity**: **CROWD_PCT**, **SHIP_OBJ_CROWD**, **SPR_CROWD**, base y escalado (E1).
-    - **MLP** (SRM): se ignoran columnas **Total** y se suma por tipo de vehículo (**Large/Small/Car**) para **SDD** y **SPOT**.
-      Se muestran columnas de desglose y se asignan rutas por prioridad **SDD → SPOT → Backlog**.
-    """))
