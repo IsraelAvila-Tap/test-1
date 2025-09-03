@@ -1240,9 +1240,7 @@ def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
         "FCST","SHIPMENTS_DC","SHIPMENTS_SP","FCST (sin DC & sin SP)","DEMANDA_AJUSTADA",
         "RUTAS_RENTALS","SPR_RENTALS","SHIP_RENTALS",
         "CROWD_PCT","SPR_CROWD","SHIP_OBJ_CROWD","RUTAS_CROWD_OBJ",
-        # 👇 aquí ahora van los DOS valores de crowd que quieres ver
         "RUTAS_CROWD_CAP","CROWD_E1_CAP",
-        # (puedes dejar las siguientes si te sirven; si no, bórralas)
         "RUTAS_CROWD_BASE","RUTAS_CROWD_ESCALADO",
         "SHIP_CROWD","SHIP_RESTANTES_PRE_MLP",
         "SPR_USADO","SPR_PROM","SPR_PEAK","SPR_OBJ","SPR_MLP",
@@ -1255,11 +1253,31 @@ def apply_output_adjustments(resumen: pd.DataFrame) -> pd.DataFrame:
         "CAP_TOTAL","CAP_VS_FCST","CAP_DIFF_ABS","RIESGO",
     ]
 
+    # Asegura que todas existan
     for c in orden:
         if c not in resumen.columns:
             resumen[c] = 0
 
-    return resumen[orden]
+    df = resumen.copy()
+
+    # --- Formato solicitado (solo presentación) ---
+    # 1) CAP_VS_FCST como porcentaje "100%" / "96%"
+    df["CAP_VS_FCST"] = (
+        pd.to_numeric(df["CAP_VS_FCST"], errors="coerce").fillna(0).clip(lower=0) * 100
+    ).round(0).astype(int).astype(str) + "%"
+
+    # 2) CAP_DIFF_ABS negativa cuando haya RIESGO (sin cambiar cálculos previos)
+    diff_signed = (
+        pd.to_numeric(df["CAP_TOTAL"], errors="coerce").fillna(0)
+        - pd.to_numeric(df["FCST"], errors="coerce").fillna(0)
+    ).round(1)
+    df["CAP_DIFF_ABS"] = np.where(
+        df.get("RIESGO","") == "RIESGO",
+        diff_signed,                 # negativo si falta capacidad
+        diff_signed.abs()            # positivo si estamos OK
+    )
+
+    return df[orden]
 
 def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.DataFrame:
     hoy = date.today()
