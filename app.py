@@ -1939,17 +1939,15 @@ try:
 
                 st.dataframe(plan, use_container_width=True, hide_index=True)
 
-# --- Debajo de st.dataframe(plan, ...) ---
-try:
-    detalles = expand_to_vehicle_level(plan, spr_mode)
-    st.markdown("### Detalle por vehículo – SVC – día")
-    st.dataframe(detalles, use_container_width=True, hide_index=True)
-except Exception as e:
-    st.error("No se pudo construir el detalle por vehículo.")
-    show_exception(e, "Detalle vehículo (traceback)")
-
+                # --- Detalle por vehículo debajo del plan ---
+                try:
+                    detalles = expand_to_vehicle_level(plan, spr_mode)
+                    st.markdown("### Detalle por vehículo – SVC – día")
+                    st.dataframe(detalles, use_container_width=True, hide_index=True)
+                except Exception as e:
+                    st.error("No se pudo construir el detalle por vehículo.")
+                    show_exception(e, "Detalle vehículo (traceback)")
 
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
     show_exception(e, "Traceback completo")
-
