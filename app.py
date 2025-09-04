@@ -2263,7 +2263,7 @@ st.markdown("## 🤖 Pregunta a Mel-IA sobre tus datos")
 
 # Asegura que la API key esté en el entorno (si la guardaste en st.secrets)
 if "OPENAI_API_KEY" in st.secrets and not os.environ.get("OPENAI_API_KEY"):
-    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+     os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
 
 try:
     from openai import OpenAI
