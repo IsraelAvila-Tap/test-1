@@ -2272,8 +2272,7 @@ try:
 except Exception as _e:
     openai_ok = False
     st.info(
-        "Para habilitar el chat, agrega `openai>=1.40.0` a requirements.txt "
-        "y define `OPENAI_API_KEY` en tus Secrets."
+        "Puedes preguntarle a Mel-IA sobre los datos del plan, riesgos, spr, mlps, etc."
     )
 
 # Historial simple en sesión
