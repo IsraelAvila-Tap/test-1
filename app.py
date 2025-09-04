@@ -2252,3 +2252,48 @@ try:
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
     show_exception(e, "Traceback completo")
+
+import openai
+
+st.markdown("## 🤖 Pregunta a Mel-IA sobre tus datos")
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+user_q = st.text_input("Escribe tu pregunta:")
+
+if st.button("Preguntar") and user_q:
+    try:
+        # Contexto: convertimos tus tablas a un CSV compacto (máx. 300 filas para no saturar)
+        context = ""
+        if plan is not None and not plan.empty:
+            context += "Tabla plan (arriba):\n" + plan.head(300).to_csv(index=False) + "\n"
+        if detalles is not None and not detalles.empty:
+            context += "Tabla detalle (abajo):\n" + detalles.head(300).to_csv(index=False) + "\n"
+
+        prompt = f"""
+        Eres un analista experto en planeación táctica.
+        Responde en español de forma clara usando solo la información que te paso.
+        Contexto:\n{context}\n
+        Pregunta: {user_q}
+        """
+
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",  # puedes usar gpt-4o o gpt-5 si tienes acceso
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+        )
+
+        answer = resp["choices"][0]["message"]["content"]
+
+        # Guardamos en historial
+        st.session_state.chat_history.append((user_q, answer))
+
+    except Exception as e:
+        st.error(f"No se pudo obtener respuesta: {e}")
+
+# Mostrar historial
+for q, a in st.session_state.chat_history:
+    st.markdown(f"**Tú:** {q}")
+    st.markdown(f"**Mel-IA:** {a}")
+
