@@ -2228,17 +2228,17 @@ try:
                     + _sum_numeric_col(plan, "RUTAS_MLP_SDD_USADAS")
                     + _sum_numeric_col(plan, "RUTAS_MLP_SPOT_USADAS")
                     + _sum_numeric_col(plan, "RUTAS_MLP_BACKLOG_USADAS")
-                    )
+                )
 
-                    spr_cap_result = ship_capacidad_total / max(rutas_cap_total, 1)
-                    spr_cap_label  = f"{spr_cap_result:,.1f}"
+                spr_cap_result = ship_capacidad_total / max(rutas_cap_total, 1)
+                spr_cap_label  = f"{spr_cap_result:,.1f}"
 
-                    # 5) Mostrar KPIs (sin "Rutas SPR base")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("SVCs", svcs_uniques)
-                    c2.metric("Demanda ajustada", f"{dem_aj_total:,}")
-                    c3.metric("Rutas faltantes", f"{rutas_falt_total:,}")
-                    c4.metric("SPR (resultante capacidad)", spr_cap_label)
+                # 5) Mostrar KPIs (sin "Rutas SPR base")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("SVCs", svcs_uniques)
+                c2.metric("Demanda ajustada", f"{dem_aj_total:,}")
+                c3.metric("Rutas faltantes", f"{rutas_falt_total:,}")
+                c4.metric("SPR (resultante capacidad)", spr_cap_label)
 
 
                 
