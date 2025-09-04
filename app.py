@@ -2160,6 +2160,7 @@ with st.expander("ℹ️ Notas de esta versión"):
       Se muestran columnas de desglose y se asignan rutas por prioridad **SDD → SPOT → Backlog**.
     - **Reconciliación arriba↔abajo**: los *shipments* mostrados “arriba” se toman de la suma del detalle (abajo) y el **SPR mostrado**
       es la **resultante** = *shipments / rutas*. Las **rutas** permanecen como la “verdad” de la tabla de arriba.
+    - **SPR (resultante capacidad)** en cabecera = *Shipments de capacidad / Rutas de capacidad* (solo Rentals + Crowd + MLP).
     """))
 
 # --- Helper para sumar columnas numéricas formateadas (para métricas) ---
@@ -2202,16 +2203,49 @@ try:
                 plan = reconcile_plan_with_detail(plan_base, detalles)
 
                 # 4) KPIs header basados en el plan reconciliado
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("SVCs", plan["SVC"].nunique())
-                c2.metric("Demanda ajustada", f"{_sum_numeric_col(plan, 'DEMANDA_AJUSTADA'):,}")
-                c3.metric("Rutas (SPR base)", f"{_sum_numeric_col(plan, 'RUTAS_SPR_BASE'):,}")
-                c4.metric("Rutas faltantes", f"{_sum_numeric_col(plan, 'RUTAS_FALTANTES'):,}")
+                svcs_uniques = plan["SVC"].nunique()
 
-                # 5) Mostrar tabla “arriba” (reconciliada)
+                dem_aj_total = _sum_numeric_col(plan, "DEMANDA_AJUSTADA")
+                rutas_base_total = _sum_numeric_col(plan, "RUTAS_SPR_BASE")
+                rutas_falt_total = _sum_numeric_col(plan, "RUTAS_FALTANTES")
+
+                ship_dc   = _sum_numeric_col(plan, "SHIPMENTS_DC")
+                ship_sp   = _sum_numeric_col(plan, "SHIPMENTS_SP")
+                ship_rent = _sum_numeric_col(plan, "SHIP_RENTALS")
+                ship_crwd = _sum_numeric_col(plan, "SHIP_CROWD")
+                cap_total = _sum_numeric_col(plan, "CAP_TOTAL")
+
+                # Shipments MLP = CAP_TOTAL - (DC + SP + Rentals + Crowd)
+                ship_mlp_total = max(cap_total - ship_dc - ship_sp - ship_rent - ship_crwd, 0)
+
+                # Shipments de capacidad (solo Rentals + Crowd + MLP)
+                ship_capacidad_total = ship_rent + ship_crwd + ship_mlp_total
+
+                # Rutas de capacidad = Rentals + Crowd (base+esc) + MLP (SDD/SPOT/BACKLOG)
+                rutas_cap_total = (
+                    _sum_numeric_col(plan, "RUTAS_RENTALS")
+                    + _sum_numeric_col(plan, "RUTAS_CROWD_BASE")
+                    + _sum_numeric_col(plan, "RUTAS_CROWD_ESCALADO")
+                    + _sum_numeric_col(plan, "RUTAS_MLP_SDD_USADAS")
+                    + _sum_numeric_col(plan, "RUTAS_MLP_SPOT_USADAS")
+                    + _sum_numeric_col(plan, "RUTAS_MLP_BACKLOG_USADAS")
+                )
+
+                spr_cap_result = ship_capacidad_total / max(rutas_cap_total, 1)
+                spr_cap_label  = f"{spr_cap_result:,.1f}"
+
+                # 5) Mostrar KPIs
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("SVCs", svcs_uniques)
+                c2.metric("Demanda ajustada", f"{dem_aj_total:,}")
+                c3.metric("Rutas (SPR base)", f"{rutas_base_total:,}")
+                c4.metric("Rutas faltantes", f"{rutas_falt_total:,}")
+                c5.metric("SPR (resultante capacidad)", spr_cap_label)
+
+                # 6) Mostrar tabla “arriba” (reconciliada)
                 st.dataframe(plan, use_container_width=True, hide_index=True)
 
-                # 6) Mostrar detalle
+                # 7) Mostrar detalle
                 st.markdown("### Detalle por vehículo – SVC – día")
                 st.dataframe(detalles, use_container_width=True, hide_index=True)
 
