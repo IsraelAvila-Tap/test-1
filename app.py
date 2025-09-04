@@ -2253,47 +2253,98 @@ except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
     show_exception(e, "Traceback completo")
 
-import openai
+# ===================== Chat Mel-IA sobre tus datos =====================
+import os, textwrap
+import streamlit as st
+import pandas as pd
+import numpy as np
 
 st.markdown("## 🤖 Pregunta a Mel-IA sobre tus datos")
 
+# Asegura que la API key esté en el entorno (si la guardaste en st.secrets)
+if "OPENAI_API_KEY" in st.secrets and not os.environ.get("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+
+try:
+    from openai import OpenAI
+    client = OpenAI()
+    openai_ok = True
+except Exception as _e:
+    openai_ok = False
+    st.info(
+        "Para habilitar el chat, agrega `openai>=1.40.0` a requirements.txt "
+        "y define `OPENAI_API_KEY` en tus Secrets."
+    )
+
+# Historial simple en sesión
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-user_q = st.text_input("Escribe tu pregunta:")
+# Entrada de usuario
+colq1, colq2 = st.columns([1, 0.15])
+with colq1:
+    user_q = st.text_input("Escribe tu pregunta (ej. “¿cuántas rutas rentals en SGD1?”)")
+with colq2:
+    ask = st.button("Preguntar", type="primary", use_container_width=True)
 
-if st.button("Preguntar") and user_q:
-    try:
-        # Contexto: convertimos tus tablas a un CSV compacto (máx. 300 filas para no saturar)
-        context = ""
-        if plan is not None and not plan.empty:
-            context += "Tabla plan (arriba):\n" + plan.head(300).to_csv(index=False) + "\n"
-        if detalles is not None and not detalles.empty:
-            context += "Tabla detalle (abajo):\n" + detalles.head(300).to_csv(index=False) + "\n"
+def _df_to_context(name: str, df: pd.DataFrame, limit_rows: int = 250) -> str:
+    if df is None or df.empty:
+        return f"{name}: (vacío)\n"
+    # recortamos columnas con strings muy largos y filas para no saturar el prompt
+    df2 = df.copy()
+    for c in df2.columns:
+        if df2[c].dtype == object:
+            df2[c] = df2[c].astype(str).str.slice(0, 80)
+    return f"{name} (primeras {min(len(df2), limit_rows)} filas):\n" + \
+           df2.head(limit_rows).to_csv(index=False)
 
-        prompt = f"""
-        Eres un analista experto en planeación táctica.
-        Responde en español de forma clara usando solo la información que te paso.
-        Contexto:\n{context}\n
-        Pregunta: {user_q}
-        """
+if ask and user_q:
+    if not openai_ok:
+        st.error("El chat no está disponible porque falta el paquete `openai`.")
+    else:
+        # Prepara contexto compacto desde tus tablas
+        context_parts = []
+        try:
+            context_parts.append(_df_to_context("Tabla plan (arriba)", plan, 250))
+        except Exception:
+            context_parts.append("Tabla plan (arriba): (no disponible)\n")
+        try:
+            context_parts.append(_df_to_context("Tabla detalle (abajo)", detalles, 250))
+        except Exception:
+            context_parts.append("Tabla detalle (abajo): (no disponible)\n")
 
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",  # puedes usar gpt-4o o gpt-5 si tienes acceso
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
+        system_msg = (
+            "Eres un analista de planeación táctica. Responde en español, "
+            "claro y conciso. Si haces cálculos, muéstralos. "
+            "Usa solo el contexto provisto; si algo no está en los datos, dilo."
         )
 
-        answer = resp["choices"][0]["message"]["content"]
+        user_prompt = textwrap.dedent(f"""
+        CONTEXTO:
+        {("\n".join(context_parts))}
 
-        # Guardamos en historial
-        st.session_state.chat_history.append((user_q, answer))
+        PREGUNTA:
+        {user_q}
+        """)
 
-    except Exception as e:
-        st.error(f"No se pudo obtener respuesta: {e}")
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",  # usa el modelo que tengas habilitado
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                max_tokens=700,
+            )
+            answer = resp.choices[0].message.content.strip()
+            st.session_state.chat_history.append((user_q, answer))
+        except Exception as e:
+            st.error(f"No se pudo obtener respuesta: {e}")
 
-# Mostrar historial
-for q, a in st.session_state.chat_history:
-    st.markdown(f"**Tú:** {q}")
-    st.markdown(f"**Mel-IA:** {a}")
-
+# Muestra historial
+if st.session_state.chat_history:
+    st.divider()
+    for q, a in st.session_state.chat_history[::-1]:
+        st.markdown(f"**Tú:** {q}")
+        st.markdown(f"**Mel-IA:** {a}")
