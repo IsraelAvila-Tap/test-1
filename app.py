@@ -2206,7 +2206,6 @@ try:
                 svcs_uniques = plan["SVC"].nunique()
 
                 dem_aj_total = _sum_numeric_col(plan, "DEMANDA_AJUSTADA")
-                rutas_base_total = _sum_numeric_col(plan, "RUTAS_SPR_BASE")
                 rutas_falt_total = _sum_numeric_col(plan, "RUTAS_FALTANTES")
 
                 ship_dc   = _sum_numeric_col(plan, "SHIPMENTS_DC")
@@ -2229,19 +2228,20 @@ try:
                     + _sum_numeric_col(plan, "RUTAS_MLP_SDD_USADAS")
                     + _sum_numeric_col(plan, "RUTAS_MLP_SPOT_USADAS")
                     + _sum_numeric_col(plan, "RUTAS_MLP_BACKLOG_USADAS")
-                )
+                    )
 
-                spr_cap_result = ship_capacidad_total / max(rutas_cap_total, 1)
-                spr_cap_label  = f"{spr_cap_result:,.1f}"
+                    spr_cap_result = ship_capacidad_total / max(rutas_cap_total, 1)
+                    spr_cap_label  = f"{spr_cap_result:,.1f}"
 
-                # 5) Mostrar KPIs
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("SVCs", svcs_uniques)
-                c2.metric("Demanda ajustada", f"{dem_aj_total:,}")
-                c3.metric("Rutas (SPR base)", f"{rutas_base_total:,}")
-                c4.metric("Rutas faltantes", f"{rutas_falt_total:,}")
-                c5.metric("SPR (resultante capacidad)", spr_cap_label)
+                    # 5) Mostrar KPIs (sin "Rutas SPR base")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("SVCs", svcs_uniques)
+                    c2.metric("Demanda ajustada", f"{dem_aj_total:,}")
+                    c3.metric("Rutas faltantes", f"{rutas_falt_total:,}")
+                    c4.metric("SPR (resultante capacidad)", spr_cap_label)
 
+
+                
                 # 6) Mostrar tabla “arriba” (reconciliada)
                 st.dataframe(plan, use_container_width=True, hide_index=True)
 
