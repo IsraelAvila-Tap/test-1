@@ -1970,19 +1970,121 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
     detalle["Shipments"] = detalle["Shipments"].astype(int)
     return detalle
 
+def _to_num_series(s):
+    """Convierte serie con comas/% a numérico (NaN→0)."""
+    return pd.to_numeric(
+        pd.Series(s).astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False),
+        errors="coerce"
+    ).fillna(0)
+
+def reconcile_plan_with_detail(plan_df: pd.DataFrame, detalle_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Toma la tabla de arriba (plan_df) y el detalle (detalle_df),
+    y reemplaza en 'arriba' los SHIP_* por la suma del detalle.
+    Además muestra SPR resultantes = shipments / rutas.
+    No toca las rutas (las rutas son la “verdad” arriba).
+    """
+    if plan_df is None or plan_df.empty or detalle_df is None or detalle_df.empty:
+        return plan_df
+
+    df = plan_df.copy()
+
+    # --- extraemos totales de shipments del detalle por DM/SVC ---
+    det = detalle_df.copy()
+    det["Shipments"] = pd.to_numeric(det["Shipments"], errors="coerce").fillna(0)
+    det["Rutas"]     = pd.to_numeric(det["Rutas"], errors="coerce").fillna(0)
+    dm = det["DELIVERY_MOD"].astype(str)
+
+    ship_rent = det[dm.eq("Rentals")].groupby("SVC")["Shipments"].sum().rename("SHIP_RENTALS_DET")
+    ship_crow = det[dm.eq("CROWD")].groupby("SVC")["Shipments"].sum().rename("SHIP_CROWD_DET")
+    ship_mlp  = det[dm.isin(["MLP SDD","MLP SPOT","MLP BACKLOG"])].groupby("SVC")["Shipments"].sum().rename("SHIP_MLP_DET")
+    # (Opcional) DC/SP
+    ship_dc   = det[dm.eq("DC")].groupby("SVC")["Shipments"].sum().rename("SHIP_DC_DET")
+    ship_sp   = det[dm.eq("SP")].groupby("SVC")["Shipments"].sum().rename("SHIP_SP_DET")
+
+    # Mergear a la tabla de arriba
+    for ser in [ship_rent, ship_crow, ship_mlp, ship_dc, ship_sp]:
+        if not ser.empty:
+            df = df.merge(ser.reset_index(), on="SVC", how="left")
+
+    # --- columnas numéricas que usaremos como denominadores ---
+    rutas_r = _to_num_series(df.get("RUTAS_RENTALS", 0))
+    rutas_c = _to_num_series(df.get("RUTAS_CROWD_BASE", 0)) + _to_num_series(df.get("RUTAS_CROWD_ESCALADO", 0))
+    rutas_m = (
+        _to_num_series(df.get("RUTAS_MLP_SDD_USADAS", 0)) +
+        _to_num_series(df.get("RUTAS_MLP_SPOT_USADAS", 0)) +
+        _to_num_series(df.get("RUTAS_MLP_BACKLOG_USADAS", 0))
+    )
+
+    # backups de SPR objetivo (solo referencia)
+    if "SPR_RENTALS" in df.columns: df["SPR_RENTALS_OBJ"] = df["SPR_RENTALS"]
+    if "SPR_CROWD"   in df.columns: df["SPR_CROWD_OBJ"]   = df["SPR_CROWD"]
+    if "SPR_MLP"     in df.columns: df["SPR_MLP_OBJ"]     = df["SPR_MLP"]
+
+    # --- Reemplazar shipments “arriba” por los del detalle ---
+    df["SHIP_RENTALS"] = _to_num_series(df.get("SHIP_RENTALS", 0))
+    df["SHIP_CROWD"]   = _to_num_series(df.get("SHIP_CROWD", 0))
+    # DC/SP “arriba” pueden no existir; solo informativo si los quieres usar en KPIs
+    base_dc = _to_num_series(df.get("SHIPMENTS_DC", 0))
+    base_sp = _to_num_series(df.get("SHIPMENTS_SP", 0))
+
+    if "SHIP_RENTALS_DET" in df.columns:
+        df["SHIP_RENTALS"] = _to_num_series(df["SHIP_RENTALS_DET"])
+    if "SHIP_CROWD_DET" in df.columns:
+        df["SHIP_CROWD"] = _to_num_series(df["SHIP_CROWD_DET"])
+
+    ship_mlp_det = _to_num_series(df.get("SHIP_MLP_DET", 0))  # total MLP desde detalle
+
+    # --- SPR resultantes = shipments / rutas (evita división por 0) ---
+    def safe_div(num, den):
+        den = den.replace(0, np.nan)
+        out = (num / den).fillna(0)
+        return out
+
+    df["SPR_RENTALS"] = safe_div(_to_num_series(df["SHIP_RENTALS"]), rutas_r)
+    df["SPR_CROWD"]   = safe_div(_to_num_series(df["SHIP_CROWD"]), rutas_c)
+    if rutas_m.sum() > 0:
+        df["SPR_MLP"] = safe_div(ship_mlp_det, rutas_m)
+
+    # --- Recalcular KPIs de capacidad con shipments reconciliados ---
+    fcst = _to_num_series(df.get("FCST", 0))
+    cap_total = base_dc + base_sp + _to_num_series(df["SHIP_RENTALS"]) + _to_num_series(df["SHIP_CROWD"]) + ship_mlp_det
+    df["CAP_TOTAL"]   = cap_total
+    df["CAP_VS_FCST"] = (cap_total / fcst.replace(0, np.nan)).fillna(0).round(2)
+    df["CAP_DIFF_ABS"] = (fcst - cap_total).abs().round(2)
+    df["RIESGO"] = np.where(cap_total + 1e-9 >= fcst, "OK", "RIESGO")
+
+    # Limpiar columnas auxiliares
+    df.drop(columns=[c for c in ["SHIP_RENTALS_DET","SHIP_CROWD_DET","SHIP_MLP_DET","SHIP_DC_DET","SHIP_SP_DET"] if c in df.columns],
+            inplace=True, errors="ignore")
+
+    # Devolvemos con el mismo formato que la tabla 1 (llama a tu formateador)
+    return apply_output_adjustments(df)
+
 
 # -----------------------------------------------------------------------------
 # 6) UI
 # -----------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------
+# 6) UI
+# ---------------------------------------------------------------------
 st.set_page_config(page_title="Mel-IA — Plan táctico (diario por SVC)", layout="wide")
 
+# --- Sidebar: configuración del proyecto / credenciales / healthcheck ---
 st.sidebar.markdown("## 🗂️ Proyecto")
-raw_input = st.sidebar.text_input("SHEET_ID (puede ser URL o ID)", value=SHEET_ID or "", placeholder="pega aquí la URL o el ID del Sheet")
+raw_input = st.sidebar.text_input(
+    "SHEET_ID (puede ser URL o ID)",
+    value=SHEET_ID or "",
+    placeholder="pega aquí la URL o el ID del Sheet",
+)
 new_sheet_id = sanitize_sheet_id(raw_input)
 if new_sheet_id != SHEET_ID:
     SHEET_ID = new_sheet_id
     st.cache_data.clear()
     st.session_state["sheet_id"] = SHEET_ID
+
 if SHEET_ID:
     st.sidebar.markdown(f"**Sheet (ID):** `{SHEET_ID}`")
 else:
@@ -2004,16 +2106,22 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
         st.error("No se pudo validar acceso.")
         st.caption(str(e))
 
+# --- Controles principales ---
 st.title("Mel-IA — Plan táctico (diario por SVC)")
 
-spr_mode = st.radio("SPR objetivo", options=["promedio","peak","plan"], horizontal=True, index=0)
-spr_mode = spr_mode.strip().lower()  # 👈 normaliza
-
+spr_mode = st.radio(
+    "SPR objetivo",
+    options=["promedio", "peak", "plan"],
+    horizontal=True,
+    index=0,
+)
+spr_mode = spr_mode.strip().lower()  # normaliza
 
 run_btn = False
 auto_run = False
 sel_svcs: List[str] = []
 
+# --- Carga de opciones (SVCs disponibles) ---
 with st.expander("▶️ Cargando datos...", expanded=True):
     try:
         if not SHEET_ID:
@@ -2027,7 +2135,11 @@ with st.expander("▶️ Cargando datos...", expanded=True):
             rents_svcs   = load_rentals_caps_from_sheet()[["SVC"]]
             rent_fb_svcs = load_rentals_fallback()[["SVC"]]
             mlp_svcs     = load_mlp_caps_from_srm()[["SVC"]]
-            base_svcs = pd.concat([fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs, mlp_svcs], axis=0).drop_duplicates()
+
+            base_svcs = pd.concat(
+                [fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs, mlp_svcs],
+                axis=0
+            ).drop_duplicates()
             base_svcs = _as_str_cols(base_svcs, ["SVC"])
             svc_list = sorted(base_svcs["SVC"].dropna().astype(str).unique().tolist())
 
@@ -2039,15 +2151,18 @@ with st.expander("▶️ Cargando datos...", expanded=True):
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
 
+# --- Notas de la versión ---
 with st.expander("ℹ️ Notas de esta versión"):
     st.markdown(textwrap.dedent("""
     - Rentals desde **Rentals** (fuzzy en “Unidades dispon…”) con **SPR_RENTALS** ponderado; siempre se usa 100% antes de Crowd/MLP.
     - Crowd por % de **Capacity**: **CROWD_PCT**, **SHIP_OBJ_CROWD**, **SPR_CROWD**, base y escalado (E1).
     - **MLP** (SRM): se ignoran columnas **Total** y se suma por tipo de vehículo (**Large/Small/Car**) para **SDD** y **SPOT**.
       Se muestran columnas de desglose y se asignan rutas por prioridad **SDD → SPOT → Backlog**.
+    - **Reconciliación arriba↔abajo**: los *shipments* mostrados “arriba” se toman de la suma del detalle (abajo) y el **SPR mostrado**
+      es la **resultante** = *shipments / rutas*. Las **rutas** permanecen como la “verdad” de la tabla de arriba.
     """))
 
-# --- Helper para sumar columnas con números formateados ---
+# --- Helper para sumar columnas numéricas formateadas (para métricas) ---
 def _sum_numeric_col(df, col):
     s = (
         df[col].astype(str)
@@ -2056,38 +2171,49 @@ def _sum_numeric_col(df, col):
     )
     return int(pd.to_numeric(s, errors="coerce").fillna(0).sum())
 
-# --- Ejecución del plan ---
+# --- Auto-run (primer render) ---
 if 'auto_run_once' not in st.session_state:
     st.session_state['auto_run_once'] = True
     auto_run = True
 else:
     auto_run = False
 
+# --- Orquestación: plan base → detalle → reconciliar → mostrar ---
 try:
     if run_btn or auto_run:
         if not SHEET_ID:
             st.warning("Proporciona `SHEET_ID` para calcular.")
         else:
-            plan = compute_plan(spr_mode, sel_svcs or DEFAULT_SVCS)
-            if plan.empty:
+            # 1) Calcula plan base (objetivo)
+            plan_base = compute_plan(spr_mode, sel_svcs or DEFAULT_SVCS)
+
+            if plan_base.empty:
                 st.warning("No hay datos para mostrar con los filtros seleccionados.")
             else:
+                # 2) Detalle por vehículo (usa rutas “arriba” y SPR por DM/vehículo)
+                try:
+                    detalles = expand_to_vehicle_level(plan_base, spr_mode)
+                except Exception as e:
+                    st.error("No se pudo construir el detalle por vehículo.")
+                    show_exception(e, "Detalle vehículo (traceback)")
+                    detalles = pd.DataFrame(columns=["DELIVERY_MOD","FECHA","SVC","SHP_LG_VEHICLE_TYPE","SPR","Rutas","Shipments"])
+
+                # 3) Reconciliación: shipments de abajo → arriba; SPR resultante arriba
+                plan = reconcile_plan_with_detail(plan_base, detalles)
+
+                # 4) KPIs header basados en el plan reconciliado
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("SVCs", plan["SVC"].nunique())
                 c2.metric("Demanda ajustada", f"{_sum_numeric_col(plan, 'DEMANDA_AJUSTADA'):,}")
                 c3.metric("Rutas (SPR base)", f"{_sum_numeric_col(plan, 'RUTAS_SPR_BASE'):,}")
                 c4.metric("Rutas faltantes", f"{_sum_numeric_col(plan, 'RUTAS_FALTANTES'):,}")
 
+                # 5) Mostrar tabla “arriba” (reconciliada)
                 st.dataframe(plan, use_container_width=True, hide_index=True)
 
-                # --- Detalle por vehículo debajo del plan ---
-                try:
-                    detalles = expand_to_vehicle_level(plan, spr_mode)
-                    st.markdown("### Detalle por vehículo – SVC – día")
-                    st.dataframe(detalles, use_container_width=True, hide_index=True)
-                except Exception as e:
-                    st.error("No se pudo construir el detalle por vehículo.")
-                    show_exception(e, "Detalle vehículo (traceback)")
+                # 6) Mostrar detalle
+                st.markdown("### Detalle por vehículo – SVC – día")
+                st.dataframe(detalles, use_container_width=True, hide_index=True)
 
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
