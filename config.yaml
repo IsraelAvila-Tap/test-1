@@ -3,3 +3,11 @@ projects:
     title: "Plan táctico"
     description: "Copiloto de tu flota en Mercado Libre"
     sheet_id: "1UBjU3-ftGCow3EzTD0NB6UaYwMUYUARbn9QjD7SlxtY"
+
+# .streamlit/config.toml
+[theme]
+primaryColor = "#2D3277"            # Azul MELI
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F6F7FB"
+textColor = "#111827"
+font = "sans serif"
