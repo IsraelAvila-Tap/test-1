@@ -2366,20 +2366,6 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
         st.error("No se pudo validar acceso.")
         st.caption(str(e))
 
-# --- Controles principales ---
-
-# ---------------------------------------------------------
-# Encabezado fijo y compacto (reemplaza al bloque con st.columns)
-# ---------------------------------------------------------
-render_fixed_header(
-    logo_img=LOGO_IMAGE,
-    title="Mel-IA — Plan táctico (diario por SVC)",
-    subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
-    header_h=int(st.session_state.get("header_h", 72)),
-    logo_h=int(st.session_state.get("logo_h", 44)),
-)
-
-
 
 spr_mode = st.radio(
     "SPR objetivo",
