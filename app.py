@@ -26,6 +26,37 @@ SERVICE_EMAIL = "planificacion@planificacion.iam.gserviceaccount.com"
 DEFAULT_SVCS = ["SGD1", "SMT1", "SMX9", "SPB1"]
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1UBjU3-ftGCow3EzTD0NB6UaYwMUYUARbn9QjD7SlxtY/edit?gid=148917403#gid=148917403"
 
+# ---------------------------------------------------------------------
+# Branding: Logo y encabezado de la app
+# ---------------------------------------------------------------------
+from PIL import Image
+
+logo_path = "20250813_1028_Camión Futurista Amarillo_remix_01k2j40zxfp0te4vpq1kq1wnv.png"  # usa el nombre exacto de tu archivo en el repo
+
+try:
+    logo = Image.open(logo_path)
+
+    col1, col2 = st.columns([1,4])
+    with col1:
+        st.image(logo, width=100)
+    with col2:
+        st.markdown(
+            """
+            <div style="padding-top:20px;">
+                <h1 style="margin-bottom:0;">Mel-IA Ops</h1>
+                <p style="margin-top:0; font-size:16px; color:gray;">
+                    Copiloto de planificación táctica de flota 🚛🤖
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+except Exception as e:
+    st.warning("⚠️ No se pudo cargar el logo, revisa la ruta del archivo.")
+    st.error(e)
+
+
+
 def sanitize_sheet_id(text: str | None) -> str | None:
     if not text: return None
     text = text.strip()
