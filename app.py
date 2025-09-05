@@ -2376,7 +2376,7 @@ with st.sidebar.expander("🎨 Apariencia", expanded=False):
     st.session_state["logo_h"]   = int(logo_h)
 
 # La barra debe ser al menos tan alta como el logo
-final_header_h = max(int(st.session_state["header_h"]), int(st.session_state["logo_h"]) + 1)
+final_header_h = max(int(st.session_state["header_h"]), int(st.session_state["logo_h"]) -5)
 
 render_fixed_header(
     logo_img=LOGO_IMAGE,
