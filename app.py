@@ -2330,13 +2330,15 @@ with st.sidebar.expander("🎨 Apariencia", expanded=False):
 
 ##Header
 
+# Header (usa los valores elegidos en el panel 🎨)
 render_fixed_header(
     logo_img=LOGO_IMAGE,
     title="Mel-IA — Plan táctico (diario por SVC)",
     subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
-    header_h=96,   # altura total de la barra
-    logo_h=76,     # altura del logo (casi llena la barra)
+    header_h=header_h,   # ← del slider
+    logo_h=logo_h,       # ← del slider
 )
+
 
 
 
