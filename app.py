@@ -134,7 +134,7 @@ def render_fixed_header(
     title="Mel-IA (Copiloto de tu flota en Mercado Libre)",
     subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
     header_h=104,     # altura total de la barra
-    logo_h=500,       # altura del logo dentro de la barra
+    logo_h=800,       # altura del logo dentro de la barra
 ):
     import io, base64
 
