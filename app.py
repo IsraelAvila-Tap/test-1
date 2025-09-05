@@ -2328,6 +2328,15 @@ with st.sidebar.expander("🎨 Apariencia", expanded=False):
     st.session_state["header_h"] = int(header_h)
     st.session_state["logo_h"]   = int(logo_h)
 
+##Header
+
+render_fixed_header(
+    logo_img=LOGO_IMAGE,
+    title="Mel-IA — Plan táctico (diario por SVC)",
+    subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
+    header_h=96,   # altura total de la barra
+    logo_h=76,     # altura del logo (casi llena la barra)
+)
 
 
 
