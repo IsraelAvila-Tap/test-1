@@ -1588,29 +1588,50 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
 
     # ----------------- SPR por Delivery Model (según modo) -----------------
   
-        # ----------------- SPR por Delivery Model (según modo) -----------------
-    # 1) Selección por modo (promedio/peak/plan) desde la pestaña SPR
-    dm_sel = load_spr_dm_by_mode(hoy, spr_mode)  # -> SVC, SPR_RENTALS_SEL, SPR_CROWD_SEL, SPR_MLP_SEL
+     # Garantiza existencia de columnas de stats
+    for c in [
+        "SPR_RENTALS_PROM4","SPR_RENTALS_P95_4","SPR_RENTALS_PROM","SPR_RENTALS_PEAK",
+        "SPR_CROWD_PROM4","SPR_CROWD_P95_4","SPR_CROWD_PROM","SPR_CROWD_PEAK",
+        "SPR_MLP_PROM4","SPR_MLP_P95_4","SPR_MLP_PROM","SPR_MLP_PEAK",
+    ]:
+        if spr_stats_dm.empty or c not in spr_stats_dm.columns:
+            # se crearán como NaN y luego habrá fallback
+            pass
+    if not spr_stats_dm.empty:
+        out = safe_merge(out, spr_stats_dm, ["SVC"])
 
-    # 2) Une sin provocar sufijos _x/_y
-    if not dm_sel.empty:
-        out = safe_merge(out, dm_sel, ["SVC"])
+    # Merge plan SPR de Capacity (día) si existe
+    if not plan_spr_cap.empty:
+        out = safe_merge(out, plan_spr_cap, ["SVC"])
 
-    # 3) Asegura columnas necesarias
-    out = ensure_columns(out, {
-        "SPR_RENTALS": np.nan, "SPR_CROWD": np.nan, "SPR_MLP": np.nan,
-        "SPR_RENTALS_SEL": np.nan, "SPR_CROWD_SEL": np.nan, "SPR_MLP_SEL": np.nan,
-    })
-
-    # 4) Si hay *_SEL úsalo; si no, conserva lo existente y, si sigue vacío, cae a SPR_USADO
-    def _pick(sel_col: str, final_col: str):
-        sel  = pd.to_numeric(out[sel_col],  errors="coerce")
-        base = pd.to_numeric(out[final_col], errors="coerce")
-        out[final_col] = sel.combine_first(base).fillna(out["SPR_USADO"]).clip(lower=1)
-
-    _pick("SPR_RENTALS_SEL", "SPR_RENTALS")
-    _pick("SPR_CROWD_SEL",   "SPR_CROWD")
-    _pick("SPR_MLP_SEL",     "SPR_MLP")
+    def pick_dm(prom4, p95_4, prom, peak, plan_cap, plan_sheet):
+        """
+        Selecciona el SPR final para un DM con fallbacks.
+        - promedio: PROM4 -> PROM -> SPR_USADO
+        - peak:     P95_4 -> PEAK -> PROM -> SPR_USADO
+        - plan:     plan_cap -> plan_sheet -> PROM4 -> PROM -> SPR_USADO
+        """
+        if spr_mode == "promedio":
+            s = out.get(prom4)
+            if s is None:
+                s = out.get(prom)
+            return pd.to_numeric(s, errors="coerce")
+        elif spr_mode == "peak":
+            s = out.get(p95_4)
+            if s is None:
+                s = out.get(peak)
+            if s is None:
+                s = out.get(prom)
+            return pd.to_numeric(s, errors="coerce")
+        else:  # plan
+            s = out.get(plan_cap)  # desde Capacity del día
+            if s is None or pd.isna(s).all():
+                s = out.get(plan_sheet)  # valor “plan” que ya tengas en sheet por DM (si aplica)
+            if s is None or pd.isna(s).all():
+                s = out.get(prom4)
+            if s is None or pd.isna(s).all():
+                s = out.get(prom)
+            return pd.to_numeric(s, errors="coerce")
     
 
 
@@ -2352,8 +2373,8 @@ render_fixed_header(
 
 def render_fixed_header(
     logo_img=None,
-    title="Mel-IA — Plan táctico (diario por SVC)",
-    subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
+    title="Mel-IA Ops — Plan táctico (diario por SVC)",
+    subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP • SP • DC",
     header_h=104,
     logo_h=500,
 ):
