@@ -2181,27 +2181,45 @@ else:
 
 # --- Orquestación: plan base → detalle → reconciliar → mostrar ---
 try:
-    if run_btn or auto_run:
+    # --- Orquestación: plan base → detalle → reconciliar → mostrar ---
+try:
+    # ✅ Clave: además de run_btn/auto_run, muestra el último plan guardado en session_state
+    if run_btn or auto_run or ("plan_df" in st.session_state and st.session_state["plan_df"] is not None):
         if not SHEET_ID:
             st.warning("Proporciona `SHEET_ID` para calcular.")
         else:
-            # 1) Calcula plan base (objetivo)
-            plan_base = compute_plan(spr_mode, sel_svcs or DEFAULT_SVCS)
+            # Si se presionó Calcular (o es el primer render), recalculamos y PERSISTIMOS
+            if run_btn or auto_run:
+                # 1) Calcula plan base (objetivo)
+                plan_base = compute_plan(spr_mode, sel_svcs or DEFAULT_SVCS)
 
-            if plan_base.empty:
-                st.warning("No hay datos para mostrar con los filtros seleccionados.")
+                if plan_base.empty:
+                    st.warning("No hay datos para mostrar con los filtros seleccionados.")
+                    st.session_state["plan_df"] = None
+                    st.session_state["detalles_df"] = None
+                else:
+                    # 2) Detalle por vehículo (usa rutas “arriba” y SPR por DM/vehículo)
+                    try:
+                        detalles = expand_to_vehicle_level(plan_base, spr_mode)
+                    except Exception as e:
+                        st.error("No se pudo construir el detalle por vehículo.")
+                        show_exception(e, "Detalle vehículo (traceback)")
+                        detalles = pd.DataFrame(columns=["DELIVERY_MOD","FECHA","SVC","SHP_LG_VEHICLE_TYPE","SPR","Rutas","Shipments"])
+
+                    # 3) Reconciliación: shipments de abajo → arriba; SPR resultante arriba
+                    plan = reconcile_plan_with_detail(plan_base, detalles)
+
+                    # ✅ NUEVO: persistir para que el chat y los reruns lo usen
+                    st.session_state["plan_df"] = plan.copy()
+                    st.session_state["detalles_df"] = detalles.copy()
+
+            # ---- Mostrar siempre lo último disponible (aunque este run no haya recalculado)
+            plan = st.session_state.get("plan_df")
+            detalles = st.session_state.get("detalles_df")
+
+            if plan is None or plan.empty:
+                st.warning("No hay datos para mostrar. Calcula el plan.")
             else:
-                # 2) Detalle por vehículo (usa rutas “arriba” y SPR por DM/vehículo)
-                try:
-                    detalles = expand_to_vehicle_level(plan_base, spr_mode)
-                except Exception as e:
-                    st.error("No se pudo construir el detalle por vehículo.")
-                    show_exception(e, "Detalle vehículo (traceback)")
-                    detalles = pd.DataFrame(columns=["DELIVERY_MOD","FECHA","SVC","SHP_LG_VEHICLE_TYPE","SPR","Rutas","Shipments"])
-
-                # 3) Reconciliación: shipments de abajo → arriba; SPR resultante arriba
-                plan = reconcile_plan_with_detail(plan_base, detalles)
-
                 # 4) KPIs header basados en el plan reconciliado
                 svcs_uniques = plan["SVC"].nunique()
 
@@ -2240,8 +2258,6 @@ try:
                 c3.metric("Rutas faltantes", f"{rutas_falt_total:,}")
                 c4.metric("SPR (resultante capacidad)", spr_cap_label)
 
-
-                
                 # 6) Mostrar tabla “arriba” (reconciliada)
                 st.dataframe(plan, use_container_width=True, hide_index=True)
 
@@ -2292,6 +2308,11 @@ detalles = st.session_state.get("detalles_df")  # DataFrame de la tabla de abajo
 # --- UI DEL CHAT ---
 st.markdown("## 🤖 Pregunta a Mel-IA sobre tus datos")
 st.caption("Puedes preguntarle a Mel-IA sobre los datos del plan, riesgos, spr, mlps, etc.")
+
+# Si no hay plan persistido, avisa (evita consultas vacías)
+if not st.session_state.get("plan_df") is not None:
+    st.info("Primero calcula el plan (botón 'Calcular plan') para que el chat tenga contexto.")
+
 
 # Historial persistente del chat
 if "chat_history" not in st.session_state:
