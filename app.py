@@ -2253,87 +2253,103 @@ except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
     show_exception(e, "Traceback completo")
 
-# ===================== Chat Mel-IA sobre tus datos =====================
+# =========================
+# 🤖 Chat Mel-IA (Bloque B)
+# =========================
 import os, textwrap
 import streamlit as st
-import pandas as pd
-import numpy as np
 
-st.markdown("## 🤖 Pregunta a Mel-IA sobre tus datos")
-
-# Asegura que la API key esté en el entorno (si la guardaste en st.secrets)
-if "OPENAI_API_KEY" in st.secrets and not os.environ.get("OPENAI_API_KEY"):
-     os.environ["OPENAI_API_KEY"] = st.secrets["openai"]["api_key"]
-
+# --- IMPORT & CLIENTE OPENAI ROBUSTO ---
 try:
     from openai import OpenAI
-    client = OpenAI()
-    openai_ok = True
-except Exception as _e:
-    openai_ok = False
-    st.info(
-        "Puedes preguntarle a Mel-IA sobre los datos del plan, riesgos, spr, mlps, etc."
-    )
+    _openai_ok = True
+except Exception:
+    _openai_ok = False
+    OpenAI = None  # evita NameError
 
-# Historial simple en sesión
+client = None
+if _openai_ok:
+    api_key = (
+        st.secrets.get("openai", {}).get("api_key") or
+        st.secrets.get("OPENAI_API_KEY") or
+        os.environ.get("OPENAI_API_KEY")
+    )
+    try:
+        if api_key:
+            os.environ["OPENAI_API_KEY"] = api_key  # el SDK la toma del env
+        client = OpenAI()
+    except Exception as e:
+        client = None
+        st.info(f"El chat no está disponible (OpenAI client): {e}")
+else:
+    st.info("El chat no está disponible porque falta el paquete 'openai'.")
+
+# --- ASEGURA PERSISTENCIA DE RESULTADOS DEL PLAN ---
+# (Si en otra parte ya guardas estos dfs en session_state, puedes omitir este bloque)
+plan = st.session_state.get("plan_df")   # DataFrame de la tabla de arriba
+detalles = st.session_state.get("detalles_df")  # DataFrame de la tabla de abajo
+
+# --- UI DEL CHAT ---
+st.markdown("## 🤖 Pregunta a Mel-IA sobre tus datos")
+st.caption("Puedes preguntarle a Mel-IA sobre los datos del plan, riesgos, spr, mlps, etc.")
+
+# Historial persistente del chat
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# Entrada de usuario
-colq1, colq2 = st.columns([1, 0.15])
-with colq1:
-    user_q = st.text_input("Escribe tu pregunta (ej. “¿cuántas rutas rentals en SGD1?”)")
-with colq2:
-    ask = st.button("Preguntar", type="primary", use_container_width=True)
+# Aísla el input en un formulario para evitar reruns al teclear/Enter
+with st.form("qa_form", clear_on_submit=False):
+    user_q = st.text_input(
+        "Escribe tu pregunta (ej. “¿cuántas rutas rentals en SGD1?”)",
+        key="user_q",
+        placeholder="Pregunta sobre tus datos…"
+    )
+    ask = st.form_submit_button("Preguntar")
 
-def _df_to_context(name: str, df: pd.DataFrame, limit_rows: int = 250) -> str:
-    if df is None or df.empty:
-        return f"{name}: (vacío)\n"
-    # recortamos columnas con strings muy largos y filas para no saturar el prompt
-    df2 = df.copy()
-    for c in df2.columns:
-        if df2[c].dtype == object:
-            df2[c] = df2[c].astype(str).str.slice(0, 80)
-    return f"{name} (primeras {min(len(df2), limit_rows)} filas):\n" + \
-           df2.head(limit_rows).to_csv(index=False)
-
-if ask and user_q:
-    if not openai_ok:
-        st.error("El chat no está disponible porque falta el paquete `openai`.")
+if ask:
+    if not client:
+        st.error("El chat no está disponible (cliente OpenAI no inicializado o paquete faltante).")
+    elif not user_q.strip():
+        st.warning("Escribe una pregunta.")
     else:
-        # Prepara contexto compacto desde tus tablas
+        # Construye contexto desde los dataframes persistidos
         context_parts = []
-        try:
-            context_parts.append(_df_to_context("Tabla plan (arriba)", plan, 250))
-        except Exception:
+        def _df_to_context(title, df, n=150):
+            try:
+                return f"{title}:\n" + df.head(n).to_csv(index=False)
+            except Exception:
+                return f"{title}: (no disponible)\n"
+
+        if plan is not None and hasattr(plan, "empty") and not plan.empty:
+            context_parts.append(_df_to_context("Tabla plan (arriba)", plan, 200))
+        else:
             context_parts.append("Tabla plan (arriba): (no disponible)\n")
-        try:
+
+        if detalles is not None and hasattr(detalles, "empty") and not detalles.empty:
             context_parts.append(_df_to_context("Tabla detalle (abajo)", detalles, 250))
-        except Exception:
+        else:
             context_parts.append("Tabla detalle (abajo): (no disponible)\n")
 
-###
         system_msg = (
             "Eres un analista de planeación táctica. Responde en español, "
             "claro y conciso. Si haces cálculos, muéstralos. "
             "Usa solo el contexto provisto; si algo no está en los datos, dilo."
         )
-
-        # ⚠️ Precomputamos el bloque de contexto para no usar backslash en una f-string
         context_block = "\n".join(context_parts)
 
+        # OJO: nada de backslashes dentro de { } en f-strings
         user_prompt = textwrap.dedent(
             f"""CONTEXTO:
-        {context_block}
+{context_block}
 
-        PREGUNTA:
-        {user_q}
-        """
+PREGUNTA:
+{user_q}
+"""
         )
 
         try:
             resp = client.chat.completions.create(
-                model="gpt-4o-mini",  # o el modelo que tengas habilitado
+                model="gpt-4o-mini",   # usa el modelo que tengas habilitado
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_prompt},
@@ -2346,10 +2362,9 @@ if ask and user_q:
         except Exception as e:
             st.error(f"No se pudo obtener respuesta: {e}")
 
-
-# Muestra historial
+# --- Mostrar historial (no dispara recalculos del plan) ---
 if st.session_state.chat_history:
-    st.divider()
-    for q, a in st.session_state.chat_history[::-1]:
-        st.markdown(f"**Tú:** {q}")
-        st.markdown(f"**Mel-IA:** {a}")
+    st.write("---")
+    for i, (q, a) in enumerate(st.session_state.chat_history, 1):
+        st.markdown(f"**Q{i}:** {q}")
+        st.markdown(f"**A{i}:** {a}")
