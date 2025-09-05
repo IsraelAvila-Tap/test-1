@@ -96,9 +96,29 @@ def autocrop_whitespace(img: Image.Image) -> Image.Image:
     except Exception:
         return img
 
+# Quita fondo blanco (o casi blanco) -> lo vuelve transparente
+def white_to_alpha(img: Image.Image, threshold: int = 245) -> Image.Image:
+    """Convierte a RGBA y pone alpha=0 donde R,G,B >= threshold (blancos/near-white)."""
+    try:
+        import numpy as np
+        if img.mode != "RGBA":
+            img = img.convert("RGBA")
+        arr = np.array(img)
+        r, g, b, a = arr[...,0], arr[...,1], arr[...,2], arr[...,3]
+        mask = (r >= threshold) & (g >= threshold) & (b >= threshold)
+        arr[mask, 3] = 0  # vuelve transparentes los blancos
+        return Image.fromarray(arr, mode="RGBA")
+    except Exception:
+        # Fallback sin romper la app
+        return img
+
+
 # Después de abrir el logo:
 if LOGO_IMAGE is not None:
     LOGO_IMAGE = autocrop_whitespace(LOGO_IMAGE)
+    # ← limpia el fondo blanco; sube/baja el umbral si hace falta
+    LOGO_IMAGE = white_to_alpha(LOGO_IMAGE, threshold=245)
+
 
 
 def sanitize_sheet_id(text: str | None) -> str | None:
