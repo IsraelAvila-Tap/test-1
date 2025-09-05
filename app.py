@@ -2303,13 +2303,11 @@ LOGO_WIDTH = int(st.session_state["logo_width"])
 
 
 with st.sidebar.expander("🎨 Apariencia", expanded=False):
-    LOGO_WIDTH = st.slider(
-        "Tamaño del logo (px)",
-        64, 240,
-        int(st.session_state.get("logo_width", DEFAULT_LOGO_WIDTH)),
-        step=4
-    )
-    st.session_state["logo_width"] = int(LOGO_WIDTH)
+    # altura del header (logo y contenedor)
+    DEFAULT_HEADER_H = int(st.session_state.get("header_height", 64))
+    HEADER_H = st.slider("Altura del encabezado (px)", 48, 96, DEFAULT_HEADER_H, step=2)
+    st.session_state["header_height"] = int(HEADER_H)
+
 
 
 
@@ -2351,27 +2349,15 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
 # --- Controles principales ---
 
 # ---------------------------------------------------------
-# Encabezado con logo (si existe) + título/subtítulo
+# Encabezado fijo y compacto (reemplaza al bloque con st.columns)
 # ---------------------------------------------------------
-col_logo, col_title = st.columns([1, 5])
-with col_logo:
-    if LOGO_IMAGE is not None:
-        st.image(LOGO_IMAGE, width=160)
-    else:
-        st.markdown("<div style='font-size:48px;'>🚛</div>", unsafe_allow_html=True)
+render_sticky_header(
+    logo_img=LOGO_IMAGE,
+    title="Mel-IA — Plan táctico (diario por SVC)",
+    subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
+    height_px=int(st.session_state.get("header_height", 56))  # 56 por defecto
+)
 
-with col_title:
-    st.markdown(
-        """
-        <div style="padding-top:8px;">
-            <h1 style="margin:0;">Mel-IA — Plan táctico (Copiloto de tu flota en Mercado Libre)</h1>
-            <div style="color:#6b7280; margin-top:4px;">
-                Copiloto de planificación táctica de flota • Rentals • Crowd • MLP
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 spr_mode = st.radio(
