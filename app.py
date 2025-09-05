@@ -2171,7 +2171,7 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
 col_logo, col_title = st.columns([1, 5])
 with col_logo:
     if LOGO_IMAGE is not None:
-        st.image(LOGO_IMAGE, width=96)
+        st.image(LOGO_IMAGE, width=160)
     else:
         st.markdown("<div style='font-size:48px;'>🚛</div>", unsafe_allow_html=True)
 
