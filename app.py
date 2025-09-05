@@ -131,7 +131,7 @@ SHEET_TABS = {
 # ---------------------------------------------------------
 def render_fixed_header(
     logo_img=None,
-    title="Mel-IA — Plan táctico (diario por SVC)",
+    title="Mel-IA — Plan táctico (Copiloto de tu flota en Mercado Libre)",
     subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
     header_h=104,     # altura total de la barra
     logo_h=500,       # altura del logo dentro de la barra
@@ -2355,15 +2355,99 @@ with st.sidebar.expander("🎨 Apariencia", expanded=False):
     st.session_state["logo_h"]   = int(logo_h)
 
 # Header: que la barra nunca sea menor que el logo (+margen)
-final_header_h = max(int(st.session_state["header_h"]), int(st.session_state["logo_h"]) + 16)
-
+final_header_h = max(int(st.session_state["header_h"]), int(st.session_state["logo_h"]) + 20)
 render_fixed_header(
     logo_img=LOGO_IMAGE,
+    header_h=final_header_h,
+    logo_h=int(st.session_state["logo_h"]),
+)
+
+
+def render_fixed_header(
+    logo_img=None,
     title="Mel-IA — Plan táctico (diario por SVC)",
     subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
-    header_h=final_header_h,      # ← altura efectiva de la barra
-    logo_h=int(st.session_state["logo_h"]),  # ← tamaño real del logo
-)
+    header_h=104,
+    logo_h=500,
+):
+    import io, base64
+    def _img_to_b64(img):
+        buf = io.BytesIO()
+        try:
+            img.save(buf, format="PNG")
+        except Exception:
+            img = img.convert("RGBA")
+            img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    if logo_img is not None:
+        try:
+            b64 = _img_to_b64(logo_img)
+            # estilo inline con !important por si hay reglas globales
+            logo_html = (
+                f'<img src="data:image/png;base64,{b64}" alt="logo" '
+                f'style="height:{int(logo_h)}px !important; '
+                f'width:auto !important; max-height:none !important; '
+                f'max-width:none !important; display:block;" />'
+            )
+        except Exception:
+            logo_html = f'<div style="font-size:{int(logo_h)}px; line-height:{int(logo_h)}px;">🚛</div>'
+    else:
+        logo_html = f'<div style="font-size:{int(logo_h)}px; line-height:{int(logo_h)}px;">🚛</div>'
+
+    st.markdown(
+        f"""
+        <style>
+          :root {{
+            --meli-header-h: {int(header_h)}px;
+            --meli-logo-h: {int(logo_h)}px;
+          }}
+
+          .meli-fixed {{
+            position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+            background: #fff; height: var(--meli-header-h);
+            border-bottom: 1px solid rgba(0,0,0,.06);
+            box-shadow: 0 1px 6px rgba(0,0,0,.04);
+            overflow: visible; /* por si el navegador quisiera recortar */
+          }}
+          .meli-wrap {{
+            max-width: 1200px; margin: 0 auto;
+            height: 100%;
+            display: grid; grid-template-columns: auto 1fr;
+            align-items: center; gap: 14px; padding: 6px 12px;
+          }}
+
+          /* Mata cualquier límite global de imágenes dentro del header */
+          .meli-logo img {{
+            height: var(--meli-logo-h) !important;
+            width: auto !important;
+            max-height: none !important;
+            max-width: none !important;
+            display: block;
+            image-rendering: crisp-edges;
+          }}
+
+          .meli-title {{ margin: 0; font-size: 32px; line-height: 1.15; font-weight: 800; }}
+          .meli-sub {{ margin: 2px 0 0 0; color: #6b7280; font-size: 13px; }}
+
+          /* Quita header nativo y compensa offset del main */
+          [data-testid="stHeader"] {{ display: none; }}
+          .block-container {{ padding-top: calc(var(--meli-header-h) + 12px) !important; }}
+        </style>
+
+        <div class="meli-fixed">
+          <div class="meli-wrap">
+            <div class="meli-logo">{logo_html}</div>
+            <div>
+              <h1 class="meli-title">{title}</h1>
+              <div class="meli-sub">{subtitle}</div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 
 
