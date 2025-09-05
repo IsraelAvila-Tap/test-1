@@ -2348,7 +2348,7 @@ st.set_page_config(
 inject_brand_css()  # ← ACTIVA los estilos de marca
 
 # --- Tamaño del logo: default + persistencia ---
-DEFAULT_LOGO_WIDTH = 160
+DEFAULT_LOGO_WIDTH = 200
 try:
     DEFAULT_LOGO_WIDTH = int(
         st.secrets.get("LOGO_WIDTH", os.environ.get("LOGO_WIDTH", DEFAULT_LOGO_WIDTH))
@@ -2364,7 +2364,7 @@ LOGO_WIDTH = int(st.session_state["logo_width"])
 
 with st.sidebar.expander("🎨 Apariencia", expanded=False):
     _def_h = int(st.session_state.get("header_h", 96))
-    _def_l = int(st.session_state.get("logo_h", 160))
+    _def_l = int(st.session_state.get("logo_h", 200))
 
     header_h = st.slider("Altura barra (px)", 64, 1200, _def_h, step=2)
     # ↑ también amplié el máximo por si quieres una barra muy alta
