@@ -2328,7 +2328,7 @@ st.set_page_config(
 inject_brand_css()  # ← ACTIVA los estilos de marca
 
 # --- Tamaño del logo: default + persistencia ---
-DEFAULT_LOGO_WIDTH = 120
+DEFAULT_LOGO_WIDTH = 240
 try:
     DEFAULT_LOGO_WIDTH = int(
         st.secrets.get("LOGO_WIDTH", os.environ.get("LOGO_WIDTH", DEFAULT_LOGO_WIDTH))
