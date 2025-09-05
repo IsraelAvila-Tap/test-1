@@ -2114,19 +2114,121 @@ def reconcile_plan_with_detail(plan_df: pd.DataFrame, detalle_df: pd.DataFrame) 
     return apply_output_adjustments(df)
 
 
+
+
 # -----------------------------------------------------------------------------
 # 6) UI
 # -----------------------------------------------------------------------------
 
+# ---------------------------------------------------------
+# Estilos de marca MELI para Streamlit
+# ---------------------------------------------------------
+def inject_brand_css(
+    yellow="#FFE600",   # Amarillo MELI
+    blue="#2D3277",     # Azul MELI
+    soft="#F6F7FB",     # Fondo suave de tarjetas
+    text="#111827"      # Texto principal
+):
+    st.markdown(
+        f"""
+        <style>
+        :root {{
+          --meli-yellow: {yellow};
+          --meli-blue: {blue};
+          --meli-soft: {soft};
+          --meli-text: {text};
+        }}
+
+        /* Header transparente (solo deja tu título) */
+        [data-testid="stHeader"] {{ background: transparent; }}
+
+        /* Botón primario */
+        .stButton>button {{
+          background: var(--meli-blue) !important;
+          color: #fff !important;
+          border: 0 !important;
+          border-radius: 12px !important;
+          padding: 0.55rem 1.0rem !important;
+          box-shadow: 0 2px 10px rgba(0,0,0,.06);
+        }}
+        .stButton>button:hover {{ filter: brightness(1.06); }}
+
+        /* Radio / checkbox con color de acento */
+        input[type="radio"], input[type="checkbox"] {{ accent-color: var(--meli-blue); }}
+
+        /* Chips del multiselect */
+        div[data-baseweb="tag"] {{
+          background: var(--meli-yellow) !important;
+          color: #111827 !important;
+          border-radius: 10px !important;
+          border: 0 !important;
+        }}
+
+        /* Métricas (st.metric) como tarjetas */
+        div[data-testid="stMetric"] {{
+          background: var(--meli-soft);
+          border: 1px solid rgba(0,0,0,.06);
+          border-radius: 14px;
+          padding: 10px 14px;
+        }}
+        div[data-testid="stMetric"] label p {{
+          color: var(--meli-blue) !important;
+          font-weight: 700 !important;
+        }}
+
+        /* Expanders más limpios */
+        details>summary {{
+          background: var(--meli-soft);
+          border-radius: 10px;
+          padding: 6px 10px;
+        }}
+
+        /* DataFrame: cabecera azul, filas zebra suaves */
+        .stDataFrame table thead tr th {{
+          background: var(--meli-blue) !important;
+          color: #fff !important;
+        }}
+        .stDataFrame tbody tr:nth-child(odd) {{
+          background: rgba(0,0,0,.015);
+        }}
+
+        /* Links del título */
+        h1, h2, h3 {{ color: var(--meli-text); }}
+        a {{ color: var(--meli-blue); }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# Opcional: helper para “vista bonita” estática con pandas Styler
+def render_pretty_table(df, caption=None):
+    if df is None or df.empty:
+        st.info("Sin datos para mostrar.")
+        return
+    # Si tus números vienen con comas/%, los dejamos como están (solo pintamos riesgo)
+    cols = [c for c in df.columns if c.upper() == "RIESGO"]
+    def color_riesgo(row):
+        return [("background-color: #FFE1E1; color:#B00020;" if str(v).upper()=="RIESGO" else "") for v in row]
+    sty = (df.style
+        .apply(color_riesgo, axis=1)
+        .hide(axis="index"))
+    if caption:
+        st.caption(caption)
+    st.table(sty)
 
 # ---------------------------------------------------------------------
 # 6) UI
 # ---------------------------------------------------------------------
 st.set_page_config(
-    page_title="Mel-IA — Plan táctico (copiloto de la flota en Mercado Libre)",
+    page_title="Mel-IA — Plan táctico (Copiloto de tu flota en Mercado Libre)",
     layout="wide",
     page_icon=LOGO_IMAGE if LOGO_IMAGE is not None else "🚛"
 )
+inject_brand_css()  # ← ACTIVA los estilos de marca
+
+with st.sidebar.expander("🎨 Apariencia", expanded=False):
+    LOGO_WIDTH = st.slider("Tamaño del logo (px)", 64, 240, LOGO_WIDTH, step=4)
+
 
 
 # --- Sidebar: configuración del proyecto / credenciales / healthcheck ---
