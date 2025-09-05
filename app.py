@@ -134,7 +134,7 @@ def render_fixed_header(
     title="Mel-IA — Plan táctico (diario por SVC)",
     subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
     header_h=104,     # altura total de la barra
-    logo_h=300,       # altura del logo dentro de la barra
+    logo_h=500,       # altura del logo dentro de la barra
 ):
     import io, base64
 
