@@ -164,6 +164,84 @@ SHEET_TABS = {
     "srm":      "SRM",     # <--- NUEVO (capacidad MLP)
 }
 
+# ---------------------------------------------------------
+# Header fijo (fixed), compacto y con control de tamaños
+# ---------------------------------------------------------
+def render_fixed_header(
+    logo_img=None,
+    title="Mel-IA — Plan táctico (diario por SVC)",
+    subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
+    header_h=72,     # altura total de la barra
+    logo_h=44,       # altura del logo dentro de la barra
+):
+    import io, base64
+
+    def _img_to_b64(img):
+        buf = io.BytesIO()
+        try:
+            img.save(buf, format="PNG")
+        except Exception:
+            img = img.convert("RGBA")
+            img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    if logo_img is not None:
+        try:
+            b64 = _img_to_b64(logo_img)
+            logo_html = (
+                f'<img src="data:image/png;base64,{b64}" alt="logo" '
+                f'style="height:{int(logo_h)}px; width:auto; display:block;" />'
+            )
+        except Exception:
+            logo_html = f'<div style="font-size:{int(logo_h)}px; line-height:{int(logo_h)}px;">🚛</div>'
+    else:
+        logo_html = f'<div style="font-size:{int(logo_h)}px; line-height:{int(logo_h)}px;">🚛</div>'
+
+    st.markdown(
+        f"""
+        <style>
+          :root {{ --meli-header-h: {int(header_h)}px; }}
+
+          /* Barra fija arriba de todo */
+          .meli-fixed {{
+            position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+            background: #FFFFFF;
+            height: var(--meli-header-h);
+            border-bottom: 1px solid rgba(0,0,0,.06);
+            box-shadow: 0 1px 6px rgba(0,0,0,.04);
+          }}
+          .meli-wrap {{
+            max-width: 1200px; margin: 0 auto;
+            height: 100%;
+            display: grid; grid-template-columns: auto 1fr;
+            align-items: center; gap: 14px; padding: 6px 12px;
+          }}
+          .meli-title {{
+            margin: 0; font-size: 32px; line-height: 1.15; font-weight: 800;
+          }}
+          .meli-sub {{ margin: 2px 0 0 0; color: #6b7280; font-size: 13px; }}
+          /* Quita el header nativo y compensa el espacio superior del main */
+          [data-testid="stHeader"] {{ display: none; }}
+          .block-container {{ padding-top: calc(var(--meli-header-h) + 12px) !important; }}
+        </style>
+
+        <div class="meli-fixed">
+          <div class="meli-wrap">
+            <div class="meli-logo">{logo_html}</div>
+            <div>
+              <h1 class="meli-title">{title}</h1>
+              <div class="meli-sub">{subtitle}</div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+
+
+
 # -----------------------------------------------------------------------------
 # 1) Normalización / coerción
 # -----------------------------------------------------------------------------
@@ -2303,10 +2381,12 @@ LOGO_WIDTH = int(st.session_state["logo_width"])
 
 
 with st.sidebar.expander("🎨 Apariencia", expanded=False):
-    # altura del header (logo y contenedor)
-    DEFAULT_HEADER_H = int(st.session_state.get("header_height", 64))
-    HEADER_H = st.slider("Altura del encabezado (px)", 48, 96, DEFAULT_HEADER_H, step=2)
-    st.session_state["header_height"] = int(HEADER_H)
+    _def_h = int(st.session_state.get("header_h", 72))
+    _def_l = int(st.session_state.get("logo_h", 44))
+    header_h = st.slider("Altura barra (px)", 56, 120, _def_h, step=2)
+    logo_h   = st.slider("Altura logo (px)", max(24, header_h-40), header_h-12, min(_def_l, header_h-12), step=2)
+    st.session_state["header_h"] = int(header_h)
+    st.session_state["logo_h"]   = int(logo_h)
 
 
 
@@ -2351,11 +2431,12 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
 # ---------------------------------------------------------
 # Encabezado fijo y compacto (reemplaza al bloque con st.columns)
 # ---------------------------------------------------------
-render_sticky_header(
+render_fixed_header(
     logo_img=LOGO_IMAGE,
     title="Mel-IA — Plan táctico (diario por SVC)",
     subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
-    height_px=int(st.session_state.get("header_height", 56))  # 56 por defecto
+    header_h=int(st.session_state.get("header_h", 72)),
+    logo_h=int(st.session_state.get("logo_h", 44)),
 )
 
 
