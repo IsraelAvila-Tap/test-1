@@ -1587,8 +1587,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     out["RUTAS_SPR_BASE"]   = np.ceil(out["DEMANDA_AJUSTADA"] / out["SPR_USADO"]).astype(int)
 
     # ----------------- SPR por Delivery Model (según modo) -----------------
-  
-     # Garantiza existencia de columnas de stats
+    # Garantiza existencia de columnas de stats
     for c in [
         "SPR_RENTALS_PROM4","SPR_RENTALS_P95_4","SPR_RENTALS_PROM","SPR_RENTALS_PEAK",
         "SPR_CROWD_PROM4","SPR_CROWD_P95_4","SPR_CROWD_PROM","SPR_CROWD_PEAK",
@@ -1632,8 +1631,27 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
             if s is None or pd.isna(s).all():
                 s = out.get(prom)
             return pd.to_numeric(s, errors="coerce")
-    
 
+    # Rentals
+    out["SPR_RENTALS"] = pick_dm(
+        "SPR_RENTALS_PROM4","SPR_RENTALS_P95_4","SPR_RENTALS_PROM","SPR_RENTALS_PEAK",
+        "SPR_PLAN_RENTALS","SPR_RENTALS"  # plan_sheet = el ponderado por mix si no hubiera en Capacity
+    ).fillna(out["SPR_USADO"]).clip(lower=1)
+
+    # Crowd
+    out["SPR_CROWD"] = pick_dm(
+        "SPR_CROWD_PROM4","SPR_CROWD_P95_4","SPR_CROWD_PROM","SPR_CROWD_PEAK",
+        "SPR_PLAN_CROWD","SPR_CROWD"  # si no hay en Capacity, usa el del sheet SPR
+    ).fillna(out["SPR_USADO"]).clip(lower=1)
+
+    # MLP
+    out["SPR_MLP"] = pick_dm(
+        "SPR_MLP_PROM4","SPR_MLP_P95_4","SPR_MLP_PROM","SPR_MLP_PEAK",
+        "SPR_PLAN_MLP","SPR_MLP"  # fallback al del sheet SPR si no hay en Capacity
+    ).fillna(out["SPR_USADO"]).clip(lower=1)
+
+
+        
 
     # ----------------- CROWD ASIGNACIÓN -----------------
     out["SHIP_OBJ_CROWD"] = pd.to_numeric(out["FCST"], errors="coerce").fillna(0) * out["CROWD_PCT"]
