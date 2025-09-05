@@ -2363,7 +2363,7 @@ LOGO_WIDTH = int(st.session_state["logo_width"])
 
 
 with st.sidebar.expander("🎨 Apariencia", expanded=False):
-    _def_h = int(st.session_state.get("header_h", 96))
+    _def_h = int(st.session_state.get("header_h", 60))
     _def_l = int(st.session_state.get("logo_h", 200))
 
     header_h = st.slider("Altura barra (px)", 64, 1200, _def_h, step=2)
@@ -2553,18 +2553,6 @@ with st.expander("▶️ Cargando datos...", expanded=True):
     except Exception as e:
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
-
-# --- Notas de la versión ---
-with st.expander("ℹ️ Notas de esta versión"):
-    st.markdown(textwrap.dedent("""
-    - Rentals desde **Rentals** (fuzzy en “Unidades dispon…”) con **SPR_RENTALS** ponderado; siempre se usa 100% antes de Crowd/MLP.
-    - Crowd por % de **Capacity**: **CROWD_PCT**, **SHIP_OBJ_CROWD**, **SPR_CROWD**, base y escalado (E1).
-    - **MLP** (SRM): se ignoran columnas **Total** y se suma por tipo de vehículo (**Large/Small/Car**) para **SDD** y **SPOT**.
-      Se muestran columnas de desglose y se asignan rutas por prioridad **SDD → SPOT → Backlog**.
-    - **Reconciliación arriba↔abajo**: los *shipments* mostrados “arriba” se toman de la suma del detalle (abajo) y el **SPR mostrado**
-      es la **resultante** = *shipments / rutas*. Las **rutas** permanecen como la “verdad” de la tabla de arriba.
-    - **SPR (resultante capacidad)** en cabecera = *Shipments de capacidad / Rutas de capacidad* (solo Rentals + Crowd + MLP).
-    """))
 
 # --- Helper para sumar columnas numéricas formateadas (para métricas) ---
 def _sum_numeric_col(df, col):
