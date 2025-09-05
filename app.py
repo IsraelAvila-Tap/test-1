@@ -2181,8 +2181,6 @@ else:
 
 # --- Orquestación: plan base → detalle → reconciliar → mostrar ---
 try:
-    # --- Orquestación: plan base → detalle → reconciliar → mostrar ---
-try:
     # ✅ Clave: además de run_btn/auto_run, muestra el último plan guardado en session_state
     if run_btn or auto_run or ("plan_df" in st.session_state and st.session_state["plan_df"] is not None):
         if not SHEET_ID:
