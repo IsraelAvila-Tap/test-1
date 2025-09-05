@@ -2312,23 +2312,28 @@ if ask and user_q:
         except Exception:
             context_parts.append("Tabla detalle (abajo): (no disponible)\n")
 
+###
         system_msg = (
             "Eres un analista de planeación táctica. Responde en español, "
             "claro y conciso. Si haces cálculos, muéstralos. "
             "Usa solo el contexto provisto; si algo no está en los datos, dilo."
         )
 
-        user_prompt = textwrap.dedent(f"""
-        CONTEXTO:
-        {("\n".join(context_parts))}
+        # ⚠️ Precomputamos el bloque de contexto para no usar backslash en una f-string
+        context_block = "\n".join(context_parts)
+
+        user_prompt = textwrap.dedent(
+            f"""CONTEXTO:
+        {context_block}
 
         PREGUNTA:
         {user_q}
-        """)
+        """
+        )
 
         try:
             resp = client.chat.completions.create(
-                model="gpt-4o-mini",  # usa el modelo que tengas habilitado
+                model="gpt-4o-mini",  # o el modelo que tengas habilitado
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_prompt},
@@ -2340,6 +2345,7 @@ if ask and user_q:
             st.session_state.chat_history.append((user_q, answer))
         except Exception as e:
             st.error(f"No se pudo obtener respuesta: {e}")
+
 
 # Muestra historial
 if st.session_state.chat_history:
