@@ -1,6 +1,6 @@
 # app.py
 # =============================================================================
-# Mel-IA — Plan táctico (diario por SVC)
+# Mel-IA — Plan táctico (Copiloto de tu flota en Mercado Libre)
 # Tabs: FCST, SPR, Capacity, Rentals, Crowd, SRM (MLP caps).
 # Encabezado autodetectado (busca SVC/SVCs/LC/Facility) + encabezado de 2 filas (Crowd).
 # Robusto ante vacíos/alias y pestañas ausentes.
@@ -25,6 +25,67 @@ SERVICE_EMAIL = "planificacion@planificacion.iam.gserviceaccount.com"
 
 DEFAULT_SVCS = ["SGD1", "SMT1", "SMX9", "SPB1"]
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1UBjU3-ftGCow3EzTD0NB6UaYwMUYUARbn9QjD7SlxtY/edit?gid=148917403#gid=148917403"
+
+# ---------------------------------------------------------
+# Encabezado sticky (fijo) y compacto
+# ---------------------------------------------------------
+import io, base64
+
+def _img_to_base64(pil_img):
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+def render_sticky_header(logo_img=None, title="Mel-IA — Plan táctico (Copiloto de tu flota en Mercado libre)",
+                         subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
+                         height_px=64):
+    """Dibuja un header fijo en la parte superior con grid y estilos compactos."""
+    if logo_img is not None:
+        try:
+            b64 = _img_to_base64(logo_img)
+            logo_html = f'<img src="data:image/png;base64,{b64}" alt="logo" style="height:{height_px}px; width:auto;" />'
+        except Exception:
+            logo_html = f'<div style="font-size:{height_px}px; line-height:{height_px}px;">🚛</div>'
+    else:
+        logo_html = f'<div style="font-size:{height_px}px; line-height:{height_px}px;">🚛</div>'
+
+    st.markdown(
+        f"""
+        <style>
+          /* Header propio fijo */
+          .meli-sticky {{
+            position: sticky; top: 0; z-index: 999;
+            background: #FFFFFF;               /* mismo fondo que el tema */
+            padding: 8px 12px;                 /* compacto */
+            border-bottom: 1px solid rgba(0,0,0,.06);
+            box-shadow: 0 2px 8px rgba(0,0,0,.04);
+            margin-bottom: 8px;                /* separa del contenido */
+          }}
+          .meli-wrap {{
+            max-width: 1200px; margin: 0 auto;
+            display: grid; grid-template-columns: auto 1fr;
+            align-items: center; gap: 14px;
+          }}
+          .meli-title  {{ margin: 0; font-size: 34px; line-height: 1.1; }}
+          .meli-sub    {{ margin: 2px 0 0 0; color: #6b7280; font-size: 14px; }}
+          /* Reduce padding global para ganar espacio vertical */
+          main .block-container {{ padding-top: 0.5rem; }}
+          /* Oculta fondo del header nativo de Streamlit (si aparece) */
+          [data-testid="stHeader"] {{ background: transparent; }}
+        </style>
+        <div class="meli-sticky">
+          <div class="meli-wrap">
+            <div class="meli-logo">{logo_html}</div>
+            <div>
+              <h1 class="meli-title">{title}</h1>
+              <div class="meli-sub">{subtitle}</div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 # ---------------------------------------------------------
 # Branding (logo): búsqueda robusta y carga
@@ -2303,7 +2364,7 @@ with col_title:
     st.markdown(
         """
         <div style="padding-top:8px;">
-            <h1 style="margin:0;">Mel-IA — Plan táctico (diario por SVC)</h1>
+            <h1 style="margin:0;">Mel-IA — Plan táctico (Copiloto de tu flota en Mercado Libre)</h1>
             <div style="color:#6b7280; margin-top:4px;">
                 Copiloto de planificación táctica de flota • Rentals • Crowd • MLP
             </div>
