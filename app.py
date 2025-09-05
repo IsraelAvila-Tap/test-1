@@ -2344,7 +2344,7 @@ LOGO_WIDTH = int(st.session_state["logo_width"])
 
 with st.sidebar.expander("🎨 Apariencia", expanded=False):
     _def_h = int(st.session_state.get("header_h", 96))
-    _def_l = int(st.session_state.get("logo_h", 400))
+    _def_l = int(st.session_state.get("logo_h", 240))
 
     header_h = st.slider("Altura barra (px)", 64, 1200, _def_h, step=2)
     # ↑ también amplié el máximo por si quieres una barra muy alta
