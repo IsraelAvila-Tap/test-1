@@ -2342,25 +2342,28 @@ if "logo_width" not in st.session_state:
 LOGO_WIDTH = int(st.session_state["logo_width"])
 
 
-# --- 🎨 Apariencia (desacoplado) ---
 with st.sidebar.expander("🎨 Apariencia", expanded=False):
     _def_h = int(st.session_state.get("header_h", 96))
-    _def_l = int(st.session_state.get("logo_h", 120))  # por defecto más grande
+    _def_l = int(st.session_state.get("logo_h", 240))
 
-    # Ahora NO depende uno del otro
-    header_h = st.slider("Altura barra (px)", 64, 240, _def_h, step=2)
-    logo_h   = st.slider("Altura logo (px)",  24, 300, _def_l, step=2)
+    header_h = st.slider("Altura barra (px)", 64, 1200, _def_h, step=2)
+    # ↑ también amplié el máximo por si quieres una barra muy alta
+
+    logo_h   = st.slider("Altura logo (px)",  24, 1200, min(_def_l, 400), step=2)
+    #            ^^^^^^^^^^^^^^^^^^ sube el máximo (ej. 1200)
 
     st.session_state["header_h"] = int(header_h)
     st.session_state["logo_h"]   = int(logo_h)
 
-# Header: que la barra nunca sea menor que el logo (+margen)
-final_header_h = max(int(st.session_state["header_h"]), int(st.session_state["logo_h"]) + 20)
+# La barra debe ser al menos tan alta como el logo
+final_header_h = max(int(st.session_state["header_h"]), int(st.session_state["logo_h"]) + 16)
+
 render_fixed_header(
     logo_img=LOGO_IMAGE,
     header_h=final_header_h,
     logo_h=int(st.session_state["logo_h"]),
 )
+
 
 
 def render_fixed_header(
