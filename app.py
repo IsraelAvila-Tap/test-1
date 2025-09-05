@@ -131,7 +131,7 @@ SHEET_TABS = {
 # ---------------------------------------------------------
 def render_fixed_header(
     logo_img=None,
-    title="Mel-IA — Plan táctico (Copiloto de tu flota en Mercado Libre)",
+    title="Mel-IA (Copiloto de tu flota en Mercado Libre)",
     subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
     header_h=104,     # altura total de la barra
     logo_h=500,       # altura del logo dentro de la barra
@@ -2321,7 +2321,7 @@ def render_pretty_table(df, caption=None):
 # 6) UI
 # ---------------------------------------------------------------------
 st.set_page_config(
-    page_title="Mel-IA — Plan táctico (Copiloto de tu flota en Mercado Libre)",
+    page_title="Mel-IA (Copiloto de tu flota en Mercado Libre)",
     layout="wide",
     page_icon=LOGO_IMAGE if LOGO_IMAGE is not None else "🚛"
 )
