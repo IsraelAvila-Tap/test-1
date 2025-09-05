@@ -2122,7 +2122,12 @@ def reconcile_plan_with_detail(plan_df: pd.DataFrame, detalle_df: pd.DataFrame) 
 # ---------------------------------------------------------------------
 # 6) UI
 # ---------------------------------------------------------------------
-st.set_page_config(page_title="Mel-IA — Plan táctico (diario por SVC)", layout="wide")
+st.set_page_config(
+    page_title="Mel-IA — Plan táctico (copiloto de la flota en Mercado Libre)",
+    layout="wide",
+    page_icon=LOGO_IMAGE if LOGO_IMAGE is not None else "🚛"
+)
+
 
 # --- Sidebar: configuración del proyecto / credenciales / healthcheck ---
 st.sidebar.markdown("## 🗂️ Proyecto")
@@ -2159,7 +2164,30 @@ with st.sidebar.expander("Estado de conexión", expanded=False):
         st.caption(str(e))
 
 # --- Controles principales ---
-st.title("Mel-IA — Plan táctico (diario por SVC)")
+
+# ---------------------------------------------------------
+# Encabezado con logo (si existe) + título/subtítulo
+# ---------------------------------------------------------
+col_logo, col_title = st.columns([1, 5])
+with col_logo:
+    if LOGO_IMAGE is not None:
+        st.image(LOGO_IMAGE, width=96)
+    else:
+        st.markdown("<div style='font-size:48px;'>🚛</div>", unsafe_allow_html=True)
+
+with col_title:
+    st.markdown(
+        """
+        <div style="padding-top:8px;">
+            <h1 style="margin:0;">Mel-IA — Plan táctico (diario por SVC)</h1>
+            <div style="color:#6b7280; margin-top:4px;">
+                Copiloto de planificación táctica de flota • Rentals • Crowd • MLP
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 spr_mode = st.radio(
     "SPR objetivo",
