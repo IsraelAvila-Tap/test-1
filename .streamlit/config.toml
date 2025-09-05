@@ -1,2 +1,6 @@
-[server]
-fileWatcherType = "poll"   # usa "none" si el error persiste
+[theme]
+primaryColor = "#2D3277"            # Azul MELI
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F6F7FB"
+textColor = "#111827"
+font = "sans serif"
