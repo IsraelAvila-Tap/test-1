@@ -26,34 +26,55 @@ SERVICE_EMAIL = "planificacion@planificacion.iam.gserviceaccount.com"
 DEFAULT_SVCS = ["SGD1", "SMT1", "SMX9", "SPB1"]
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1UBjU3-ftGCow3EzTD0NB6UaYwMUYUARbn9QjD7SlxtY/edit?gid=148917403#gid=148917403"
 
-# ---------------------------------------------------------------------
-# Branding: Logo y encabezado de la app
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------
+# Branding (logo): búsqueda robusta y carga
+# ---------------------------------------------------------
 from PIL import Image
+import unicodedata
 
-logo_path = "20250813_1028_Camión Futurista Amarillo_remix_01k2j40zxfp0te4vpq1kq1wnv.png"  # usa el nombre exacto de tu archivo en el repo
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii","ignore").decode("ascii")
+    return s.lower()
 
-try:
-    logo = Image.open(logo_path)
+def find_logo_file(preferred: list[str] | None = None) -> str | None:
+    """
+    1) Prueba rutas preferidas (tal cual);
+    2) Busca recursivamente un .png/.jpg cuyo nombre contenga 'camion' y 'amarillo' o 'mel-ia'.
+    """
+    import os
+    preferred = preferred or []
+    # 1) preferred exactas
+    for p in preferred:
+        if p and os.path.exists(p):
+            return p
+    # 2) secretos opcionales
+    psec = (st.secrets.get("LOGO_PATH") if isinstance(st.secrets, dict) else None) or os.environ.get("LOGO_PATH")
+    if psec and os.path.exists(psec):
+        return psec
+    # 3) búsqueda recursiva
+    hits = []
+    for root, _, files in os.walk("."):
+        for f in files:
+            if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                fn = _norm(f)
+                # tokens que identifican tu archivo (soporta acentos/variantes)
+                if (("camion" in fn and "amarillo" in fn) or ("mel-ia" in fn) or ("meli" in fn)):
+                    hits.append(os.path.join(root, f))
+    return hits[0] if hits else None
 
-    col1, col2 = st.columns([1,4])
-    with col1:
-        st.image(logo, width=100)
-    with col2:
-        st.markdown(
-            """
-            <div style="padding-top:20px;">
-                <h1 style="margin-bottom:0;">Mel-IA Ops</h1>
-                <p style="margin-top:0; font-size:16px; color:gray;">
-                    Copiloto de planificación táctica de flota 🚛🤖
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-except Exception as e:
-    st.warning("⚠️ No se pudo cargar el logo, revisa la ruta del archivo.")
-    st.error(e)
+# Intenta con el nombre que vimos en tu repo + búsqueda flexible
+LOGO_PATH = find_logo_file([
+    # ↙️ si cambia, no pasa nada: el buscador recursivo lo encuentra igual
+    "20250813_1028_Camión Futurista Amarillo_remix_01k2j40zxfp0te4vpq1kq1wnv.png",
+    "20250813_1028_Camion Futurista Amarillo_remix_01k2j40zxfp0te4vpq1kq1wnv.png",
+])
+
+LOGO_IMAGE = None
+if LOGO_PATH:
+    try:
+        LOGO_IMAGE = Image.open(LOGO_PATH)
+    except Exception as _e:
+        LOGO_IMAGE = None  # fallback sin romper la app
 
 
 
