@@ -77,6 +77,28 @@ if LOGO_PATH:
     except Exception as _e:
         LOGO_IMAGE = None  # fallback sin romper la app
 
+from PIL import Image, ImageChops
+
+def autocrop_whitespace(img: Image.Image) -> Image.Image:
+    try:
+        # Si tiene alpha, recorta contra transparente
+        if img.mode in ("RGBA", "LA"):
+            bg = Image.new(img.mode, img.size, (255, 255, 255, 0))
+            diff = ImageChops.difference(img, bg)
+            bbox = diff.getbbox()
+            return img.crop(bbox) if bbox else img
+        # Si no, recorta contra el color del pixel (0,0) (normalmente blanco)
+        base = img.convert("RGB")
+        bg = Image.new("RGB", base.size, base.getpixel((0, 0)))
+        diff = ImageChops.difference(base, bg)
+        bbox = diff.getbbox()
+        return img.crop(bbox) if bbox else img
+    except Exception:
+        return img
+
+# Después de abrir el logo:
+if LOGO_IMAGE is not None:
+    LOGO_IMAGE = autocrop_whitespace(LOGO_IMAGE)
 
 
 def sanitize_sheet_id(text: str | None) -> str | None:
@@ -2320,24 +2342,29 @@ if "logo_width" not in st.session_state:
 LOGO_WIDTH = int(st.session_state["logo_width"])
 
 
+# --- 🎨 Apariencia (desacoplado) ---
 with st.sidebar.expander("🎨 Apariencia", expanded=False):
-    _def_h = int(st.session_state.get("header_h", 72))
-    _def_l = int(st.session_state.get("logo_h", 44))
-    header_h = st.slider("Altura barra (px)", 56, 120, _def_h, step=2)
-    logo_h   = st.slider("Altura logo (px)", max(24, header_h-40), header_h-12, min(_def_l, header_h-12), step=2)
+    _def_h = int(st.session_state.get("header_h", 96))
+    _def_l = int(st.session_state.get("logo_h", 120))  # por defecto más grande
+
+    # Ahora NO depende uno del otro
+    header_h = st.slider("Altura barra (px)", 64, 240, _def_h, step=2)
+    logo_h   = st.slider("Altura logo (px)",  24, 300, _def_l, step=2)
+
     st.session_state["header_h"] = int(header_h)
     st.session_state["logo_h"]   = int(logo_h)
 
-##Header
+# Header: que la barra nunca sea menor que el logo (+margen)
+final_header_h = max(int(st.session_state["header_h"]), int(st.session_state["logo_h"]) + 16)
 
-# Header (usa los valores elegidos en el panel 🎨)
 render_fixed_header(
     logo_img=LOGO_IMAGE,
     title="Mel-IA — Plan táctico (diario por SVC)",
     subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP",
-    header_h=header_h,   # ← del slider
-    logo_h=logo_h,       # ← del slider
+    header_h=final_header_h,      # ← altura efectiva de la barra
+    logo_h=int(st.session_state["logo_h"]),  # ← tamaño real del logo
 )
+
 
 
 
