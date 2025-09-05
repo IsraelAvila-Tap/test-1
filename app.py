@@ -1588,22 +1588,22 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
 
     # ----------------- SPR por Delivery Model (según modo) -----------------
   
-# Usa el selector directo por modo (promedio/peak/plan)
-dm_sel = load_spr_dm_by_mode(hoy, spr_mode)  # -> SPR_RENTALS_SEL / SPR_CROWD_SEL / SPR_MLP_SEL
+    # Usa el selector directo por modo (promedio/peak/plan)
+    dm_sel = load_spr_dm_by_mode(hoy, spr_mode)  # -> SPR_RENTALS_SEL / SPR_CROWD_SEL / SPR_MLP_SEL
 
-out = safe_merge(
-    out,
-    dm_sel.rename(columns={
-        "SPR_RENTALS_SEL": "SPR_RENTALS",
-        "SPR_CROWD_SEL":   "SPR_CROWD",
-        "SPR_MLP_SEL":     "SPR_MLP",
-    }),
-    ["SVC"]
-)
+    out = safe_merge(
+        out,
+        dm_sel.rename(columns={
+            "SPR_RENTALS_SEL": "SPR_RENTALS",
+            "SPR_CROWD_SEL":   "SPR_CROWD",
+            "SPR_MLP_SEL":     "SPR_MLP",
+        }),
+        ["SVC"]
+    )
 
-# Fallback: si alguno viene vacío, usa SPR_USADO
-for c in ["SPR_RENTALS", "SPR_CROWD", "SPR_MLP"]:
-    out[c] = pd.to_numeric(out[c], errors="coerce").fillna(out["SPR_USADO"]).clip(lower=1)
+    # Fallback: si alguno viene vacío, usa SPR_USADO
+    for c in ["SPR_RENTALS", "SPR_CROWD", "SPR_MLP"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(out["SPR_USADO"]).clip(lower=1)
 
 
     # Rentals
