@@ -1588,22 +1588,50 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
 
     # ----------------- SPR por Delivery Model (según modo) -----------------
   
-    # Usa el selector directo por modo (promedio/peak/plan)
-    dm_sel = load_spr_dm_by_mode(hoy, spr_mode)  # -> SPR_RENTALS_SEL / SPR_CROWD_SEL / SPR_MLP_SEL
+    # Garantiza existencia de columnas de stats
+    for c in [
+        "SPR_RENTALS_PROM4","SPR_RENTALS_P95_4","SPR_RENTALS_PROM","SPR_RENTALS_PEAK",
+        "SPR_CROWD_PROM4","SPR_CROWD_P95_4","SPR_CROWD_PROM","SPR_CROWD_PEAK",
+        "SPR_MLP_PROM4","SPR_MLP_P95_4","SPR_MLP_PROM","SPR_MLP_PEAK",
+    ]:
+        if spr_stats_dm.empty or c not in spr_stats_dm.columns:
+            # se crearán como NaN y luego habrá fallback
+            pass
+    if not spr_stats_dm.empty:
+        out = safe_merge(out, spr_stats_dm, ["SVC"])
 
-    out = safe_merge(
-        out,
-        dm_sel.rename(columns={
-            "SPR_RENTALS_SEL": "SPR_RENTALS",
-            "SPR_CROWD_SEL":   "SPR_CROWD",
-            "SPR_MLP_SEL":     "SPR_MLP",
-        }),
-        ["SVC"]
-    )
+    # Merge plan SPR de Capacity (día) si existe
+    if not plan_spr_cap.empty:
+        out = safe_merge(out, plan_spr_cap, ["SVC"])
 
-    # Fallback: si alguno viene vacío, usa SPR_USADO
-    for c in ["SPR_RENTALS", "SPR_CROWD", "SPR_MLP"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(out["SPR_USADO"]).clip(lower=1)
+    def pick_dm(prom4, p95_4, prom, peak, plan_cap, plan_sheet):
+        """
+        Selecciona el SPR final para un DM con fallbacks.
+        - promedio: PROM4 -> PROM -> SPR_USADO
+        - peak:     P95_4 -> PEAK -> PROM -> SPR_USADO
+        - plan:     plan_cap -> plan_sheet -> PROM4 -> PROM -> SPR_USADO
+        """
+        if spr_mode == "promedio":
+            s = out.get(prom4)
+            if s is None:
+                s = out.get(prom)
+            return pd.to_numeric(s, errors="coerce")
+        elif spr_mode == "peak":
+            s = out.get(p95_4)
+            if s is None:
+                s = out.get(peak)
+            if s is None:
+                s = out.get(prom)
+            return pd.to_numeric(s, errors="coerce")
+        else:  # plan
+            s = out.get(plan_cap)  # desde Capacity del día
+            if s is None or pd.isna(s).all():
+                s = out.get(plan_sheet)  # valor “plan” que ya tengas en sheet por DM (si aplica)
+            if s is None or pd.isna(s).all():
+                s = out.get(prom4)
+            if s is None or pd.isna(s).all():
+                s = out.get(prom)
+            return pd.to_numeric(s, errors="coerce")
 
 
     # Rentals
