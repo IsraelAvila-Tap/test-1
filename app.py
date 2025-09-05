@@ -2226,8 +2226,30 @@ st.set_page_config(
 )
 inject_brand_css()  # ← ACTIVA los estilos de marca
 
+# --- Tamaño del logo: default + persistencia ---
+DEFAULT_LOGO_WIDTH = 120
+try:
+    DEFAULT_LOGO_WIDTH = int(
+        st.secrets.get("LOGO_WIDTH", os.environ.get("LOGO_WIDTH", DEFAULT_LOGO_WIDTH))
+    )
+except Exception:
+    pass
+
+if "logo_width" not in st.session_state:
+    st.session_state["logo_width"] = DEFAULT_LOGO_WIDTH
+
+LOGO_WIDTH = int(st.session_state["logo_width"])
+
+
 with st.sidebar.expander("🎨 Apariencia", expanded=False):
-    LOGO_WIDTH = st.slider("Tamaño del logo (px)", 64, 240, LOGO_WIDTH, step=4)
+    LOGO_WIDTH = st.slider(
+        "Tamaño del logo (px)",
+        64, 240,
+        int(st.session_state.get("logo_width", DEFAULT_LOGO_WIDTH)),
+        step=4
+    )
+    st.session_state["logo_width"] = int(LOGO_WIDTH)
+
 
 
 
