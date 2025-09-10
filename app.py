@@ -2531,12 +2531,19 @@ auto_run = False
 sel_svcs: List[str] = []
 
 # --- Carga de opciones (SVCs disponibles) ---
+import time
+
+# nonce para romper caché cuando se refresquen datos
+if "refresh_nonce" not in st.session_state:
+    st.session_state.refresh_nonce = 0
+
 with st.expander("▶️ Cargando datos...", expanded=True):
     try:
         if not SHEET_ID:
             st.warning("Falta `SHEET_ID`. Pégalo en la barra lateral.")
             svc_list = []
         else:
+            # Lee orígenes (usa tus funciones tal cual)
             fcst_svcs    = load_fcst()[["SVC"]]
             caps         = load_capacity_caps()
             cap_svcs     = caps[["SVC"]] if "SVC" in caps.columns else caps.to_frame(name="SVC")
@@ -2547,43 +2554,37 @@ with st.expander("▶️ Cargando datos...", expanded=True):
 
             base_svcs = pd.concat(
                 [fcst_svcs, cap_svcs, crowd_svcs, rents_svcs, rent_fb_svcs, mlp_svcs],
-                axis=0
-            ).drop_duplicates()
+                axis=0, ignore_index=True
+            ).drop_duplicates(subset=["SVC"])
             base_svcs = _as_str_cols(base_svcs, ["SVC"])
             svc_list = sorted(base_svcs["SVC"].dropna().astype(str).unique().tolist())
 
         default_sel = [s for s in DEFAULT_SVCS if s in svc_list] or svc_list[:4]
-        sel_svcs = st.multiselect("Filtrar SVC", options=svc_list, default=default_sel, placeholder="Selecciona SVCs")
-        st.write(" ")
-        run_btn = st.button("Calcular plan", type="primary")
+        sel_svcs = st.multiselect(
+            "Filtrar SVC",
+            options=svc_list,
+            default=default_sel,
+            placeholder="Selecciona SVCs"
+        )
 
-        ####
-        # --- Botonera: Calcular plan + Actualizar datos (lado a lado) ---
-        import streamlit as st
+        # --- Botones lado a lado ---
+        c1, c2 = st.columns([1, 1], gap="small")
 
-        #    Inicializa nonce para romper caché cuando se actualicen datos
-        if "refresh_nonce" not in st.session_state:
-            st.session_state.refresh_nonce = 0
+        with c1:
+            run_btn = st.button("Calcular plan", type="primary", use_container_width=True, key="btn_calc")
 
-        col_run, col_refresh, _spacer = st.columns([1, 1, 4], gap="small")
+        with c2:
+            refresh_clicked = st.button("Actualizar datos", use_container_width=True, key="btn_refresh_inline")
 
-        with col_refresh:
-            if st.button("Actualizar datos", help="Limpiar caché y recargar fuentes",
-                         use_container_width=True, key="btn_refresh"):
-                # Limpia caches y fuerza rerun
-                st.cache_data.clear()
-                st.cache_resource.clear()
-                st.session_state.refresh_nonce += 1
-                st.rerun()
+        # Acción de refresco: limpia caché y relanza
+        if refresh_clicked:
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.session_state.refresh_nonce += 1
+            st.rerun()
 
-        # Si el usuario da clic en Calcular plan
-        if run_plan:
-            # Llama tu función normal de cálculo (ajusta args según tu app)
-            # plan = compute_plan(...)
-            pass
+        st.caption(f"Última recarga: {time.strftime('%Y-%m-%d %H:%M:%S')} · nonce={st.session_state.refresh_nonce}")
 
-
-    
     except Exception as e:
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
