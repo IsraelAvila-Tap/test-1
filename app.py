@@ -12,6 +12,18 @@ from typing import Optional, List, Dict
 import numpy as np
 import pandas as pd
 import streamlit as st
+import time
+
+if "refresh_nonce" not in st.session_state:
+    st.session_state.refresh_nonce = 0
+
+if st.button("Actualizar datos", type="primary"):
+    # Borra TODOS los caches de datos/recursos y fuerza un rerun limpio
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.session_state.refresh_nonce += 1
+    st.rerun()
+
 
 # -----------------------------------------------------------------------------
 # 0) Credenciales y configuración
