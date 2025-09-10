@@ -2556,36 +2556,40 @@ with st.expander("▶️ Cargando datos...", expanded=True):
         sel_svcs = st.multiselect("Filtrar SVC", options=svc_list, default=default_sel, placeholder="Selecciona SVCs")
         st.write(" ")
         run_btn = st.button("Calcular plan", type="primary")
+
+        ####
+        # --- Botonera: Calcular plan + Actualizar datos (lado a lado) ---
+        import streamlit as st
+
+        #    Inicializa nonce para romper caché cuando se actualicen datos
+        if "refresh_nonce" not in st.session_state:
+            st.session_state.refresh_nonce = 0
+
+        col_run, col_refresh, _spacer = st.columns([1, 1, 4], gap="small")
+
+        with col_run:
+            run_plan = st.button("Calcular plan", type="primary", use_container_width=True, key="btn_calc")
+
+        with col_refresh:
+            if st.button("Actualizar datos", help="Limpiar caché y recargar fuentes",
+                         use_container_width=True, key="btn_refresh"):
+                # Limpia caches y fuerza rerun
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.session_state.refresh_nonce += 1
+                st.rerun()
+
+        # Si el usuario da clic en Calcular plan
+        if run_plan:
+            # Llama tu función normal de cálculo (ajusta args según tu app)
+            # plan = compute_plan(...)
+            pass
+
+
+    
     except Exception as e:
         st.error("No se pudieron preparar los filtros.")
         show_exception(e, "Detalles (filtros)")
-
-# --- Botonera: Calcular plan + Actualizar datos (lado a lado) ---
-import streamlit as st
-
-# Inicializa nonce para romper caché cuando se actualicen datos
-if "refresh_nonce" not in st.session_state:
-    st.session_state.refresh_nonce = 0
-
-col_run, col_refresh, _spacer = st.columns([1, 1, 4], gap="small")
-
-with col_run:
-    run_plan = st.button("Calcular plan", type="primary", use_container_width=True, key="btn_calc")
-
-with col_refresh:
-    if st.button("Actualizar datos", help="Limpiar caché y recargar fuentes",
-                 use_container_width=True, key="btn_refresh"):
-        # Limpia caches y fuerza rerun
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        st.session_state.refresh_nonce += 1
-        st.rerun()
-
-# Si el usuario da clic en Calcular plan
-if run_plan:
-    # Llama tu función normal de cálculo (ajusta args según tu app)
-    # plan = compute_plan(...)
-    pass
 
 
 # --- Helper para sumar columnas numéricas formateadas (para métricas) ---
