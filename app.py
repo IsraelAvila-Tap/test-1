@@ -534,53 +534,6 @@ def load_spr_hist_from_sheet() -> pd.DataFrame:
     out = _as_str_cols(out, ["SVC","VEHICULO_TIPO_HOM"])
     return out
 
-#####
-# === SPR MLP PROM4 (semanas ancla) — BEGIN ===
-import numpy as np
-import pandas as pd
-
-# 1) Asegura columna de vehiculo en ambos DF
-veh_col = "vehiculo"
-if veh_col not in hist_spr.columns:
-    if "SHP_LG_VEHICLE_TYPE" in hist_spr.columns:
-        hist_spr[veh_col] = hist_spr["SHP_LG_VEHICLE_TYPE"]
-if veh_col not in out.columns:
-    if "SHP_LG_VEHICLE_TYPE" in out.columns:
-        out[veh_col] = out["SHP_LG_VEHICLE_TYPE"]
-
-# 2) Normaliza tipos
-hist_spr["FECHA"] = pd.to_datetime(hist_spr["FECHA"])
-hist_spr["SPR"]   = pd.to_numeric(hist_spr["SPR"], errors="coerce")
-
-out["FECHA"] = pd.to_datetime(out["FECHA"])
-
-# 3) Construye PROM4 por (FECHA, SVC, vehiculo) usando anclas D-7, D-14, D-21, D-28
-rows = []
-for (svc_i, veh_i), g in hist_spr.groupby(["SVC", veh_col]):
-    g = g.dropna(subset=["SPR"]).sort_values("FECHA")
-    g_idx = g.set_index("FECHA")
-
-    for D in g["FECHA"].unique():
-        anchors = [pd.Timestamp(D) - pd.Timedelta(days=7*i) for i in [1, 2, 3, 4]]
-        vals = g_idx.reindex(anchors)["SPR"].dropna()
-        prom4 = vals.mean() if len(vals) >= 2 else np.nan   # exige >=2 puntos
-        rows.append((D, svc_i, veh_i, prom4))
-
-df_prom4 = pd.DataFrame(rows, columns=["FECHA", "SVC", veh_col, "SPR_MLP_PROM4"])
-df_prom4["SPR_MLP_PROM4"] = df_prom4["SPR_MLP_PROM4"].round(1)
-
-# 4) Une PROM4 al plan (out)
-out = out.merge(df_prom4, on=["FECHA", "SVC", veh_col], how="left")
-
-# 5) Selector para modo promedio (con fallback ordenado)
-def pick_dm_promedio(row):
-    for col in ["SPR_MLP_PROM4", "SPR_PLAN_MLP", "SPR_MLP", "SPR_USADO"]:
-        if col in row and pd.notna(row[col]) and float(row[col]) > 0:
-            return float(row[col])
-    return np.nan
-# === SPR MLP PROM4 (semanas ancla) — END ===
-#######
-
 
 
 def load_rentals_caps_from_sheet() -> pd.DataFrame:
