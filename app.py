@@ -2567,9 +2567,6 @@ with st.expander("▶️ Cargando datos...", expanded=True):
 
         col_run, col_refresh, _spacer = st.columns([1, 1, 4], gap="small")
 
-        with col_run:
-            run_plan = st.button("Calcular plan", type="primary", use_container_width=True, key="btn_calc")
-
         with col_refresh:
             if st.button("Actualizar datos", help="Limpiar caché y recargar fuentes",
                          use_container_width=True, key="btn_refresh"):
