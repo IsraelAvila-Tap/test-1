@@ -2456,76 +2456,98 @@ def _dm_norm_label(s: str) -> str:
 
 def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
     """
-    Devuelve caps por MLP con columnas:
-    SVC, MLP, DELIVERY_MOD (MLP SDD|MLP SPOT|MLP BACKLOG),
-    SHP_LG_VEHICLE_TYPE (Large Van|Small Van|Car), CAP
+    Lee SRM (pestaña "SRM") y devuelve filas a nivel proveedor MLP con:
+      SVC, MLP, DELIVERY_MOD ('MLP SDD'|'MLP SPOT'|'MLP BACKLOG'),
+      SHP_LG_VEHICLE_TYPE ('Large Van'|'Small Van'|'Car'), CAP (int)
+    Ignora columnas 'Total ...'.
     """
     df = read_sheet(SHEET_ID, SHEET_TABS["srm"])
-    want = ["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","CAP"]
+    out_cols = ["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","CAP"]
     if df.empty:
-        return pd.DataFrame(columns=want)
+        return pd.DataFrame(columns=out_cols)
 
-    # columnas mínimas
-    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SRM")
-    find_and_rename(df, ["MLP","Proveedor","Carrier","Partner","Proveedor MLP"], "MLP", False, "SRM")
+    # --- SVC robusto (acepta headers raros/fusionados) ---
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC",
+                    required=False, source_label="SRM")
+    if "SVC" not in df.columns:
+        cmap = {_canon_name(c): c for c in df.columns}
+        for can, real in cmap.items():
+            if can.startswith("svc"):
+                if real != "SVC":
+                    df.rename(columns={real: "SVC"}, inplace=True)
+                break
+    if "SVC" not in df.columns:
+        # si aún no la encontramos, mejor devolvemos vacío (evita crash)
+        return pd.DataFrame(columns=out_cols)
+
+    # --- Proveedor (MLP) robusto ---
+    find_and_rename(df, ["MLP","Proveedor","Carrier","Proveedor MLP","Partner"],
+                    "MLP", required=False, source_label="SRM")
+    if "MLP" not in df.columns:
+        df["MLP"] = ""
+
     _as_str_cols(df, ["SVC","MLP"])
 
-    # Pasamos todas las columnas numéricas potenciales a CAPs "largas"
-    melted = []
-    for col in df.columns:
-        can = _canon_name(col)
-        if can in ("svc","mlp"): 
-            continue
-        # detecta MLP SDD / MLP SPOT / BACKLOG por nombre de columna
-        dm = None
-        if "sdd" in can or "adenda" in can:
-            dm = "MLP SDD"
-        elif "spot" in can:
-            if "bu" in can or "back" in can or "backlog" in can:
-                dm = "MLP BACKLOG"
-            else:
-                dm = "MLP SPOT"
-        else:
-            continue  # ignora otras familias
+    # --- Canon para ubicar familias/tipos (excluye 'total') ---
+    def canon_col(name: str) -> str:
+        c = _canon_name(name)           # minúsculas, sin acentos/espacios
+        c = c.replace("h&b", "hb")
+        c = re.sub(r"w\d+", "", c)      # quita W36...
+        return c
 
-        # tipo de vehículo aproximado por tokens
-        if "large" in can or "lv" in can or "xlv" in can or "heavybulky" in can or "hb" in can:
-            veh = "Large Van"
-        elif "small" in can or "sv" in can:
-            veh = "Small Van"
-        elif "car" in can:
-            veh = "Car"
-        else:
-            # si la columna dice "total", la ignoramos (evita doble conteo)
-            if "total" in can: 
+    canon = {c: canon_col(c) for c in df.columns}
+
+    def pick_cols(family_tokens: list[str], type_tokens: list[str]) -> list[str]:
+        sel = []
+        for col, cc in canon.items():
+            if col in ("SVC","MLP"):         # columnas clave
                 continue
-            # si no podemos inferir tipo, sáltala
-            continue
+            if "total" in cc:                 # evitamos 'Total ...'
+                continue
+            if all(t in cc for t in family_tokens) and any(t in cc for t in type_tokens):
+                sel.append(col)
+        return sel
 
-        ser = pd.to_numeric(df[col], errors="coerce").fillna(0)
-        if ser.sum() == 0:
-            continue
-        tmp = pd.DataFrame({
-            "SVC": df["SVC"].astype(str),
-            "MLP": df["MLP"].astype(str),
-            "DELIVERY_MOD": dm,
-            "SHP_LG_VEHICLE_TYPE": veh,
-            "CAP": ser.astype(int)
-        })
-        melted.append(tmp)
+    # tokens
+    LV   = ["largev","large","lv","xlv","hb"]
+    SV   = ["smallv","small","sv"]
+    CAR  = ["car","auto"]
+    SDD  = ["sdd","adenda"]
+    SPOT = ["spot"]
+    BACK = ["back","backup","backlog","bu"]
 
-    caps = pd.concat(melted, axis=0) if melted else pd.DataFrame(columns=want)
-    if caps.empty:
-        return pd.DataFrame(columns=want)
+    bucket_cols = {
+        ("MLP SDD","Large Van"):  pick_cols(SDD,  LV),
+        ("MLP SDD","Small Van"):  pick_cols(SDD,  SV),
+        ("MLP SDD","Car"):        pick_cols(SDD,  CAR),
+        ("MLP SPOT","Large Van"): pick_cols(SPOT, LV),
+        ("MLP SPOT","Small Van"): pick_cols(SPOT, SV),
+        ("MLP SPOT","Car"):       pick_cols(SPOT, CAR),
+        ("MLP BACKLOG","Large Van"): pick_cols(BACK, LV),
+        ("MLP BACKLOG","Small Van"): pick_cols(BACK, SV),
+        ("MLP BACKLOG","Car"):       pick_cols(BACK, CAR),
+    }
 
-    caps["SHP_LG_VEHICLE_TYPE"] = caps["SHP_LG_VEHICLE_TYPE"].map(_veh_hom_simple)
-    caps["DELIVERY_MOD"] = caps["DELIVERY_MOD"].map(_dm_norm_label)
-    # consolida duplicados (mismo SVC/MLP/DM/veh) sumando cap
-    caps = (
-        caps.groupby(["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)["CAP"]
-            .sum().reset_index()
-    )
-    return caps[want]
+    # a numérico las columnas sumables
+    for c in set(sum(bucket_cols.values(), [])):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    # --- expandimos a filas (SVC, MLP, DM, VEH, CAP) ---
+    rows = []
+    for _, r in df.iterrows():
+        svc = str(r["SVC"])
+        mlp = str(r["MLP"]).strip()
+        for (dm, veh), lst in bucket_cols.items():
+            if not lst:
+                continue
+            cap = int(float(pd.Series(r[lst]).sum()))
+            if cap > 0:
+                rows.append([svc, mlp, dm, veh, cap])
+
+    out = pd.DataFrame(rows, columns=out_cols)
+    return out
+
+
 
 def load_mlp_score_from_arer() -> pd.DataFrame:
     """
