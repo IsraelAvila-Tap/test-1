@@ -3215,19 +3215,18 @@ try:
                     st.dataframe(_scor_dbg.head(12), use_container_width=True, hide_index=True)
                 
 ####        
-                # (Opcional) Debug SRM & Score
-                _caps_dbg = load_srm_caps_by_mlp_detailed()
-                _scor_dbg = load_mlp_score_from_arer()
-                
-                with st.expander("🔎 Debug SRM & Score", expanded=False):
-                    st.caption("Caps por MLP (primeras 12 filas)")
-                    st.dataframe(_caps_dbg.head(12), use_container_width=True, hide_index=True)
-                    st.caption("Score por MLP (primeras 12 filas)")
-                    st.dataframe(_scor_dbg.head(12), use_container_width=True, hide_index=True)
-
-
-###
-                
+                    # (Opcional) Debug SRM & Score
+                try:
+                    _caps_dbg = load_srm_caps_by_mlp_detailed()
+                    _scor_dbg = load_mlp_score_from_arer()
+            
+                    with st.expander("🔎 Debug SRM & Score", expanded=False):
+                        st.caption("Caps por MLP (primeras 12 filas)")
+                        st.dataframe(_caps_dbg.head(12), use_container_width=True, hide_index=True)
+            
+                        st.caption("Score por MLP (primeras 12 filas)")
+                        st.dataframe(_scor_dbg.head(12), use_container_width=True, hide_index=True)
+            
                 except Exception as e:
                     st.error("No se pudo construir o mostrar la Tabla 3.")
                     show_exception(e, "Tabla 3 (traceback)")
