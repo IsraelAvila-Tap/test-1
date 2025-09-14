@@ -2434,6 +2434,229 @@ def build_mlp_detail(detalles_df: pd.DataFrame) -> pd.DataFrame:
 
     return res[out_cols]
 
+--------------------------------------------------------
+
+# =========================
+# Tabla 3: Detalle por MLP
+# =========================
+
+def _veh_hom_simple(v: str) -> str:
+    v = (v or "").lower().strip()
+    if "car" in v: return "Car"
+    h = homologar_vehicle_type(v)
+    hl = (h or "").lower()
+    if "small" in hl: return "Small Van"
+    if "large" in hl: return "Large Van"
+    return "Large Van"
+
+def _dm_norm_label(s: str) -> str:
+    s = (s or "").strip().lower()
+    if "spot" in s and ("bu" in s or "back" in s): return "MLP BACKLOG"
+    if "spot" in s:  return "MLP SPOT"
+    if "sdd" in s or "adenda" in s: return "MLP SDD"
+    return s.upper()
+
+def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
+    """
+    Devuelve caps por MLP con columnas:
+    SVC, MLP, DELIVERY_MOD (MLP SDD|MLP SPOT|MLP BACKLOG),
+    SHP_LG_VEHICLE_TYPE (Large Van|Small Van|Car), CAP
+    """
+    df = read_sheet(SHEET_ID, SHEET_TABS["srm"])
+    want = ["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","CAP"]
+    if df.empty:
+        return pd.DataFrame(columns=want)
+
+    # columnas mínimas
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "SRM")
+    find_and_rename(df, ["MLP","Proveedor","Carrier","Partner","Proveedor MLP"], "MLP", False, "SRM")
+    _as_str_cols(df, ["SVC","MLP"])
+
+    # Pasamos todas las columnas numéricas potenciales a CAPs "largas"
+    melted = []
+    for col in df.columns:
+        can = _canon_name(col)
+        if can in ("svc","mlp"): 
+            continue
+        # detecta MLP SDD / MLP SPOT / BACKLOG por nombre de columna
+        dm = None
+        if "sdd" in can or "adenda" in can:
+            dm = "MLP SDD"
+        elif "spot" in can:
+            if "bu" in can or "back" in can or "backlog" in can:
+                dm = "MLP BACKLOG"
+            else:
+                dm = "MLP SPOT"
+        else:
+            continue  # ignora otras familias
+
+        # tipo de vehículo aproximado por tokens
+        if "large" in can or "lv" in can or "xlv" in can or "heavybulky" in can or "hb" in can:
+            veh = "Large Van"
+        elif "small" in can or "sv" in can:
+            veh = "Small Van"
+        elif "car" in can:
+            veh = "Car"
+        else:
+            # si la columna dice "total", la ignoramos (evita doble conteo)
+            if "total" in can: 
+                continue
+            # si no podemos inferir tipo, sáltala
+            continue
+
+        ser = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        if ser.sum() == 0:
+            continue
+        tmp = pd.DataFrame({
+            "SVC": df["SVC"].astype(str),
+            "MLP": df["MLP"].astype(str),
+            "DELIVERY_MOD": dm,
+            "SHP_LG_VEHICLE_TYPE": veh,
+            "CAP": ser.astype(int)
+        })
+        melted.append(tmp)
+
+    caps = pd.concat(melted, axis=0) if melted else pd.DataFrame(columns=want)
+    if caps.empty:
+        return pd.DataFrame(columns=want)
+
+    caps["SHP_LG_VEHICLE_TYPE"] = caps["SHP_LG_VEHICLE_TYPE"].map(_veh_hom_simple)
+    caps["DELIVERY_MOD"] = caps["DELIVERY_MOD"].map(_dm_norm_label)
+    # consolida duplicados (mismo SVC/MLP/DM/veh) sumando cap
+    caps = (
+        caps.groupby(["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)["CAP"]
+            .sum().reset_index()
+    )
+    return caps[want]
+
+def load_mlp_score_from_arer() -> pd.DataFrame:
+    """
+    Lee la pestaña AR-ER (histórico de apertura/aceptados/cancelados/ejecutados)
+    y calcula SCORE = ejecutados / aceptados (sin penalizar cancelados).
+    Devuelve columnas: MLP, SVC, SCORE.
+    """
+    df = read_sheet(SHEET_ID, "AR-ER")
+    if df.empty:
+        return pd.DataFrame(columns=["MLP","SVC","SCORE"])
+
+    # nombres flexibles
+    find_and_rename(df, ["MLP","Proveedor","Carrier","Partner"], "MLP", False, "AR-ER")
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", False, "AR-ER")
+    find_and_rename(df, ["Aceptados","Confirmados"], "ACEPTADOS", False, "AR-ER")
+    find_and_rename(df, ["Ejecutados","Ejecutado"], "EJECUTADOS", False, "AR-ER")
+    _as_str_cols(df, ["MLP","SVC"])
+    df["ACEPTADOS"] = pd.to_numeric(df.get("ACEPTADOS", 0), errors="coerce").fillna(0)
+    df["EJECUTADOS"] = pd.to_numeric(df.get("EJECUTADOS", 0), errors="coerce").fillna(0)
+
+    # score simple: ejecutados / aceptados
+    g = df.groupby(["MLP","SVC"], dropna=False)[["EJECUTADOS","ACEPTADOS"]].sum().reset_index()
+    g["SCORE"] = (g["EJECUTADOS"] / g["ACEPTADOS"].replace(0, np.nan)).clip(0, 1).fillna(0.5)
+    return g[["MLP","SVC","SCORE"]]
+
+def build_table3(plan_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Asigna las rutas MLP del plan a MLPs concretos por SVC/DM/vehículo
+    respetando caps y priorizando mayor SCORE.
+    """
+    if plan_df is None or plan_df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
+
+    caps = load_srm_caps_by_mlp_detailed()   # SVC, MLP, DELIVERY_MOD, VEH, CAP
+    scores = load_mlp_score_from_arer()      # MLP, SVC, SCORE
+
+    # fallback si no hay caps detallados
+    if caps.empty:
+        # conserva tu comportamiento anterior (POOL_*), así no rompe
+        rows = []
+        for _, r in plan_df.iterrows():
+            svc = str(r["SVC"])
+            fch = r.get("FECHA", date.today())
+            for dm_lbl, used in [
+                ("MLP SDD",  _to_int(r.get("RUTAS_MLP_SDD_USADAS", 0))),
+                ("MLP SPOT", _to_int(r.get("RUTAS_MLP_SPOT_USADAS", 0))),
+                ("MLP BACKLOG", _to_int(r.get("RUTAS_MLP_BACKLOG_USADAS", 0))),
+            ]:
+                if used <= 0: 
+                    continue
+                # prioriza LV → SV → Car
+                alloc = _alloc_mlp_by_type(used, 10**9, 10**9, 10**9)
+                for veh, q in alloc.items():
+                    if q > 0:
+                        rows.append([fch, svc, dm_lbl, veh, f"POOL_{dm_lbl.split()[-1]}", int(q), np.nan])
+        return pd.DataFrame(rows, columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
+
+    # precomputos
+    caps["SHP_LG_VEHICLE_TYPE"] = caps["SHP_LG_VEHICLE_TYPE"].map(_veh_hom_simple)
+    caps["DELIVERY_MOD"] = caps["DELIVERY_MOD"].map(_dm_norm_label)
+    scores = scores.copy()
+    scores["SCORE"] = pd.to_numeric(scores["SCORE"], errors="coerce").fillna(0.5)
+
+    # índice para no pasarnos del cap por MLP/DM/veh
+    asignado = {}  # key=(svc, mlp, dm, veh) -> int asignado
+
+    out_rows = []
+    for _, r in plan_df.iterrows():
+        svc = str(r["SVC"])
+        fch = r.get("FECHA", date.today())
+
+        for dm_lbl, used_total in [
+            ("MLP SDD", _to_int(r.get("RUTAS_MLP_SDD_USADAS", 0))),
+            ("MLP SPOT", _to_int(r.get("RUTAS_MLP_SPOT_USADAS", 0))),
+            ("MLP BACKLOG", _to_int(r.get("RUTAS_MLP_BACKLOG_USADAS", 0))),
+        ]:
+            if used_total <= 0:
+                continue
+
+            # prioriza LV→SV→Car, pero acota con el total de caps por tipo que existan
+            caps_svc_dm = caps[(caps["SVC"] == svc) & (caps["DELIVERY_MOD"] == dm_lbl)]
+            tot_lv = int(caps_svc_dm[caps_svc_dm["SHP_LG_VEHICLE_TYPE"] == "Large Van"]["CAP"].sum())
+            tot_sv = int(caps_svc_dm[caps_svc_dm["SHP_LG_VEHICLE_TYPE"] == "Small Van"]["CAP"].sum())
+            tot_car = int(caps_svc_dm[caps_svc_dm["SHP_LG_VEHICLE_TYPE"] == "Car"]["CAP"].sum())
+            alloc_types = _alloc_mlp_by_type(used_total, tot_lv or 10**9, tot_sv or 10**9, tot_car or 10**9)
+
+            for veh, qty in alloc_types.items():
+                rem = int(qty)
+                if rem <= 0:
+                    continue
+
+                pool_label = f"POOL_{dm_lbl.split()[-1]}"
+                sub = caps_svc_dm[caps_svc_dm["SHP_LG_VEHICLE_TYPE"] == veh].copy()
+
+                if sub.empty:
+                    # sin caps detallados para ese tipo → manda a pool
+                    out_rows.append([fch, svc, dm_lbl, veh, pool_label, rem, np.nan])
+                    continue
+
+                # ordena por SCORE (mayor = mejor) y desempata por CAP desc
+                sub = sub.merge(scores, on=["MLP","SVC"], how="left")
+                sub["SCORE"] = sub["SCORE"].fillna(0.5)
+                sub = sub.sort_values(["SCORE","CAP"], ascending=[False, False]).reset_index(drop=True)
+
+                for _, row in sub.iterrows():
+                    if rem <= 0:
+                        break
+                    key = (svc, row["MLP"], dm_lbl, veh)
+                    ya = asignado.get(key, 0)
+                    cap_disp = max(int(row["CAP"]) - ya, 0)
+                    if cap_disp <= 0:
+                        continue
+                    take = min(rem, cap_disp)
+                    if take > 0:
+                        out_rows.append([fch, svc, dm_lbl, veh, row["MLP"], int(take), float(row["SCORE"])])
+                        asignado[key] = ya + take
+                        rem -= take
+
+                if rem > 0:
+                    # si aún falta y no hay MLPs con cap → manda a pool informativo
+                    out_rows.append([fch, svc, dm_lbl, veh, pool_label, rem, np.nan])
+
+    tabla3 = pd.DataFrame(out_rows, columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
+    if not tabla3.empty:
+        tabla3["Rutas"] = tabla3["Rutas"].astype(int)
+        tabla3["Score"] = pd.to_numeric(tabla3["Score"], errors="coerce").round(3)
+    return tabla3
+####-
+
 
 
 
@@ -2973,32 +3196,26 @@ try:
                 st.dataframe(detalles, use_container_width=True, hide_index=True)
 
 
-                # === TABLA 3: Detalle por MLP (temporal con pool) ===
+                # === Tabla 3 (debajo del detalle por vehículo) ===
                 st.markdown("### Detalle por MLP – (Tabla 3)")
                 
                 try:
-                    # Recalcula si cambió la fuente 'detalles'
-                    if "mlp_detalle_df" not in st.session_state or st.session_state.get("_mlp_detalle_rows_src", -1) != len(detalles):
-                        tabla3 = build_mlp_detail(detalles)
-                        st.session_state["mlp_detalle_df"] = tabla3.copy()
-                        st.session_state["_mlp_detalle_rows_src"] = len(detalles)
-                    else:
-                        tabla3 = st.session_state["mlp_detalle_df"]
+                    tabla3 = build_table3(plan)  # ← plan es la tabla ya reconciliada que guardamos en session_state
+                except Exception as e:
+                    st.error("No se pudo construir la Tabla 3 (detalle por MLP).")
+                    show_exception(e, "Tabla 3 (traceback)")
+                    tabla3 = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
                 
-                    if tabla3 is None or tabla3.empty:
-                        st.info("Sin asignaciones MLP para mostrar. Revisa que el detalle tenga filas de 'MLP SDD/SPOT/BACKLOG'.")
-                    else:
-                        st.dataframe(tabla3, use_container_width=True, hide_index=True)
+                st.dataframe(tabla3, use_container_width=True, hide_index=True)
                 
-                    # 🔎 Debug rápido
-                    with st.expander("Debug Tabla 3", expanded=False):
-                        st.write("Filas detalle:", 0 if detalles is None else len(detalles))
-                        if detalles is not None and not detalles.empty:
-                            st.write("Muestra detalle (MLP):",
-                                     detalles[detalles["DELIVERY_MOD"].isin(["MLP SDD","MLP SPOT","MLP BACKLOG"])].head(8))
-                        st.write("Filas Tabla 3:", 0 if tabla3 is None else len(tabla3))
-                        if tabla3 is not None and not tabla3.empty:
-                            st.write(tabla3.head(8))
+                with st.expander("🔎 Debug SRM & Score", expanded=False):
+                    _caps_dbg = load_srm_caps_by_mlp_detailed()
+                    _scor_dbg = load_mlp_score_from_arer()
+                    st.caption("Caps por MLP (primeras 12 filas)")
+                    st.dataframe(_caps_dbg.head(12), use_container_width=True, hide_index=True)
+                    st.caption("Score por MLP (primeras 12 filas)")
+                    st.dataframe(_scor_dbg.head(12), use_container_width=True, hide_index=True)
+                
 ####
                     with st.expander("🔎 Debug SRM & Score", expanded=False):
                         st.caption("Caps por MLP (primeras 12 filas)")
