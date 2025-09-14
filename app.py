@@ -3221,8 +3221,11 @@ try:
                         st.caption("Score por MLP (primeras 12 filas)")
                         st.dataframe(load_mlp_scores_from_sheet().head(12), use_container_width=True, hide_index=True)
 
-
-
+###
+                
+                except Exception as e:
+                    st.error("No se pudo construir o mostrar la Tabla 3.")
+                    show_exception(e, "Tabla 3 (traceback)")
 
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
