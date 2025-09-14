@@ -2396,6 +2396,46 @@ def build_mlp_detail(detalle_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(rows, columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
     return out
 
+def build_mlp_detail(detalles_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Hotfix: arma Tabla 3 a partir del detalle ya calculado.
+    - Usa las filas de DELIVERY_MOD en {"MLP SDD","MLP SPOT","MLP BACKLOG"}.
+    - Mantiene FECHA, SVC, tipo de vehículo y Rutas.
+    - Columna MLP queda como un 'pool' temporal por modalidad, hasta que tengamos score real.
+    """
+    import pandas as pd
+    if detalles_df is None or detalles_df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
+
+    mlp_mask = detalles_df["DELIVERY_MOD"].astype(str).isin(["MLP SDD","MLP SPOT","MLP BACKLOG"])
+    sub = detalles_df.loc[mlp_mask, ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","Rutas"]].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
+
+    # Pool temporal de MLP (cuando aún no hay score por proveedor)
+    pool_map = {"MLP SDD": "POOL_SDD", "MLP SPOT": "POOL_SPOT", "MLP BACKLOG": "POOL_BACKLOG"}
+    sub["MLP"] = sub["DELIVERY_MOD"].map(pool_map).fillna("POOL_MLP")
+
+    # Asegura entero
+    sub["Rutas"] = pd.to_numeric(sub["Rutas"], errors="coerce").fillna(0).astype(int)
+
+    # Opcional: agrega una columna Score (temporal=0.50)
+    sub["Score"] = 0.50
+
+    # Orden visible
+    dm_cat = pd.CategoricalDtype(["MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
+    try:
+        sub["DELIVERY_MOD"] = sub["DELIVERY_MOD"].astype(dm_cat)
+        sub = sub.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])
+    except Exception:
+        sub = sub.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])
+
+    return sub[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"]]
+
+
+
+
+
 
 def reconcile_plan_with_detail(plan_df: pd.DataFrame, detalle_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -2875,32 +2915,6 @@ try:
                     # 3) Reconciliación: shipments de abajo → arriba; SPR resultante arriba
                     plan = reconcile_plan_with_detail(plan_base, detalles)
 
-                    # === TABLA 3: Detalle por MLP (llenado secuencial) ===
-                    try:
-                        tabla3 = build_mlp_detail(detalles)
-                    except Exception as e:
-                        st.error("No se pudo construir la Tabla 3 (detalle por MLP).")
-                        show_exception(e, "Tabla 3 (traceback)")
-                        tabla3 = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
-                    
-                    # Persistimos
-                    st.session_state["mlp_detalle_df"] = tabla3.copy()
-                    
-                    # Mostrar (y control de cuadre)
-                    st.markdown("### Detalle por MLP – (Tabla 3)")
-                    st.dataframe(tabla3, use_container_width=True, hide_index=True)
-                    
-                    # Control de cuadre: Tabla 3 vs Detalle (abajo)
-                    if not tabla3.empty:
-                        agg_t3 = tabla3.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])["Rutas"].sum().rename("Rutas_T3")
-                        agg_det = detalles[detalles["DELIVERY_MOD"].isin(["MLP SDD","MLP SPOT","MLP BACKLOG"])] \
-                            .groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])["Rutas"].sum().rename("Rutas_DET")
-                        chk = pd.concat([agg_t3, agg_det], axis=1).fillna(0).reset_index()
-                        chk["Diff"] = chk["Rutas_DET"] - chk["Rutas_T3"]
-                        if (chk["Diff"].abs() > 0).any():
-                            st.warning("Hay diferencias entre Tabla 3 y el detalle por vehículo (deberían ser 0). Revisa el control abajo.")
-                            st.dataframe(chk, use_container_width=True, hide_index=True)
-
 
                     # ✅ NUEVO: persistir para que el chat y los reruns lo usen
                     st.session_state["plan_df"] = plan.copy()
@@ -2957,6 +2971,38 @@ try:
                 # 7) Mostrar detalle
                 st.markdown("### Detalle por vehículo – SVC – día")
                 st.dataframe(detalles, use_container_width=True, hide_index=True)
+
+
+                # === TABLA 3: Detalle por MLP (temporal con pool) ===
+                st.markdown("### Detalle por MLP – (Tabla 3)")
+                
+                try:
+                    # Recalcula si cambió la fuente 'detalles'
+                    if "mlp_detalle_df" not in st.session_state or st.session_state.get("_mlp_detalle_rows_src", -1) != len(detalles):
+                        tabla3 = build_mlp_detail(detalles)
+                        st.session_state["mlp_detalle_df"] = tabla3.copy()
+                        st.session_state["_mlp_detalle_rows_src"] = len(detalles)
+                    else:
+                        tabla3 = st.session_state["mlp_detalle_df"]
+                
+                    if tabla3 is None or tabla3.empty:
+                        st.info("Sin asignaciones MLP para mostrar. Revisa que el detalle tenga filas de 'MLP SDD/SPOT/BACKLOG'.")
+                    else:
+                        st.dataframe(tabla3, use_container_width=True, hide_index=True)
+                
+                    # 🔎 Debug rápido
+                    with st.expander("Debug Tabla 3", expanded=False):
+                        st.write("Filas detalle:", 0 if detalles is None else len(detalles))
+                        if detalles is not None and not detalles.empty:
+                            st.write("Muestra detalle (MLP):",
+                                     detalles[detalles["DELIVERY_MOD"].isin(["MLP SDD","MLP SPOT","MLP BACKLOG"])].head(8))
+                        st.write("Filas Tabla 3:", 0 if tabla3 is None else len(tabla3))
+                        if tabla3 is not None and not tabla3.empty:
+                            st.write(tabla3.head(8))
+                
+                except Exception as e:
+                    st.error("No se pudo construir o mostrar la Tabla 3.")
+                    show_exception(e, "Tabla 3 (traceback)")
 
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
