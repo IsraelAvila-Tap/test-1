@@ -1075,22 +1075,45 @@ def load_mlp_caps_by_carrier_from_srm() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=want)
 
-    # SVC + MLP
-    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", required=False, source_label="SRM")
-    find_and_rename(df, ["MLP","Proveedor","Carrier","Proveedor MLP","Partner"], "MLP", required=False, source_label="SRM")
-    df = ensure_columns(df, {"SVC":None, "MLP":""})
+    # -------- SVC (con fallback fuzzy, igual a load_mlp_caps_from_srm) --------
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC",
+                    required=False, source_label="SRM")
+    if "SVC" not in df.columns:
+        cmap = {_canon_name(c): c for c in df.columns}
+        for key, real in cmap.items():
+            if key.startswith("svc") or key in {"svcs","logisticcenterid","facility","lc"}:
+                if real != "SVC":
+                    df.rename(columns={real: "SVC"}, inplace=True)
+                break
+    if "SVC" not in df.columns:
+        # sin SVC no podemos cruzar; regresamos vacío con headers
+        return pd.DataFrame(columns=want)
+
+    # -------- MLP (fuzzy también) --------------------------------------------
+    find_and_rename(df, ["MLP","Proveedor","Carrier","Proveedor MLP","Partner"], "MLP",
+                    required=False, source_label="SRM")
+    if "MLP" not in df.columns:
+        # busca algo que parezca proveedor / carrier
+        cmap = {_canon_name(c): c for c in df.columns}
+        for key, real in cmap.items():
+            if any(tok in key for tok in ["mlp","proveedor","carrier","partner"]):
+                if real != "MLP":
+                    df.rename(columns={real: "MLP"}, inplace=True)
+                break
+    if "MLP" not in df.columns:
+        df["MLP"] = ""
+
     df = _as_str_cols(df, ["SVC","MLP"])
 
-    # Canon de columnas (igual filosofía que load_mlp_caps_from_srm)
+    # ---------------- Canon de columnas y picks por familia/tipo --------------
     def canon_col(name: str) -> str:
         c = _canon_name(name)
         c = c.replace("h&b", "hb")
-        c = re.sub(r"w\d+", "", c)      # quita W36...
+        c = re.sub(r"w\d+", "", c)      # quita W36, etc.
         c = re.sub(r"\d+$", "", c)
         return c
 
     canon = {c: canon_col(c) for c in df.columns}
-
     def is_data(cc):  # ignora claves
         return cc not in {"svc","svcs","logisticcenterid","facility","lc","mlp"}
 
@@ -1107,12 +1130,13 @@ def load_mlp_caps_by_carrier_from_srm() -> pd.DataFrame:
         exc_tokens = (exc_tokens or [])
         out = []
         for col, cc in canon.items():
-            if not is_data(cc): continue
-            if all(has(cc, ft) for ft in fam_tokens) and has_any(cc, type_tokens) and not has_any(cc, EXC_TOT) and not has_any(cc, exc_tokens):
+            if not is_data(cc):
+                continue
+            if all(has(cc, ft) for ft in fam_tokens) and has_any(cc, type_tokens) \
+               and not has_any(cc, EXC_TOT) and not has_any(cc, exc_tokens):
                 out.append(col)
         return out
 
-    # Mapea a LV/SV/CAR por familia (SDD/SPOT/BACKUP)
     sdd_lv  = pick_cols(LV,  ["sdd"])
     sdd_sv  = pick_cols(SV,  ["sdd"])
     sdd_car = pick_cols(CAR, ["sdd"])
@@ -1125,7 +1149,6 @@ def load_mlp_caps_by_carrier_from_srm() -> pd.DataFrame:
     back_sv  = pick_cols(SV,  BACK_ANY)
     back_car = pick_cols(CAR, BACK_ANY)
 
-    # Asegura numérico y suma por fila
     for c in set(sdd_lv+sdd_sv+sdd_car+spot_lv+spot_sv+spot_car+back_lv+back_sv+back_car):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
@@ -1147,8 +1170,8 @@ def load_mlp_caps_by_carrier_from_srm() -> pd.DataFrame:
     rows = []
     def push(row, dm, veh, val):
         v = int(max(0, float(val or 0)))
-        if v > 0:
-            rows.append([row.SVC, row.MLP, dm, veh, v])
+        if v > 0 and str(row.MLP).strip() != "":
+            rows.append([str(row.SVC), str(row.MLP), dm, veh, v])
 
     for r in caps.itertuples(index=False):
         push(r, "MLP SDD",     "Large Van", int(r.SDD_LV))
@@ -2340,12 +2363,14 @@ def build_mlp_detail(detalles_df: pd.DataFrame) -> pd.DataFrame:
 
     # 2) Topes por MLP desde SRM (por SVC×modo×vehículo)
     caps = load_mlp_caps_by_carrier_from_srm()
+    caps = caps[caps["MLP"].astype(str).str.strip() != ""].copy()
     if caps.empty:
         # si no hay topes, regresamos una vista por pool para no romper
         tmp = need.copy()
         tmp["MLP"] = tmp["DELIVERY_MOD"].map({"MLP SDD":"POOL_SDD","MLP SPOT":"POOL_SPOT","MLP BACKLOG":"POOL_BACKLOG"})
         tmp["Score"] = 0.5
         return tmp[out_cols]
+        
 
     # 3) Score por MLP (por SVC); fallback 0.5
     sc = load_mlp_scores_from_sheet()
