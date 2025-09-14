@@ -3214,12 +3214,17 @@ try:
                     st.caption("Score por MLP (primeras 12 filas)")
                     st.dataframe(_scor_dbg.head(12), use_container_width=True, hide_index=True)
                 
-####
-                    with st.expander("🔎 Debug SRM & Score", expanded=False):
-                        st.caption("Caps por MLP (primeras 12 filas)")
-                        st.dataframe(load_mlp_caps_by_carrier_from_srm().head(12), use_container_width=True, hide_index=True)
-                        st.caption("Score por MLP (primeras 12 filas)")
-                        st.dataframe(load_mlp_scores_from_sheet().head(12), use_container_width=True, hide_index=True)
+####        
+                # (Opcional) Debug SRM & Score
+                _caps_dbg = load_srm_caps_by_mlp_detailed()
+                _scor_dbg = load_mlp_score_from_arer()
+                
+                with st.expander("🔎 Debug SRM & Score", expanded=False):
+                    st.caption("Caps por MLP (primeras 12 filas)")
+                    st.dataframe(_caps_dbg.head(12), use_container_width=True, hide_index=True)
+                    st.caption("Score por MLP (primeras 12 filas)")
+                    st.dataframe(_scor_dbg.head(12), use_container_width=True, hide_index=True)
+
 
 ###
                 
