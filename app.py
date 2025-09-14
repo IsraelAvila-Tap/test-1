@@ -144,7 +144,8 @@ SHEET_TABS = {
     "capacity": "Capacity",
     "rentals":  "Rentals",
     "crowd":    "Crowd",
-    "srm":      "SRM",     # <--- NUEVO (capacidad MLP)
+    "srm":      "SRM",
+    "arer":     "AR-ER",
 }
 
 # ---------------------------------------------------------
@@ -1062,6 +1063,119 @@ def load_mlp_caps_from_srm() -> pd.DataFrame:
     out["MLP"] = out["MLP"].fillna("")
 
     return out[out_cols]
+
+def load_mlp_caps_by_carrier_from_srm() -> pd.DataFrame:
+    """
+    Topes SRM por MLP×SVC×(MLP SDD|MLP SPOT|MLP BACKLOG)×Vehículo.
+    Columnas: MLP, SVC, DELIVERY_MOD, VEHICULO_TIPO_HOM, TOPE
+    """
+    df = read_sheet(SHEET_ID, SHEET_TABS["srm"])
+    out_cols = ["MLP","SVC","DELIVERY_MOD","VEHICULO_TIPO_HOM","TOPE"]
+    if df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", required=False, source_label="SRM")
+    find_and_rename(df, ["MLP","Proveedor","Carrier","Proveedor MLP","Partner"], "MLP", required=False, source_label="SRM")
+    df = ensure_columns(df, {"SVC": None, "MLP": ""})
+    _as_str_cols(df, ["SVC","MLP"])
+
+    def canon_col(name: str) -> str:
+        c = _canon_name(name)
+        c = c.replace("h&b","hb")
+        c = re.sub(r"w\d+", "", c)   # quita W36/Wxx
+        c = re.sub(r"\d+$", "", c)
+        return c
+
+    canon = {c: canon_col(c) for c in df.columns}
+
+    LV, SV, CAR = ["largev","largevan","large","lv","xlarge","xlv","heavybulky","hb"], ["smallvan","small","sv"], ["car","auto","sedan"]
+    SDD, SPOT, BACK, EXC_TOTAL = ["sdd","adenda","agenda"], ["spot"], ["bu","backup","back","backlog"], ["total"]
+
+    mapping = []
+    for col, cc in canon.items():
+        if cc in ("svc","mlp"): 
+            continue
+        if any(t in cc for t in EXC_TOTAL):
+            continue
+
+        dm = None
+        if any(t in cc for t in SDD): dm = "MLP SDD"
+        elif any(t in cc for t in SPOT) and not any(t in cc for t in BACK): dm = "MLP SPOT"
+        elif any(t in cc for t in BACK): dm = "MLP BACKLOG"
+        if dm is None: 
+            continue
+
+        if   any(t in cc for t in LV):  veh = "Large Van"
+        elif any(t in cc for t in SV):  veh = "Small Van"
+        elif any(t in cc for t in CAR): veh = "Car"
+        else:                           veh = "__TOTAL__"  # backlog total sin tipo
+
+        mapping.append((col, dm, veh))
+
+    for col, _, _ in mapping:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    rows = []
+    for col, dm, veh in mapping:
+        sub = df[["MLP","SVC", col]].copy()
+        sub["DELIVERY_MOD"] = dm
+        sub["VEHICULO_TIPO_HOM"] = veh
+        sub.rename(columns={col:"TOPE"}, inplace=True)
+        rows.append(sub)
+
+    caps = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=out_cols)
+    _as_str_cols(caps, ["MLP","SVC","DELIVERY_MOD","VEHICULO_TIPO_HOM"])
+    caps["TOPE"] = pd.to_numeric(caps["TOPE"], errors="coerce").fillna(0).astype(int)
+    return caps[out_cols]
+
+def load_mlp_scores_from_sheet() -> pd.DataFrame:
+    """
+    Calcula SCORE por MLP (y SVC si viene) desde la historia AR-ER.
+    No penaliza cancelados:
+      Aceptación = Aceptados / Solicitados
+      Ejecución  = Ejecutados / (Aceptados - Cancelados)
+      CapEfect   = Ejecutados / (Solicitados - Cancelados)
+      SCORE = 0.5*Ejecución + 0.3*Aceptación + 0.2*CapEfect
+    Retorna columnas: MLP, SVC, SCORE (0..1)
+    """
+    df = read_sheet(SHEET_ID, SHEET_TABS["arer"])
+    out_cols = ["MLP","SVC","SCORE"]
+    if df.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    find_and_rename(df, ["MLP","Proveedor","Carrier","Partner"], "MLP", False, "AR-ER")
+    find_and_rename(df, ["SVC","LC","Facility"], "SVC", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Solicitados","Solicitudes","Rutas solicitadas"], "SOL", False, "AR-ER")
+    find_and_rename(df, ["Aceptados","Confirmados"], "ACEP", False, "AR-ER")
+    find_and_rename(df, ["Cancelados"], "CANC", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Ejecutados","Presentados"], "EJEC", False, "AR-ER")
+
+    df = ensure_columns(df, {"MLP":"", "SVC":"", "SOL":0, "ACEP":0, "CANC":0, "EJEC":0})
+    _as_str_cols(df, ["MLP","SVC"])
+    for c in ["SOL","ACEP","CANC","EJEC"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    # Agregado (suma por MLP,SVC)
+    g = df.groupby(["MLP","SVC"], dropna=False)[["SOL","ACEP","CANC","EJEC"]].sum().reset_index()
+
+    # Métricas (con seguros de división)
+    acept = (g["ACEP"] / g["SOL"].replace(0, np.nan)).fillna(0).clip(0,1)
+    ejec  = (g["EJEC"] / (g["ACEP"] - g["CANC"]).replace(0, np.nan)).fillna(0).clip(0,1)
+    capef = (g["EJEC"] / (g["SOL"]  - g["CANC"]).replace(0, np.nan)).fillna(0).clip(0,1)
+
+    score = 0.5*ejec + 0.3*acept + 0.2*capef
+    out = g[["MLP","SVC"]].copy()
+    out["SCORE"] = score.clip(0,1)
+
+    # Fallback por MLP (si hay SVC vacío)
+    mlp_only = out.groupby("MLP")["SCORE"].mean().rename("SCORE_MLP").reset_index()
+    out = out.merge(mlp_only, on="MLP", how="left")
+    out["SCORE"] = out["SCORE"].fillna(out["SCORE_MLP"]).fillna(0.5)
+    out.drop(columns=["SCORE_MLP"], inplace=True)
+    _as_str_cols(out, ["MLP","SVC"])
+    return out[["MLP","SVC","SCORE"]]
+
+
 
 
 # ---- NUEVO: SPR de MLP ----
@@ -2156,6 +2270,133 @@ def _to_num_series(s):
         errors="coerce"
     ).fillna(0)
 
+
+def build_mlp_detail(detalle_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Arma Tabla 3: reparto secuencial por SCORE respetando topes SRM.
+    Entradas:
+      - detalle_df (expand_to_vehicle_level): contiene Rutas por (SVC, FECHA, DELIVERY_MOD, VEHÍCULO)
+    Usa:
+      - load_mlp_caps_by_carrier_from_srm()
+      - load_mlp_scores_from_sheet()
+    Salida columnas:
+      FECHA, SVC, DELIVERY_MOD, SHP_LG_VEHICLE_TYPE, MLP, Rutas, Score
+    """
+    if detalle_df is None or detalle_df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
+
+    caps = load_mlp_caps_by_carrier_from_srm()
+    scores = load_mlp_scores_from_sheet()
+
+    # Solo DMs de MLP
+    det = detalle_df.copy()
+    dm = det["DELIVERY_MOD"].astype(str)
+    det = det[dm.isin(["MLP SDD","MLP SPOT","MLP BACKLOG"])].copy()
+    if det.empty or caps.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
+
+    # Normaliza
+    _as_str_cols(det,  ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])
+    _as_str_cols(caps, ["SVC","DELIVERY_MOD","VEHICULO_TIPO_HOM","MLP"])
+    caps["TOPE"] = pd.to_numeric(caps["TOPE"], errors="coerce").fillna(0).astype(int)
+    det["Rutas"] = pd.to_numeric(det["Rutas"], errors="coerce").fillna(0).astype(int)
+
+    # Demandas a repartir por (SVC, DM, VEH)
+    demand = (
+        det.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)["Rutas"]
+           .sum().reset_index()
+           .rename(columns={"SHP_LG_VEHICLE_TYPE":"VEH"})
+    )
+
+    # Caps (join a scores)
+    sc = scores.copy()
+    _as_str_cols(sc, ["MLP","SVC"])
+    sc["SCORE"] = pd.to_numeric(sc["SCORE"], errors="coerce").fillna(0.5)
+
+    # Prepara caps con score
+    caps2 = caps.rename(columns={"VEHICULO_TIPO_HOM":"VEH"}).copy()
+    caps2 = caps2.merge(sc, on=["MLP","SVC"], how="left")
+    caps2["SCORE"] = caps2["SCORE"].fillna(0.5)
+
+    rows = []
+    # Para backlog, puede venir __TOTAL__ sin desglosar: controlaremos un saldo por MLP
+    # Creamos un dict {(MLP,SVC,DM): saldo_total_backlog} cuando veh="__TOTAL__"
+    total_back = (
+        caps2[(caps2["DELIVERY_MOD"]=="MLP BACKLOG") & (caps2["VEH"]=="__TOTAL__")]
+            .groupby(["MLP","SVC","DELIVERY_MOD"])["TOPE"].sum().to_dict()
+    )
+
+    # Helper para leer y descontar tope por MLP×SVC×DM×VEH (con __TOTAL__ para backlog)
+    def take_capacity(mlp, svc, dm, veh, want):
+        mask = (caps2["MLP"]==mlp) & (caps2["SVC"]==svc) & (caps2["DELIVERY_MOD"]==dm) & (caps2["VEH"]==veh)
+        avail = int(caps2.loc[mask, "TOPE"].sum())
+        if dm == "MLP BACKLOG" and avail == 0:
+            # usa saldo total si existe
+            key = (mlp, svc, dm)
+            avail = int(total_back.get(key, 0))
+            used = min(want, avail)
+            if used > 0:
+                total_back[key] = avail - used
+            return used
+        # Descuenta del cap por vehículo
+        used = min(want, avail)
+        if used > 0 and mask.any():
+            caps2.loc[mask, "TOPE"] = (caps2.loc[mask, "TOPE"] - used).clip(lower=0)
+        return used
+
+    # Orden LV→SV→Car para backlog si hubiera que prorratear __TOTAL__
+    veh_order = {"Large Van":0, "Small Van":1, "Car":2}
+
+    # Recorremos cada llave a asignar
+    for _, r in demand.iterrows():
+        svc = r["SVC"]; dm = r["DELIVERY_MOD"]; veh = r["VEH"]
+        pendiente = int(r["Rutas"])
+        if pendiente <= 0: 
+            continue
+
+        # Candidatos con tope >0
+        cands = caps2[(caps2["SVC"]==svc) & (caps2["DELIVERY_MOD"]==dm)]
+        if dm != "MLP BACKLOG":
+            cands = cands[cands["VEH"]==veh]
+        else:
+            # para backlog aceptamos (veh==veh) o (__TOTAL__)
+            cands = cands[(cands["VEH"]==veh) | (cands["VEH"]=="__TOTAL__")]
+
+        cands = cands.copy()
+        # Filtra los que realmente tienen disponibilidad ahora
+        def current_avail(row):
+            if row["VEH"] != "__TOTAL__":
+                m = (caps2["MLP"]==row["MLP"]) & (caps2["SVC"]==svc) & (caps2["DELIVERY_MOD"]==dm) & (caps2["VEH"]==veh)
+                return int(caps2.loc[m, "TOPE"].sum())
+            else:
+                return int(total_back.get((row["MLP"], svc, dm), 0))
+        cands["AVAIL_NOW"] = cands.apply(current_avail, axis=1)
+        cands = cands[cands["AVAIL_NOW"] > 0]
+
+        if cands.empty:
+            continue
+
+        # Orden por SCORE desc (si dm == BACKLOG y cands incluyen __TOTAL__, no importa el orden de veh)
+        cands = cands.drop_duplicates(subset=["MLP"]) \
+                     .sort_values(["SCORE","MLP"], ascending=[False, True])
+
+        # Asignación secuencial
+        for _, c in cands.iterrows():
+            if pendiente <= 0:
+                break
+            used = take_capacity(c["MLP"], svc, dm, veh, pendiente)
+            if used > 0:
+                rows.append([
+                    # FECHA: tomamos la fecha del detalle (todas iguales por día)
+                    det["FECHA"].iloc[0] if "FECHA" in det.columns and not det["FECHA"].isna().all() else date.today(),
+                    svc, dm, veh, c["MLP"], int(used), float(c["SCORE"])
+                ])
+                pendiente -= used
+
+    out = pd.DataFrame(rows, columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
+    return out
+
+
 def reconcile_plan_with_detail(plan_df: pd.DataFrame, detalle_df: pd.DataFrame) -> pd.DataFrame:
     """
     Toma la tabla de arriba (plan_df) y el detalle (detalle_df),
@@ -2633,6 +2874,33 @@ try:
 
                     # 3) Reconciliación: shipments de abajo → arriba; SPR resultante arriba
                     plan = reconcile_plan_with_detail(plan_base, detalles)
+
+                    # === TABLA 3: Detalle por MLP (llenado secuencial) ===
+                    try:
+                        tabla3 = build_mlp_detail(detalles)
+                    except Exception as e:
+                        st.error("No se pudo construir la Tabla 3 (detalle por MLP).")
+                        show_exception(e, "Tabla 3 (traceback)")
+                        tabla3 = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"])
+                    
+                    # Persistimos
+                    st.session_state["mlp_detalle_df"] = tabla3.copy()
+                    
+                    # Mostrar (y control de cuadre)
+                    st.markdown("### Detalle por MLP – (Tabla 3)")
+                    st.dataframe(tabla3, use_container_width=True, hide_index=True)
+                    
+                    # Control de cuadre: Tabla 3 vs Detalle (abajo)
+                    if not tabla3.empty:
+                        agg_t3 = tabla3.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])["Rutas"].sum().rename("Rutas_T3")
+                        agg_det = detalles[detalles["DELIVERY_MOD"].isin(["MLP SDD","MLP SPOT","MLP BACKLOG"])] \
+                            .groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])["Rutas"].sum().rename("Rutas_DET")
+                        chk = pd.concat([agg_t3, agg_det], axis=1).fillna(0).reset_index()
+                        chk["Diff"] = chk["Rutas_DET"] - chk["Rutas_T3"]
+                        if (chk["Diff"].abs() > 0).any():
+                            st.warning("Hay diferencias entre Tabla 3 y el detalle por vehículo (deberían ser 0). Revisa el control abajo.")
+                            st.dataframe(chk, use_container_width=True, hide_index=True)
+
 
                     # ✅ NUEVO: persistir para que el chat y los reruns lo usen
                     st.session_state["plan_df"] = plan.copy()
