@@ -2457,19 +2457,59 @@ def _dm_norm_label(s: str) -> str:
 
 def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
     """
-    Lee SRM y devuelve filas a nivel proveedor MLP con:
+    Devuelve filas a nivel proveedor MLP con:
       SVC, MLP, DELIVERY_MOD ('MLP SDD'|'MLP SPOT'|'MLP BACKLOG'),
       SHP_LG_VEHICLE_TYPE ('Large Van'|'Small Van'|'Car'), CAP (int)
-    Ignora columnas 'Total ...'. Hace forward-fill del MLP por SVC.
+    Hace:
+      - búsqueda robusta de la pestaña (SRM, SRM ✅, etc.)
+      - autodetección de cabecera
+      - ffill del MLP por SVC
+      - fallback a loader legacy si no arma filas
     """
-    df = read_sheet(SHEET_ID, SHEET_TABS["srm"])
     out_cols = ["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","CAP"]
-    if df.empty:
+
+    # ---------- 1) leer pestaña SRM con alias ----------
+    candidate_tabs = []
+    try:
+        candidate_tabs.append(SHEET_TABS["srm"])
+    except Exception:
+        pass
+    candidate_tabs += ["SRM ✅", "SRM", "srm", "Srm", "SRM-MLP"]
+
+    raw = pd.DataFrame()
+    for tab in candidate_tabs:
+        try:
+            tmp = read_sheet(SHEET_ID, tab)
+            if tmp is not None and not tmp.empty:
+                raw = tmp.copy()
+                break
+        except Exception:
+            continue
+
+    if raw.empty:
         return pd.DataFrame(columns=out_cols)
 
-    # --- SVC robusto ---
+    # ---------- 2) autodetección de fila header ----------
+    # buscamos una fila que contenga al menos 2 de estos tokens
+    header_tokens = ["SVC", "MLP", "SDD", "SPOT", "Back", "Large", "Small", "Car"]
+    hdr_idx = None
+    chk = raw.astype(str).fillna("")
+    for i in range(min(len(raw), 15)):  # chequea primeras 15 filas
+        row_txt = " | ".join(chk.iloc[i, :].tolist())
+        hits = sum(1 for t in header_tokens if t.lower() in row_txt.lower())
+        if hits >= 2:
+            hdr_idx = i
+            break
+    if hdr_idx is not None:
+        raw.columns = chk.iloc[hdr_idx, :].tolist()
+        raw = raw.iloc[hdr_idx+1:, :].reset_index(drop=True)
+
+    df = raw.copy()
+
+    # ---------- 3) columnas clave (SVC / MLP) ----------
     find_and_rename(df, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", required=False, source_label="SRM")
     if "SVC" not in df.columns:
+        # último intento: busca columna cuyo nombre canónico empiece con 'svc'
         cmap = {_canon_name(c): c for c in df.columns}
         for can, real in cmap.items():
             if can.startswith("svc"):
@@ -2479,33 +2519,35 @@ def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
     if "SVC" not in df.columns:
         return pd.DataFrame(columns=out_cols)
 
-    # --- Proveedor (MLP) robusto ---
     find_and_rename(df, ["MLP","Proveedor","Carrier","Proveedor MLP","Partner"], "MLP", required=False, source_label="SRM")
     if "MLP" not in df.columns:
         df["MLP"] = ""
+
     _as_str_cols(df, ["SVC","MLP"])
 
-    # Forward-fill del MLP dentro de cada SVC (en SRM a veces dejan celdas vacías)
+    # ffill del MLP por SVC (en SRM suelen dejar huecos)
     def _ffill_grp(g):
         s = g["MLP"].replace("", np.nan)
         g["MLP"] = s.ffill().fillna("")
         return g
     df = df.groupby("SVC", group_keys=False).apply(_ffill_grp)
 
-    # --- Canon para ubicar familias/tipos (excluye 'total') ---
+    # ---------- 4) localizar columnas de cap ----------
+    import re
     def canon_col(name: str) -> str:
-        c = _canon_name(name)
+        c = _canon_name(name)  # tu helper (lower + quita acentos/punct)
         c = c.replace("h&b", "hb")
         c = re.sub(r"w\d+", "", c)  # quita W36...
         return c
+
     canon = {c: canon_col(c) for c in df.columns}
 
     def pick_cols(family_tokens: list[str], type_tokens: list[str]) -> list[str]:
         sel = []
         for col, cc in canon.items():
-            if col in ("SVC","MLP"):     # columnas clave
+            if col in ("SVC","MLP"):     # claves
                 continue
-            if "total" in cc:            # evita 'Total ...'
+            if "total" in cc:            # evita Totales
                 continue
             if all(t in cc for t in family_tokens) and any(t in cc for t in type_tokens):
                 sel.append(col)
@@ -2528,16 +2570,17 @@ def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
     }
 
     # numérico
-    for c in set(sum(bucket_cols.values(), [])):
+    all_cap_cols = set(sum(bucket_cols.values(), []))
+    for c in all_cap_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # expand → filas
+    # ---------- 5) expand ----------
     rows = []
     for _, r in df.iterrows():
         svc = str(r["SVC"])
         mlp = str(r["MLP"]).strip()
         if not mlp:
-            continue  # descarta agregados sin proveedor
+            continue
         for (dm, veh), lst in bucket_cols.items():
             if not lst:
                 continue
@@ -2545,8 +2588,63 @@ def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
             if cap > 0:
                 rows.append([svc, mlp, dm, veh, cap])
 
-    return pd.DataFrame(rows, columns=out_cols)
+    out = pd.DataFrame(rows, columns=out_cols)
 
+    # ---------- 6) FALLBACK al loader legacy si quedó vacío ----------
+    if out.empty:
+        try:
+            legacy = load_mlp_caps_by_carrier_from_srm()  # tu función vieja
+            if legacy is not None and not legacy.empty:
+                x = legacy.copy()
+
+                # normaliza columnas
+                find_and_rename(x, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", required=False, source_label="SRM-LEG")
+                find_and_rename(x, ["MLP","Carrier","Proveedor","Partner"], "MLP", required=False, source_label="SRM-LEG")
+                find_and_rename(x, ["DELIVERY_MOD","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="SRM-LEG")
+                find_and_rename(x, ["SHP_LG_VEHICLE_TYPE","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="SRM-LEG")
+                # capacidad
+                cap_col = None
+                for c in ["CAP","Capacidad","Rutas","Qty","Cantidad","Units"]:
+                    if c in x.columns:
+                        cap_col = c; break
+                if cap_col is None:
+                    # busca columna numérica con sum>0
+                    num_cols = [c for c in x.columns if pd.api.types.is_numeric_dtype(x[c])]
+                    if num_cols:
+                        cap_col = max(num_cols, key=lambda c: pd.to_numeric(x[c], errors="coerce").fillna(0).sum())
+                if cap_col is None:
+                    return pd.DataFrame(columns=out_cols)
+
+                # limpiar y mapear
+                _as_str_cols(x, ["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])
+                x[cap_col] = pd.to_numeric(x[cap_col], errors="coerce").fillna(0).astype(int)
+
+                def _dm_norm(v):
+                    t = (v or "").upper()
+                    if "SPOT" in t: return "MLP SPOT"
+                    if "BACK" in t or "BU" in t: return "MLP BACKLOG"
+                    return "MLP SDD"
+                def _veh_norm(v):
+                    t = (v or "").lower()
+                    if "small" in t: return "Small Van"
+                    if "car" in t: return "Car"
+                    return "Large Van"
+
+                out = (x
+                    .assign(DELIVERY_MOD=lambda d: d["DELIVERY_MOD"].map(_dm_norm),
+                            SHP_LG_VEHICLE_TYPE=lambda d: d["SHP_LG_VEHICLE_TYPE"].map(_veh_norm))
+                    [["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE",cap_col]]
+                    .rename(columns={cap_col:"CAP"})
+                )
+                out["CAP"] = pd.to_numeric(out["CAP"], errors="coerce").fillna(0).astype(int)
+                out = out[out["CAP"] > 0].copy()
+        except Exception:
+            pass
+
+    # salida final (con columnas siempre presentes)
+    if out is None or out.empty:
+        return pd.DataFrame(columns=out_cols)
+    return out[out_cols].reset_index(drop=True)
 
 
 def load_mlp_score_from_arer() -> pd.DataFrame:
@@ -3250,26 +3348,14 @@ try:
                     _caps_dbg = load_srm_caps_by_mlp_detailed()
                     _scor_dbg = load_mlp_score_from_arer()
                     st.caption("Caps por MLP (primeras 12 filas)")
+                    
+                    raw_srm__dbg = read_sheet(SHEET_ID, SHEET_TABS.get("srm","SRM"))
+                    st.caption(f"SRM columnas (primeras 30): {list(raw_srm__dbg.columns)[:30]}")
+
                     st.dataframe(_caps_dbg.head(12), use_container_width=True, hide_index=True)
                     st.caption("Score por MLP (primeras 12 filas)")
                     st.dataframe(_scor_dbg.head(12), use_container_width=True, hide_index=True)
                 
-####        
-                    # (Opcional) Debug SRM & Score
-                try:
-                    _caps_dbg = load_srm_caps_by_mlp_detailed()
-                    _scor_dbg = load_mlp_score_from_arer()
-            
-                    with st.expander("🔎 Debug SRM & Score", expanded=False):
-                        st.caption("Caps por MLP (primeras 12 filas)")
-                        st.dataframe(_caps_dbg.head(12), use_container_width=True, hide_index=True)
-            
-                        st.caption("Score por MLP (primeras 12 filas)")
-                        st.dataframe(_scor_dbg.head(12), use_container_width=True, hide_index=True)
-            
-                except Exception as e:
-                    st.error("No se pudo construir o mostrar la Tabla 3.")
-                    show_exception(e, "Tabla 3 (traceback)")
 
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
