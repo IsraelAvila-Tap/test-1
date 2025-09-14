@@ -2434,8 +2434,6 @@ def build_mlp_detail(detalles_df: pd.DataFrame) -> pd.DataFrame:
 
     return res[out_cols]
 
---------------------------------------------------------
-
 # =========================
 # Tabla 3: Detalle por MLP
 # =========================
