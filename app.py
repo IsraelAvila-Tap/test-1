@@ -348,10 +348,41 @@ def show_exception(e: Exception, title: str):
 ####
 
 # --- Parseo robusto de fechas en español tipo "2 de junio de 2025" (AR-ER) ---
+
+# Diccionario de meses en español (ya lo tienes arriba como _SP_MONTHS)
 _SP_MONTHS = {
     "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
-    "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
+    "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,
+    "noviembre":11,"diciembre":12
 }
+
+_ES_DATE_RE = re.compile(r"^\s*(\d{1,2})\s+de\s+([a-záéíóú]+)\s+de\s+(\d{4})\s*$", re.I)
+
+def parse_es_date(txt) -> Optional[datetime.date]:
+    """Acepta '2 de junio de 2025' y también intentará pd.to_datetime(dayfirst=True)."""
+    if txt is None or (isinstance(txt, float) and math.isnan(txt)):
+        return None
+    s = str(txt).strip()
+    m = _ES_DATE_RE.match(s.lower())
+    if m:
+        d = int(m.group(1))
+        mon_name = m.group(2).replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
+        y = int(m.group(3))
+        mon = _SP_MONTHS.get(mon_name, None)
+        if mon:
+            try:
+                return datetime.date(y, mon, d)
+            except Exception:
+                pass
+    # Fallbacks comunes (e.g. 02/06/2025, 2025-06-02)
+    try:
+        return pd.to_datetime(s, errors="coerce", dayfirst=True).date()
+    except Exception:
+        return None
+
+def parse_es_date_series(s: pd.Series) -> pd.Series:
+    return s.apply(parse_es_date)
+
 
 def _strip_accents(s: str) -> str:
     import unicodedata
@@ -2714,80 +2745,63 @@ def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
         return pd.DataFrame(columns=out_cols)
     return out[out_cols].reset_index(drop=True)
 
-@st.cache_data(show_spinner=False, ttl=300)
-def load_mlp_score_from_arer(lookback_days: int = 365) -> pd.DataFrame:
+
+def load_mlp_score_from_arer(window_days: int = 120) -> pd.DataFrame:
     """
-    Lee AR-ER (nuevo formato) y calcula SCORE por MLP×SVC:
-    SCORE = promedio(FILL_RATE) con FILL_RATE = EJECUTADO / max(CONFIRMADO,1), clip 0..1.
-    Ventana por defecto: 365 días. Si la ventana queda vacía, hace fallback a todo el dataset.
+    Lee la pestaña AR-ER con el nuevo formato y calcula SCORE por (MLP, SVC).
+    SCORE = EJECUTADO / max(CONFIRMADO, 1) agregado en la ventana.
     """
     try:
-        ar = read_sheet(SHEET_ID, SHEET_TABS["ar_er"])
-    except Exception:
+        df = read_sheet(SHEET_ID, SHEET_TABS["ar_er"])  # Asegúrate: SHEET_TABS["ar_er"] -> nombre real de la pestaña "AR-ER"
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["MLP","SVC","SCORE"])
+
+        # Normalización de columnas (robusto a variantes)
+        find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
+        find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
+        find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo"], "VEHICLE", required=False, source_label="AR-ER")
+        find_and_rename(df, [
+            "Mes, Día, Año de FECHA","Mes, dia, Año de FECHA","Mes, Día, Año FECHA",
+            "FECHA","Fecha","OP_DT","DATE"
+        ], "FECHA", required=False, source_label="AR-ER")
+        find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
+        find_and_rename(df, ["EJECUTADO","Ejecutado"], "EJECUTADO", required=False, source_label="AR-ER")
+
+        # Si falta lo esencial, devuelve vacío
+        need = ["MLP","SVC","FECHA","CONFIRMADO","EJECUTADO"]
+        if any(c not in df.columns for c in need):
+            return pd.DataFrame(columns=["MLP","SVC","SCORE"])
+
+        # Tipos
+        df["FECHA"] = parse_es_date_series(df["FECHA"])
+        df = df[df["FECHA"].notna()].copy()
+
+        # Ventana (últimos N días)
+        if window_days and window_days > 0:
+            cutoff = datetime.date.today() - datetime.timedelta(days=window_days)
+            df = df[df["FECHA"] >= cutoff].copy()
+
+        for c in ["CONFIRMADO","EJECUTADO"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+        _as_str_cols(df, ["MLP","SVC"])
+
+        # Agregado por (MLP, SVC)
+        agg = (
+            df.groupby(["MLP","SVC"], dropna=False)
+              .agg(CONFIRMADO=("CONFIRMADO","sum"), EJECUTADO=("EJECUTADO","sum"))
+              .reset_index()
+        )
+
+        # SCORE y orden
+        denom = agg["CONFIRMADO"].replace(0, np.nan)
+        agg["SCORE"] = (agg["EJECUTADO"] / denom).fillna(0.0).round(4)
+        agg = agg.sort_values(["SCORE","MLP","SVC"], ascending=[False, True, True]).reset_index(drop=True)
+
+        return agg[["MLP","SVC","SCORE"]]
+    except Exception as e:
+        show_exception(e, "AR-ER (score)")
         return pd.DataFrame(columns=["MLP","SVC","SCORE"])
-
-    if ar is None or ar.empty:
-        return pd.DataFrame(columns=["MLP","SVC","SCORE"])
-
-    # Normalización de columnas
-    find_and_rename(ar, ["DELIVERY_MODEL","Delivery model","Model","DM"], "DELIVERY_MODEL", required=False, source_label="AR-ER")
-    find_and_rename(ar, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
-    find_and_rename(ar, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", required=False, source_label="AR-ER")
-    find_and_rename(ar, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Tipo de vehiculo"], "VEH_TYPE", required=False, source_label="AR-ER")
-
-    # Fecha (nuevo header con comas/acentos)
-    got_date = coerce_spanish_date_column(
-        ar,
-        ["Mes, Día, Año de FECHA","Mes, dia, año de fecha","Fecha","FECHA","DATE","OP_DT"],
-        "FECHA"
-    )
-    if not got_date:
-        # Fallback por si ya viene como datetime
-        coerce_date_column(ar, ["FECHA","Fecha","DATE","OP_DT"], "FECHA", "AR-ER", required=False)
-
-    # Métricas
-    find_and_rename(ar, ["SOLICITADO FN","Solicitado FN","Solicitado","Requested"], "SOLICITADO_FN", required=False, source_label="AR-ER")
-    find_and_rename(ar, ["CONFIRMADO","Confirmado","CONFIRMADOS"], "CONFIRMADO", required=False, source_label="AR-ER")
-    find_and_rename(ar, ["Cancelaciones Form","CANCELACIONES FORM","Cancelaciones"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
-    find_and_rename(ar, ["EJECUTADO","Ejecutado","EJECUTADOS"], "EJECUTADO", required=False, source_label="AR-ER")
-
-    # Defaults y tipos
-    ar = ensure_columns(ar, {
-        "MLP":"", "SVC":"", "DELIVERY_MODEL":"", "VEH_TYPE":"",
-        "FECHA":pd.NaT, "SOLICITADO_FN":0, "CONFIRMADO":0, "CANCELACIONES_FORM":0, "EJECUTADO":0
-    })
-    _as_str_cols(ar, ["MLP","SVC","DELIVERY_MODEL","VEH_TYPE"])
-    ar["FECHA"] = pd.to_datetime(ar["FECHA"], errors="coerce")
-    ar["SOLICITADO_FN"]      = pd.to_numeric(ar["SOLICITADO_FN"], errors="coerce").fillna(0)
-    ar["CONFIRMADO"]         = pd.to_numeric(ar["CONFIRMADO"], errors="coerce").fillna(0)
-    ar["CANCELACIONES_FORM"] = pd.to_numeric(ar["CANCELACIONES_FORM"], errors="coerce").fillna(0)
-    ar["EJECUTADO"]          = pd.to_numeric(ar["EJECUTADO"], errors="coerce").fillna(0)
-
-    # Ventana: 365d por defecto + fallback si queda vacía
-    if ar["FECHA"].notna().any():
-        cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=int(lookback_days))
-        ar_w = ar[ar["FECHA"] >= cutoff].copy()
-        if ar_w.empty:
-            # usa todo el dataset si la ventana queda vacía
-            ar_w = ar.copy()
-        ar = ar_w
-
-    if ar.empty:
-        return pd.DataFrame(columns=["MLP","SVC","SCORE"])
-
-    # Fill-rate y score
-    ar["FILL_RATE"] = (ar["EJECUTADO"] / ar["CONFIRMADO"].replace(0, np.nan)).clip(0, 1).fillna(0)
-    score = (
-        ar.groupby(["MLP","SVC"], dropna=False)["FILL_RATE"]
-          .mean()
-          .rename("SCORE")
-          .reset_index()
-    )
-    score["MLP"] = score["MLP"].astype(str).str.strip()
-    score["SVC"] = score["SVC"].astype(str).str.strip()
-    score["SCORE"] = pd.to_numeric(score["SCORE"], errors="coerce").fillna(0).clip(0,1)
-
-    return score.sort_values(["SCORE","MLP"], ascending=[False, True]).reset_index(drop=True)
 
 
 
