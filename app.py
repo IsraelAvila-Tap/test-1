@@ -3658,14 +3658,6 @@ def render_fixed_header(
         unsafe_allow_html=True,
     )
 
-# --- Llamada al header fijo (cuando ya tengas final_header_h calculado) ---
-render_fixed_header(
-    logo_img=LOGO_IMAGE,
-    header_h=final_header_h,
-    logo_h=int(st.session_state["logo_h"]),
-)
-
-
 
 with st.sidebar.expander("🎨 Apariencia", expanded=False):
     _def_h = int(st.session_state.get("header_h", 60))
