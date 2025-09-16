@@ -17,7 +17,7 @@ import re, unicodedata
 from typing import Optional
 import datetime
 import math
-from __future__ import annotations
+
 
 
 # -----------------------------------------------------------------------------
