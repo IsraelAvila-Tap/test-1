@@ -3944,7 +3944,7 @@ try:
                     @st.cache_resource(show_spinner=False)
                     def _get_trained_model():
                         return train_shortfall_model(window_days=730)
-                    )
+                    
 
                     model = _get_trained_model()
 
