@@ -3830,6 +3830,8 @@ try:
                     @st.cache_resource(show_spinner=False)
                     def _get_trained_model():
                         return train_failure_model(window_days=730)
+
+                    st.caption(f"Distribución FAIL: {y.value_counts().to_dict()}")
                     
                     model = _get_trained_model()
                     
