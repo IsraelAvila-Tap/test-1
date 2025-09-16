@@ -339,6 +339,25 @@ def coerce_date_column(df: pd.DataFrame, candidates: List[str], new_name: str,
             df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=False, infer_datetime_format=True).dt.date
     return col
 
+def get_tab_name(alias: str, candidates: list[str]) -> str:
+    # 1) Si está configurado en SHEET_TABS, úsalo
+    name = SHEET_TABS.get(alias)
+    if isinstance(name, str) and name.strip():
+        return name
+    # 2) Si no, prueba candidatos en orden; el primero que no falle lo fijamos
+    for c in candidates:
+        try:
+            _df_test = read_sheet(SHEET_ID, c)
+            # si no explota y regresa algo (aunque esté vacío), lo tomamos
+            SHEET_TABS[alias] = c
+            return c
+        except Exception:
+            continue
+    # 3) Último recurso: devuelve el primero de la lista para no romper
+    SHEET_TABS[alias] = candidates[0]
+    return candidates[0]
+
+
 def safe_merge(left: pd.DataFrame, right: pd.DataFrame, on: List[str], how="left", suffixes=("_x","_y")):
     if right is None or right.empty:
         return left.copy()
@@ -2755,6 +2774,10 @@ def load_mlp_score_from_arer(window_days: int = 120) -> pd.DataFrame:
     Lee la pestaña AR-ER con el nuevo formato y calcula SCORE por (MLP, SVC).
     SCORE = EJECUTADO / max(CONFIRMADO, 1) agregado en la ventana.
     """
+    ###
+    tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
+    df = read_sheet(SHEET_ID, tab_arer)
+    ###
     try:
         df = read_sheet(SHEET_ID, SHEET_TABS["ar_er"])  # Asegúrate: SHEET_TABS["ar_er"] -> nombre real de la pestaña "AR-ER"
         if df is None or df.empty:
