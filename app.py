@@ -27,7 +27,7 @@ from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import HistGradientBoostingClassifier
-
+from sklearn.model_selection import train_test_split
 
 # -----------------------------------------------------------------------------
 # 0) Credenciales y configuración
@@ -3179,126 +3179,118 @@ class FailureModel:
     features: list
 
 def train_failure_model(window_days: int = 730) -> FailureModel | None:
-    """Entrena 2 años de historia: etiqueta FAIL, features de calendario, SPR (Tabla2) y rolling."""
-    hist = load_mlp_score_from_arer(window_days=window_days)  # NO: eso devuelve score; usamos AR-ER crudo
-    # Usamos el loader crudo de AR-ER que ya tienes arriba en tu código:
+    """
+    Entrena ~2 años de historia para predecir FAIL a nivel (MLP/Rentals × día × tipo de vehículo).
+    Usa SPR de la Tabla 2 (dinámico), features de calendario y rolling windows.
+    Devuelve FailureModel con el pipeline entrenado.
+    """
+    # --- 1) Carga AR-ER crudo (no scores agregados) y etiqueta ---
     try:
         tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
         arer = read_sheet(SHEET_ID, tab_arer)
     except Exception:
         arer = pd.DataFrame()
-    ydf = _label_from_arer(arer)
-    if ydf.empty:
+
+    ydf = _label_from_arer(arer)  # crea col 'FAIL' (0/1) por fila de ejecución
+    if ydf is None or ydf.empty:
         return None
 
-    ydf = _attach_tabla2_spr(ydf)
-    ydf = _add_calendar_feats(ydf, "FECHA")
-    ydf = _rolling_stats(ydf)
-    # Denominadores seguros
+    # --- 2) Enriquecimiento con SPR de la Tabla 2 + calendario + rolling ---
+    ydf = _attach_tabla2_spr(ydf)             # añade SPR_T2 por SVC×DM×Veh×día (dinámico)
+    ydf = _add_calendar_feats(ydf, "FECHA")   # añade DOW, IS_WE, MES, SEM, feriados, etc.
+    ydf = _rolling_stats(ydf)                 # añade FAIL_RATE_*d y CONF_*d por ventana
+
+    # Garantiza presencia de columnas de rolling aunque alguna ventana falte
     for c in [f"FAIL_RATE_{w}d" for w in ROLL_WINDOWS] + [f"CONF_{w}d" for w in ROLL_WINDOWS]:
         if c not in ydf.columns:
             ydf[c] = np.nan
 
-    # Features
-    num_feats = ["SPR_T2", "CONFIRMADO", "EJECUTADO",
-                 "DOW","IS_WE","MES","SEM",
-                 *[f"FAIL_RATE_{w}d" for w in ROLL_WINDOWS],
-                 *[f"CONF_{w}d" for w in ROLL_WINDOWS]]
-    cat_feats = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"]
+    # --- 3) Selección de features ---
+    num_feats = [
+        # del propio AR-ER / Tabla 2
+        "SPR_T2", "CONFIRMADO", "EJECUTADO",
+        # calendario
+        "DOW", "IS_WE", "MES", "SEM",
+        # rolling
+        *[f"FAIL_RATE_{w}d" for w in ROLL_WINDOWS],
+        *[f"CONF_{w}d" for w in ROLL_WINDOWS],
+    ]
+    cat_feats = ["SVC", "DELIVERY_MOD", "SHP_LG_VEHICLE_TYPE", "MLP"]
 
+    # Filtra por si alguna columna no existe
+    num_feats = [c for c in num_feats if c in ydf.columns]
+    cat_feats = [c for c in cat_feats if c in ydf.columns]
+
+    # Dataset X/y
     X = ydf[num_feats + cat_feats].copy()
     y = ydf["FAIL"].astype(int)
 
-    # Simple imputación
-    X[num_feats] = X[num_feats].fillna(X[num_feats].median())
+    # Imputación básica para numéricos (por si queda algún NaN antes del pipeline)
+    if num_feats:
+        X[num_feats] = X[num_feats].fillna(X[num_feats].median())
 
-    pre = ColumnTransformer(
-        transformers=[
-            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=True), cat_feats),
-            ("num", "passthrough", num_feats),
-        ]
-    )
-
-    # Modelo principal (GBM) + fallback logístico si algo falla
-    try:
-        clf = GradientBoostingClassifier(random_state=42)
-    except Exception:
-        clf = LogisticRegression(max_iter=200)
-
-    # === PREPROCESAMIENTO + MODELO ROBUSTO A NaNs ===
-    
-    # 1) Define columnas (ajusta si tu set de features tiene otros nombres)
-    cat_features = ["SVC", "DELIVERY_MOD", "SHP_LG_VEHICLE_TYPE", "MLP"]
-    num_features = [
-        # básicas de Tabla 2 / Tabla 3
-        "Rutas", "SPR", "Shipments",
-        # calendario
-        "dow", "is_weekend", "is_holiday", "is_pre_holiday", "is_post_holiday",
-        "weekofyear", "month",
-        # opcionales de escala/volumen si las generaste
-        "FCST_SVC", "CAP_TOTAL_SVC"
-    ]
-    
-    # Filtra a las que existan realmente en el dataframe de entrenamiento
-    cat_features = [c for c in cat_features if c in X.columns]
-    num_features = [c for c in num_features if c in X.columns]
-    
-    # 2) Preprocesador con imputación
-
-    # --- Preprocesado ---
+    # --- 4) Preprocesamiento (denso) ---
     num_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
     ])
-    
-    # usa salida DENSO
+
+    # OneHotEncoder denso (compatibilidad scikit-learn >=1.2 y <1.2)
     try:
-        cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)  # scikit-learn >= 1.2
+        cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
-        cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)         # compat < 1.2
-    
+        cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
     cat_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="most_frequent")),
         ("ohe", cat_ohe),
     ])
-    
-    # fuerza denso aunque haya columnas codificadas
+
     preprocess = ColumnTransformer(
         transformers=[
             ("num", num_pipe, num_feats),
             ("cat", cat_pipe, cat_feats),
         ],
-        sparse_threshold=0.0   # ← esto obliga a salida densa
+        remainder="drop",
+        sparse_threshold=0.0  # fuerza salida DENSE para el HGB
     )
 
-    clf = HistGradientBoostingClassifier(
-        learning_rate=0.08, max_iter=400, random_state=42
-    )
-    pipe = Pipeline([("prep", preprocess), ("clf", clf)])
-    pipe.fit(X_fit, y_fit)
+    # --- 5) Split de entrenamiento/validación ---
+    # Estratifica solo si hay ambas clases y suficientes muestras
+    do_strat = (y.nunique() == 2) and (y.value_counts().min() >= 2)
+    try:
+        X_fit, X_eval, y_fit, y_eval = train_test_split(
+            X, y, test_size=0.20, random_state=42, stratify=y if do_strat else None
+        )
+    except Exception:
+        X_fit, y_fit = X, y
+        X_eval, y_eval = X.iloc[:0], y.iloc[:0]
 
-    
-    # 3) Clasificador (tolera NaNs y suele rendir mejor que GB clásico)
+    # --- 6) Modelo (tolera NaNs) ---
     clf = HistGradientBoostingClassifier(
         learning_rate=0.08,
-        max_depth=None,
         max_iter=400,
-        l2_regularization=0.0,
+        max_depth=None,
         random_state=42
     )
-    
-    pipe = Pipeline(steps=[
+
+    pipe = Pipeline([
         ("prep", preprocess),
-        ("clf", clf)
+        ("clf", clf),
     ])
-    
-    # (opcional) quita filas sin etiqueta
-    mask_y = y.notna()
-    X_fit = X.loc[mask_y].copy()
-    y_fit = y.loc[mask_y].copy()
-    
+
     pipe.fit(X_fit, y_fit)
 
+    # --- 7) Métrica rápida (opcional) ---
+    try:
+        if len(X_eval) > 0:
+            p = pipe.predict_proba(X_eval)[:, 1]
+            auc = roc_auc_score(y_eval, p)
+            st.caption(f"AUC validación (aprox): {auc:.3f}")
+    except Exception:
+        pass
 
+    # --- 8) Empaqueta y devuelve ---
+    return FailureModel(pipeline=pipe, features=num_feats + cat_feats)
 
 
 
