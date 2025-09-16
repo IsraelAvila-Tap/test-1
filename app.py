@@ -3199,6 +3199,7 @@ class FailureModel:
     pipeline: Pipeline
     features: list
 
+###
 def train_failure_model(window_days: int = 730) -> FailureModel | None:
     """
     Entrena ~2 años de historia para predecir FAIL a nivel (MLP/Rentals × día × tipo de vehículo).
@@ -3228,39 +3229,37 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
 
     # --- 3) Selección de features ---
     num_feats = [
-        # del propio AR-ER / Tabla 2
         "SPR_T2", "CONFIRMADO", "EJECUTADO",
-        # calendario
         "DOW", "IS_WE", "MES", "SEM",
-        # rolling
         *[f"FAIL_RATE_{w}d" for w in ROLL_WINDOWS],
         *[f"CONF_{w}d" for w in ROLL_WINDOWS],
     ]
     cat_feats = ["SVC", "DELIVERY_MOD", "SHP_LG_VEHICLE_TYPE", "MLP"]
 
-    # Filtra por si alguna columna no existe
     num_feats = [c for c in num_feats if c in ydf.columns]
     cat_feats = [c for c in cat_feats if c in ydf.columns]
 
-    # Dataset X/y
     X = ydf[num_feats + cat_feats].copy()
     y = ydf["FAIL"].astype(int)
 
-    # Imputación básica para numéricos (por si queda algún NaN antes del pipeline)
+    # Debug de etiquetas (lo verás en la app)
+    try:
+        vc = y.value_counts().to_dict()
+        pos_rate = float(y.mean()) if len(y) else 0.0
+        st.caption(f"Etiquetas FAIL — counts: {vc} · tasa positivos: {pos_rate:.3f}")
+    except Exception:
+        pass
+
+    # Imputación mínima previa (por si acaso)
     if num_feats:
         X[num_feats] = X[num_feats].fillna(X[num_feats].median())
 
-    # --- 4) Preprocesamiento (denso) ---
-    num_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-    ])
-
-    # OneHotEncoder denso (compatibilidad scikit-learn >=1.2 y <1.2)
+    # --- 4) Preprocesamiento (DENSO) ---
+    num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median"))])
     try:
         cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
         cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
-
     cat_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="most_frequent")),
         ("ohe", cat_ohe),
@@ -3272,11 +3271,10 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
             ("cat", cat_pipe, cat_feats),
         ],
         remainder="drop",
-        sparse_threshold=0.0  # fuerza salida DENSE para el HGB
+        sparse_threshold=0.0
     )
 
-    # --- 5) Split de entrenamiento/validación ---
-    # Estratifica solo si hay ambas clases y suficientes muestras
+    # --- 5) Split estratificado cuando se pueda ---
     do_strat = (y.nunique() == 2) and (y.value_counts().min() >= 2)
     try:
         X_fit, X_eval, y_fit, y_eval = train_test_split(
@@ -3286,19 +3284,22 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
         X_fit, y_fit = X, y
         X_eval, y_eval = X.iloc[:0], y.iloc[:0]
 
-    # --- 6) Modelo (tolera NaNs) ---
-    clf = HistGradientBoostingClassifier(
-        learning_rate=0.08,
-        max_iter=400,
-        max_depth=None,
-        random_state=42
-    )
+    # --- 6) Selección de modelo con fallback por desbalance ---
+    extreme_imbalance = (y.mean() < 0.05) or (y.mean() > 0.95) or (y.nunique() < 2)
 
-    pipe = Pipeline([
-        ("prep", preprocess),
-        ("clf", clf),
-    ])
+    if extreme_imbalance:
+        # Modelo robusto a desbalance extremo
+        clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+    else:
+        # Modelo principal
+        clf = HistGradientBoostingClassifier(
+            learning_rate=0.08,
+            max_iter=400,
+            max_depth=None,
+            random_state=42
+        )
 
+    pipe = Pipeline([("prep", preprocess), ("clf", clf)])
     pipe.fit(X_fit, y_fit)
 
     # --- 7) Métrica rápida (opcional) ---
@@ -3312,6 +3313,9 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
 
     # --- 8) Empaqueta y devuelve ---
     return FailureModel(pipeline=pipe, features=num_feats + cat_feats)
+###
+
+
 
 @st.cache_resource(show_spinner=False)
 def _get_trained_model():
@@ -3420,15 +3424,26 @@ def predict_failure(detalles_df: pd.DataFrame,
             # crea columna ausente; el imputador del pipeline la manejará
             X_pred[c] = np.nan
 
-    # 7) Predicción de probabilidad de fallo
-    try:
-        proba = model.pipeline.predict_proba(X_pred)[:, 1]
-    except Exception:
-        proba = np.zeros(len(pred_df), dtype=float)
-
-    pred_df["Prob_Fail"] = np.clip(proba, 0.0, 1.0)
-    pred_df["Rutas_riesgo"] = pred_df["Prob_Fail"] * pred_df["Rutas"]
-    pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pred_df["Shipments"]
+        # 7) Predicción de probabilidad de fallo
+        try:
+            proba = model.pipeline.predict_proba(X_pred)[:, 1]
+        except Exception:
+            proba = np.zeros(len(pred_df), dtype=float)
+    
+        # Evita saturaciones extremas (por desbalance/calibración)
+        pred_df["Prob_Fail"] = np.clip(proba, 0.01, 0.99)
+    
+        # Si todas las probabilidades vinieron iguales (p.ej., todo 1.0 o todo 0.5),
+        # empuja un poco con SPR: más SPR => menos riesgo
+        if (pred_df["Prob_Fail"].nunique(dropna=True) <= 1) and ("SPR" in pred_df.columns):
+            z = pd.to_numeric(pred_df["SPR"], errors="coerce").fillna(pred_df["SPR"].median())
+            z = (z - z.median()) / (z.std() + 1e-9)
+            adj = 1 / (1 + np.exp(-( -0.5*z )))  # mapping suave
+            pred_df["Prob_Fail"] = 0.7*pred_df["Prob_Fail"] + 0.3*adj
+            pred_df["Prob_Fail"] = np.clip(pred_df["Prob_Fail"], 0.01, 0.99)
+    
+        pred_df["Rutas_riesgo"] = pred_df["Prob_Fail"] * pred_df["Rutas"]
+        pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pred_df["Shipments"]
 
     # 8) Resumen por SVC (prob ponderada por shipments)
     grp = pred_df.groupby("SVC", dropna=False)
