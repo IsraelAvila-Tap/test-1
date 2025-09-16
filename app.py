@@ -3245,23 +3245,36 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
     
     # 2) Preprocesador con imputación
 
-    num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median"))])
+    # --- Preprocesado ---
+    num_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+    ])
+    
+    # usa salida DENSO
+    try:
+        cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)  # scikit-learn >= 1.2
+    except TypeError:
+        cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)         # compat < 1.2
+    
     cat_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=True)),  # o sparse=True si <1.2
+        ("ohe", cat_ohe),
     ])
     
-    preprocess = ColumnTransformer([
-        ("num", num_pipe, num_feats),
-        ("cat", cat_pipe, cat_feats),
-    ])
-    
-    clf = HistGradientBoostingClassifier(learning_rate=0.08, max_iter=400, random_state=42)
-    
+    # fuerza denso aunque haya columnas codificadas
+    preprocess = ColumnTransformer(
+        transformers=[
+            ("num", num_pipe, num_feats),
+            ("cat", cat_pipe, cat_feats),
+        ],
+        sparse_threshold=0.0   # ← esto obliga a salida densa
+    )
+
+    clf = HistGradientBoostingClassifier(
+        learning_rate=0.08, max_iter=400, random_state=42
+    )
     pipe = Pipeline([("prep", preprocess), ("clf", clf)])
-
-
-
+    pipe.fit(X_fit, y_fit)
 
     
     # 3) Clasificador (tolera NaNs y suele rendir mejor que GB clásico)
