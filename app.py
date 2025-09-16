@@ -3098,29 +3098,50 @@ def _add_calendar_feats(df, date_col="FECHA", country="MX"):
 def _label_from_arer(arer: pd.DataFrame) -> pd.DataFrame:
     """
     Etiqueta de fallo a nivel fila AR-ER.
-    FAIL=1 si EJECUTADO < CONFIRMADO (incumplimiento del proveedor o rentals).
+    FAIL = 1 si CONFIRMADO > 0 y EJECUTADO < CONFIRMADO.
     """
+    if arer is None or arer.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+                                     "CONFIRMADO","EJECUTADO","FAIL"])
+
     df = arer.copy()
-    # Normalización básica
+
+    # Normalización de encabezados (tolerante a alias)
     find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
-    find_and_rename(df, ["SVC","Facility","LC"], "SVC", required=False, source_label="AR-ER")
-    find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model"], "DELIVERY_MOD", required=False, source_label="AR-ER")
-    find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
-    find_and_rename(df, ["Mes, Día, Año de FECHA","FECHA","OP_DT","DATE"], "FECHA", required=False, source_label="AR-ER")
-    find_and_rename(df, ["CONFIRMADO"], "CONFIRMADO", required=False, source_label="AR-ER")
-    find_and_rename(df, ["EJECUTADO"], "EJECUTADO", required=False, source_label="AR-ER")
+    find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
+    find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
+    find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Mes, Día, Año de FECHA","Mes, dia, Año de FECHA","FECHA","OP_DT","DATE"], "FECHA", required=False, source_label="AR-ER")
+    find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
+    find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
 
     need = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","FECHA","CONFIRMADO","EJECUTADO"]
     if any(c not in df.columns for c in need):
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+                                     "CONFIRMADO","EJECUTADO","FAIL"])
+
+    # Tipos
     df["FECHA"] = parse_es_date_series(df["FECHA"])
     df = df[df["FECHA"].notna()].copy()
+
     for c in ["CONFIRMADO","EJECUTADO"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    df["FAIL"] = (df["EJECUTADO"] + 1e-9 < df["CONFIRMADO"]).astype(int)
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
-    return df[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","CONFIRMADO","EJECUTADO","FAIL"]]
+
+    # Solo se puede fallar si hubo confirmación (>0)
+    df["FAIL"] = np.where((df["CONFIRMADO"] > 0) & (df["EJECUTADO"] + 1e-9 < df["CONFIRMADO"]), 1, 0).astype(int)
+
+    # (debug opcional en UI)
+    try:
+        import streamlit as st
+        vc = df["FAIL"].value_counts().to_dict()
+        st.caption(f"Distribución de etiquetas FAIL (AR-ER): {vc}")
+    except Exception:
+        pass
+
+    return df[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+               "CONFIRMADO","EJECUTADO","FAIL"]]
 
 def _attach_tabla2_spr(df_hist: pd.DataFrame) -> pd.DataFrame:
     """
@@ -3304,12 +3325,16 @@ def predict_failure(detalles_df: pd.DataFrame,
     """
     # Validaciones básicas
     if model is None or getattr(model, "pipeline", None) is None:
-        return (pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"]),
-                pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"]))
+        empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"])
+        empty_det = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+                                          "Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"])
+        return empty_res, empty_det
 
     if detalles_df is None or detalles_df.empty:
-        return (pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"]),
-                pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"]))
+        empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"])
+        empty_det = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+                                          "Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"])
+        return empty_res, empty_det
 
     # 1) SPR por (fecha, svc, dm, veh) desde Tabla 2 (detalles)
     det = detalles_df.copy()
@@ -3322,10 +3347,12 @@ def predict_failure(detalles_df: pd.DataFrame,
     focus_dm = ["Rentals", "MLP SDD", "MLP SPOT", "MLP BACKLOG"]
     det = det[dm_str.isin(focus_dm)].copy()
 
-    spr_map = (det.groupby(["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)["SPR"]
-                  .mean().rename("SPR_MAP").reset_index())
+    spr_map = (
+        det.groupby(["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)["SPR"]
+           .mean().rename("SPR_MAP").reset_index()
+    )
 
-    # 2) Construye filas de predicción para RENTALS desde Tabla 2
+    # 2) Filas de predicción para RENTALS desde Tabla 2
     rentals = det[dm_str.eq("Rentals")].copy()
     if not rentals.empty:
         rentals = (rentals.groupby(["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)
@@ -3335,16 +3362,18 @@ def predict_failure(detalles_df: pd.DataFrame,
                           .reset_index())
         rentals["MLP"] = "RENTALS"
     else:
-        rentals = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","Rutas","Shipments","SPR","MLP"])
+        rentals = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE",
+                                        "Rutas","Shipments","SPR","MLP"])
 
-    # 3) Construye filas de predicción para MLP desde Tabla 3
+    # 3) Filas de predicción para MLP desde Tabla 3
     if tabla3_df is None or tabla3_df.empty:
-        mlp_rows = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"])
+        mlp_rows = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE",
+                                         "MLP","Rutas","SPR","Shipments"])
     else:
         t3 = tabla3_df.copy()
         t3["FECHA"] = pd.to_datetime(t3["FECHA"], errors="coerce").dt.date
         t3["Rutas"] = pd.to_numeric(t3["Rutas"], errors="coerce").fillna(0).astype(int)
-        # Traemos SPR desde el map de Tabla 2 (por SVC×DM×Veh en la fecha)
+        # SPR desde Tabla 2 (por SVC×DM×Veh en la fecha)
         t3 = t3.merge(spr_map, on=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], how="left")
         t3["SPR"] = pd.to_numeric(t3["SPR_MAP"], errors="coerce")
         t3.drop(columns=["SPR_MAP"], inplace=True, errors="ignore")
@@ -3360,8 +3389,8 @@ def predict_failure(detalles_df: pd.DataFrame,
     ], axis=0, ignore_index=True)
 
     if pred_df.empty:
-        return (pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"]),
-                pred_df)
+        empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"])
+        return empty_res, pred_df
 
     # 5) Features mínimas para el pipeline (calendario + SPR_T2)
     pred_df["FECHA"] = pd.to_datetime(pred_df["FECHA"], errors="coerce")
@@ -3371,31 +3400,35 @@ def predict_failure(detalles_df: pd.DataFrame,
     pred_df["SEM"] = pred_df["FECHA"].dt.isocalendar().week.astype(int)
     pred_df["SPR_T2"] = pd.to_numeric(pred_df["SPR"], errors="coerce")
 
-    # Asegura todas las columnas esperadas por el modelo
+    # 6) Asegura todas las columnas que espera el modelo (orden y nombres)
     X_cols = list(model.features) if hasattr(model, "features") else []
+    if not X_cols:
+        # fallback: usa columnas presentes típicas
+        X_cols = ["SPR_T2","DOW","IS_WE","MES","SEM","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"]
+
     X_pred = pd.DataFrame(index=pred_df.index)
     for c in X_cols:
         if c in pred_df.columns:
             X_pred[c] = pred_df[c]
         else:
-            # crea la columna ausente; imputador se encarga
+            # crea columna ausente; el imputador del pipeline la manejará
             X_pred[c] = np.nan
 
-    # 6) Predicción de probabilidad de fallo
+    # 7) Predicción de probabilidad de fallo
     try:
         proba = model.pipeline.predict_proba(X_pred)[:, 1]
     except Exception:
-        # fallback safety: si algo falla, prob = 0.0
         proba = np.zeros(len(pred_df), dtype=float)
 
-    pred_df["Prob_Fail"] = proba.clip(0, 1)
+    pred_df["Prob_Fail"] = np.clip(proba, 0.0, 1.0)
     pred_df["Rutas_riesgo"] = pred_df["Prob_Fail"] * pred_df["Rutas"]
     pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pred_df["Shipments"]
 
-    # 7) Resumen por SVC (prob ponderada por shipments)
+    # 8) Resumen por SVC (prob ponderada por shipments)
     grp = pred_df.groupby("SVC", dropna=False)
     ship_sum = grp["Shipments"].sum().replace(0, np.nan)
     prob_w = (grp.apply(lambda g: (g["Prob_Fail"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_peso_ship")
+
     resumen = pd.concat([
         grp["Rutas"].sum().rename("Rutas"),
         grp["Rutas_riesgo"].sum().rename("Rutas_riesgo"),
@@ -3404,22 +3437,24 @@ def predict_failure(detalles_df: pd.DataFrame,
         prob_w
     ], axis=1).reset_index()
 
-    # Ordena por mayor riesgo en shipments
     resumen = resumen.sort_values("Shipments_riesgo", ascending=False).reset_index(drop=True)
 
-    # Orden del detalle para lectura
+    # 9) Orden del detalle para lectura
     ord_dm = pd.CategoricalDtype(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
     try:
         pred_df["DELIVERY_MOD"] = pred_df["DELIVERY_MOD"].astype(ord_dm)
-        pred_df = pred_df.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_Fail"],
-                                      ascending=[True, True, True, True, False]).reset_index(drop=True)
+        pred_df = pred_df.sort_values(
+            ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_Fail"],
+            ascending=[True, True, True, True, False]
+        ).reset_index(drop=True)
     except Exception:
         pass
 
-    # Formato final
     cols_res = ["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"]
-    cols_det = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"]
-    return (resumen[cols_res], pred_df[cols_det])
+    cols_det = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
+                "Prob_Fail","Rutas_riesgo","Shipments_riesgo"]
+    return resumen[cols_res], pred_df[cols_det]
+
 
 
 # -----------------------------------------------------------------------------
