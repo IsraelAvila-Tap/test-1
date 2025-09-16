@@ -3750,44 +3750,46 @@ try:
 
                     ####
                     def _mk_inference_frame(detalles_df: pd.DataFrame, tabla3_df: pd.DataFrame) -> pd.DataFrame:
-                    """Construye filas a nivel MLP/día/vehículo (y Rentals) con rutas y SPR de la Tabla 2.
-                    - Para MLP: parte de Tabla 3 (Rutas por MLP) y trae SPR desde Tabla 2 por SVC×DM×Veh del mismo día.
-                    - Para Rentals: usa las filas Rentals de Tabla 2 (ya tienen SPR y Rutas)."""
-                    out_cols = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"]
-                    if (detalles_df is None or detalles_df.empty) and (tabla3_df is None or tabla3_df.empty):
-                        return pd.DataFrame(columns=out_cols)
-                
-                    # ---- Rentals directo desde Tabla 2
-                    d2 = detalles_df.copy()
-                    dm = d2["DELIVERY_MOD"].astype(str)
-                    rentals = d2[dm.eq("Rentals")].copy()
-                    if not rentals.empty:
-                        rentals["MLP"] = "RENTALS"
-                        rentals["Shipments"] = pd.to_numeric(rentals["Shipments"], errors="coerce").fillna(
-                            pd.to_numeric(rentals["Rutas"], errors="coerce").fillna(0)*pd.to_numeric(rentals["SPR"], errors="coerce").fillna(0)
-                        )
-                        rentals = rentals[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"]]
-                    else:
-                        rentals = pd.DataFrame(columns=out_cols)
-                
-                    # ---- MLP: Tabla 3 + SPR desde Tabla 2 por SVC×DM×Veh
-                    t3 = tabla3_df.copy()
-                    if t3 is None or t3.empty:
-                        mlp = pd.DataFrame(columns=out_cols)
-                    else:
-                        key = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"]
-                        spr2 = (d2[~dm.eq("Rentals")][key+["SPR"]].drop_duplicates(key))
-                        mlp = t3.merge(spr2, on=key, how="left")
-                        mlp["Shipments"] = (pd.to_numeric(mlp["Rutas"], errors="coerce").fillna(0) *
-                                            pd.to_numeric(mlp["SPR"], errors="coerce").fillna(0))
-                        mlp = mlp.rename(columns={"MLP":"MLP"})[out_cols]
-                
-                    finf = pd.concat([mlp, rentals], axis=0, ignore_index=True)
-                    # Limpieza
-                    for c in ["Rutas","SPR","Shipments"]:
-                        finf[c] = pd.to_numeric(finf[c], errors="coerce").fillna(0)
-                    _as_str_cols(finf, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
-                    return finf
+                        """
+                        Construye filas a nivel MLP/día/vehículo (y Rentals) con rutas y SPR de la Tabla 2.
+                        - Para MLP: parte de Tabla 3 (Rutas por MLP) y trae SPR desde Tabla 2 por SVC×DM×Veh del mismo día.
+                        - Para Rentals: usa las filas Rentals de Tabla 2 (ya tienen SPR y Rutas).
+                        """
+                        out_cols = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"]
+                        if (detalles_df is None or detalles_df.empty) and (tabla3_df is None or tabla3_df.empty):
+                            return pd.DataFrame(columns=out_cols)
+                    
+                        # ---- Rentals directo desde Tabla 2
+                        d2 = detalles_df.copy()
+                        dm = d2["DELIVERY_MOD"].astype(str)
+                        rentals = d2[dm.eq("Rentals")].copy()
+                        if not rentals.empty:
+                            rentals["MLP"] = "RENTALS"
+                            rentals["Shipments"] = pd.to_numeric(rentals["Shipments"], errors="coerce").fillna(
+                                pd.to_numeric(rentals["Rutas"], errors="coerce").fillna(0)*pd.to_numeric(rentals["SPR"], errors="coerce").fillna(0)
+                            )
+                            rentals = rentals[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"]]
+                        else:
+                            rentals = pd.DataFrame(columns=out_cols)
+                    
+                        # ---- MLP: Tabla 3 + SPR desde Tabla 2 por SVC×DM×Veh
+                        t3 = tabla3_df.copy()
+                        if t3 is None or t3.empty:
+                            mlp = pd.DataFrame(columns=out_cols)
+                        else:
+                            key = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"]
+                            spr2 = (d2[~dm.eq("Rentals")][key+["SPR"]].drop_duplicates(key))
+                            mlp = t3.merge(spr2, on=key, how="left")
+                            mlp["Shipments"] = (pd.to_numeric(mlp["Rutas"], errors="coerce").fillna(0) *
+                                                pd.to_numeric(mlp["SPR"], errors="coerce").fillna(0))
+                            mlp = mlp.rename(columns={"MLP":"MLP"})[out_cols]
+                    
+                        finf = pd.concat([mlp, rentals], axis=0, ignore_index=True)
+                        # Limpieza
+                        for c in ["Rutas","SPR","Shipments"]:
+                            finf[c] = pd.to_numeric(finf[c], errors="coerce").fillna(0)
+                        _as_str_cols(finf, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
+                        return finf
                 
                 def predict_failure(detalles_df: pd.DataFrame, tabla3_df: pd.DataFrame, model: FailureModel | None):
                     """
