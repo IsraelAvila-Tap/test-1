@@ -17,8 +17,7 @@ import re, unicodedata
 from typing import Optional
 import datetime
 import math
-
-
+import unicodedata, re
 
 # -----------------------------------------------------------------------------
 # 0) Credenciales y configuración
@@ -406,6 +405,20 @@ def parse_es_date(txt) -> Optional[datetime.date]:
 def parse_es_date_series(s: pd.Series) -> pd.Series:
     return s.apply(parse_es_date)
 
+# ====== Canonizador de claves para merges (MLP/SVC) =====
+
+def _canon_key(x: object) -> str:
+    """Normaliza texto para joins: minúsculas, sin acentos, sin puntuación/SA de CV, espacios colapsados."""
+    if x is None:
+        return ""
+    s = str(x).strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))  # quita acentos
+    # quita sufijos societarios muy comunes (flexible)
+    s = re.sub(r"\b(s\.?a\.?( de)? c\.?v\.?)\b", "", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)  # solo letras/números, el resto a espacio
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def _strip_accents(s: str) -> str:
     import unicodedata
@@ -2771,19 +2784,18 @@ def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
 
 def load_mlp_score_from_arer(window_days: int = 120) -> pd.DataFrame:
     """
-    Lee la pestaña AR-ER con el nuevo formato y calcula SCORE por (MLP, SVC).
-    SCORE = EJECUTADO / max(CONFIRMADO, 1) agregado en la ventana.
+    Lee AR-ER (nuevo formato) y calcula SCORE por par (MLP,SVC) en una ventana.
+    Devuelve claves canonizadas para poder unir contra la Tabla 3.
+    SCORE = EJECUTADO / max(CONFIRMADO,1) agregado en la ventana.
     """
-    ###
-    tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
-    df = read_sheet(SHEET_ID, tab_arer)
-    ###
     try:
-        df = read_sheet(SHEET_ID, SHEET_TABS["ar_er"])  # Asegúrate: SHEET_TABS["ar_er"] -> nombre real de la pestaña "AR-ER"
+        # 1) Localiza la pestaña de forma tolerante y lee una sola vez
+        tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
+        df = read_sheet(SHEET_ID, tab_arer)
         if df is None or df.empty:
-            return pd.DataFrame(columns=["MLP","SVC","SCORE"])
+            return pd.DataFrame(columns=["MLP_CAN","SVC_CAN","SCORE","MLP","SVC"])
 
-        # Normalización de columnas (robusto a variantes)
+        # 2) Normaliza encabezados
         find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
         find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
         find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo"], "VEHICLE", required=False, source_label="AR-ER")
@@ -2794,16 +2806,14 @@ def load_mlp_score_from_arer(window_days: int = 120) -> pd.DataFrame:
         find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
         find_and_rename(df, ["EJECUTADO","Ejecutado"], "EJECUTADO", required=False, source_label="AR-ER")
 
-        # Si falta lo esencial, devuelve vacío
         need = ["MLP","SVC","FECHA","CONFIRMADO","EJECUTADO"]
         if any(c not in df.columns for c in need):
-            return pd.DataFrame(columns=["MLP","SVC","SCORE"])
+            return pd.DataFrame(columns=["MLP_CAN","SVC_CAN","SCORE","MLP","SVC"])
 
-        # Tipos
+        # 3) Tipos y ventana temporal
         df["FECHA"] = parse_es_date_series(df["FECHA"])
         df = df[df["FECHA"].notna()].copy()
 
-        # Ventana (últimos N días)
         if window_days and window_days > 0:
             cutoff = datetime.date.today() - datetime.timedelta(days=window_days)
             df = df[df["FECHA"] >= cutoff].copy()
@@ -2813,145 +2823,147 @@ def load_mlp_score_from_arer(window_days: int = 120) -> pd.DataFrame:
 
         _as_str_cols(df, ["MLP","SVC"])
 
-        # Agregado por (MLP, SVC)
+        # 4) Agregado por texto original
         agg = (
             df.groupby(["MLP","SVC"], dropna=False)
               .agg(CONFIRMADO=("CONFIRMADO","sum"), EJECUTADO=("EJECUTADO","sum"))
               .reset_index()
         )
+        agg["SCORE"] = (agg["EJECUTADO"] / agg["CONFIRMADO"].replace(0, np.nan)).fillna(0.0)
 
-        # SCORE y orden
-        denom = agg["CONFIRMADO"].replace(0, np.nan)
-        agg["SCORE"] = (agg["EJECUTADO"] / denom).fillna(0.0).round(4)
-        agg = agg.sort_values(["SCORE","MLP","SVC"], ascending=[False, True, True]).reset_index(drop=True)
+        # 5) Claves canonizadas para joins robustos
+        agg["MLP_CAN"] = agg["MLP"].map(_canon_key)
+        agg["SVC_CAN"] = agg["SVC"].map(_canon_key)
 
-        return agg[["MLP","SVC","SCORE"]]
+        # 6) Colapsa a nivel canónico (si hay variantes de nombre). Promedio ponderado por CONFIRMADO
+        agg["WEIGHT"] = agg["CONFIRMADO"].clip(lower=1)
+        scores_can = (
+            agg.groupby(["MLP_CAN","SVC_CAN"], as_index=False)
+               .apply(lambda g: pd.Series({"SCORE": np.average(g["SCORE"], weights=g["WEIGHT"])}))
+               .reset_index(drop=True)
+        )
+
+        # (Opcional) Conserva un representativo de texto original para debug
+        rep = (agg.sort_values("CONFIRMADO", ascending=False)
+                 .groupby(["MLP_CAN","SVC_CAN"], as_index=False)
+                 .first()[["MLP_CAN","SVC_CAN","MLP","SVC"]])
+
+        out = scores_can.merge(rep, on=["MLP_CAN","SVC_CAN"], how="left")
+        out["SCORE"] = out["SCORE"].round(4)
+
+        # Devuelve con claves canónicas (para merge) y nombres (para debug)
+        return out[["MLP_CAN","SVC_CAN","SCORE","MLP","SVC"]]
+
     except Exception as e:
         show_exception(e, "AR-ER (score)")
-        return pd.DataFrame(columns=["MLP","SVC","SCORE"])
-
+        return pd.DataFrame(columns=["MLP_CAN","SVC_CAN","SCORE","MLP","SVC"])
 
 
 def build_table3(plan_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Tabla 3: por SVC muestra, para cada DM (MLP SDD / MLP SPOT / MLP BACKLOG)
-    y tipo de vehículo, QUÉ MLP levantaríamos y cuántas rutas.
-    Asignación proporcional a la capacidad declarada en SRM por SVC × DM × VEH.
+    Construye la Tabla 3 (Detalle por MLP) asignando rutas por SVC y DM
+    a los MLPs según su SCORE (AR-ER) y topado por CAP (SRM).
+    Columnas salida:
+      FECHA, SVC, DELIVERY_MOD, SHP_LG_VEHICLE_TYPE, MLP, Rutas, Score
     """
-    cols = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"]
-    if plan_df is None or plan_df.empty:
-        return pd.DataFrame(columns=cols)
+    try:
+        if plan_df is None or plan_df.empty:
+            return pd.DataFrame(columns=[
+                "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"
+            ])
 
-    hoy = date.today()
+        # Caps detallados por MLP desde SRM
+        caps = load_srm_caps_by_mlp_detailed()  # SVC, MLP, DELIVERY_MOD, SHP_LG_VEHICLE_TYPE, CAP
+        if caps is None or caps.empty:
+            return pd.DataFrame(columns=[
+                "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"
+            ])
 
-    # Capacidades por MLP (SVC, MLP, DM, VEH, CAP)
-    caps = load_srm_caps_by_mlp_detailed()
-    if caps.empty:
-        # Fallback a pool si no hay SRM
-        out = []
+        caps = caps.copy()
+        caps["CAP"] = pd.to_numeric(caps["CAP"], errors="coerce").fillna(0).astype(int)
+        _as_str_cols(caps, ["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])
+
+        # Scores AR-ER
+        scores = load_mlp_score_from_arer()  # MLP_CAN, SVC_CAN, SCORE
+        if scores is None:
+            scores = pd.DataFrame(columns=["MLP_CAN","SVC_CAN","SCORE"])
+        scores["SCORE"] = pd.to_numeric(scores.get("SCORE", 0), errors="coerce").fillna(0.5)
+
+        # Claves canónicas para el join
+        caps["MLP_CAN"] = caps["MLP"].map(_canon_key)
+        caps["SVC_CAN"] = caps["SVC"].map(_canon_key)
+        caps = caps.merge(
+            scores[["MLP_CAN","SVC_CAN","SCORE"]],
+            on=["MLP_CAN","SVC_CAN"], how="left"
+        )
+        caps["SCORE"] = pd.to_numeric(caps["SCORE"], errors="coerce").fillna(0.5)
+
+        rows = []
+        # FECHA de la fila del plan (si no hay, hoy)
+        import datetime
+        def _fecha_of(r):
+            f = r.get("FECHA", None)
+            try:
+                return pd.to_datetime(f).date() if pd.notna(f) else datetime.date.today()
+            except Exception:
+                return datetime.date.today()
+
+        # Para cada SVC, asigna SDD y SPOT
         for _, r in plan_df.iterrows():
-            svc = str(r["SVC"])
-            for dm, col_need in [("MLP SDD","RUTAS_MLP_SDD_USADAS"),
-                                 ("MLP SPOT","RUTAS_MLP_SPOT_USADAS"),
-                                 ("MLP BACKLOG","RUTAS_MLP_BACKLOG_USADAS")]:
-                need = _to_int(r.get(col_need, 0))
+            svc = str(r.get("SVC", ""))
+            fecha = _fecha_of(r)
+
+            for dm_label, need_col in [("MLP SDD","RUTAS_MLP_SDD_USADAS"),
+                                       ("MLP SPOT","RUTAS_MLP_SPOT_USADAS")]:
+                need = int(pd.to_numeric(r.get(need_col, 0), errors="coerce") or 0)
                 if need <= 0:
                     continue
-                out.append([hoy, svc, dm, "Large Van", f"POOL_{dm.split()[-1]}", int(need), np.nan])
-        return pd.DataFrame(out, columns=cols)
 
-    caps = caps.copy()
-    _as_str_cols(caps, ["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])
-    caps["CAP"] = pd.to_numeric(caps["CAP"], errors="coerce").fillna(0).astype(int)
-
-    # Scores por MLP y SVC (opcional)
-    score = load_mlp_score_from_arer()
-    if not score.empty:
-        score = score.copy()
-        _as_str_cols(score, ["MLP","SVC"])
-        score["SCORE"] = pd.to_numeric(score["SCORE"], errors="coerce")
-        caps["MLP_KEY"] = caps["MLP"].str.strip().str.upper()
-        score["MLP_KEY"] = score["MLP"].str.strip().str.upper()
-        caps = caps.merge(score[["MLP_KEY","SVC","SCORE"]], how="left",
-                          left_on=["MLP_KEY","SVC"], right_on=["MLP_KEY","SVC"])
-        caps.rename(columns={"SCORE":"Score"}, inplace=True)
-        caps.drop(columns=["MLP_KEY"], inplace=True)
-    else:
-        caps["Score"] = np.nan
-
-    # Total cap por SVC × DM × VEH para pesar reparto
-    cap_bkt = (caps.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])["CAP"]
-                    .sum()
-                    .rename("CAP_TIPO")
-                    .reset_index())
-
-    rows = []
-
-    for _, r in plan_df.iterrows():
-        svc = str(r["SVC"])
-
-        # necesidades por DM (enteras)
-        need = {
-            "MLP SDD":     _to_int(r.get("RUTAS_MLP_SDD_USADAS", 0)),
-            "MLP SPOT":    _to_int(r.get("RUTAS_MLP_SPOT_USADAS", 0)),
-            "MLP BACKLOG": _to_int(r.get("RUTAS_MLP_BACKLOG_USADAS", 0)),
-        }
-
-        for dm, n_tot in need.items():
-            if n_tot <= 0:
-                continue
-
-            # cap total por VEH en este SVC × DM
-            bkt = cap_bkt[(cap_bkt["SVC"] == svc) & (cap_bkt["DELIVERY_MOD"] == dm)]
-            if bkt.empty or bkt["CAP_TIPO"].sum() <= 0:
-                # sin cap por proveedor → cae a pool
-                rows.append([hoy, svc, dm, "Large Van", f"POOL_{dm.split()[-1]}", int(n_tot), np.nan])
-                continue
-
-            # Reparto de n_tot entre vehículos según CAP de cada tipo
-            w_by_veh = bkt.set_index("SHP_LG_VEHICLE_TYPE")["CAP_TIPO"]
-            req_by_veh = _largest_remainder_allocation(int(n_tot), w_by_veh)
-
-            # Ahora, dentro de cada VEH, repartir entre MLPs según su CAP
-            for veh, n_veh in req_by_veh.items():
-                n_veh = int(n_veh)
-                if n_veh <= 0:
+                pool = caps[(caps["SVC"] == svc) & (caps["DELIVERY_MOD"] == dm_label)].copy()
+                if pool.empty:
                     continue
 
-                sub = caps[(caps["SVC"] == svc) &
-                           (caps["DELIVERY_MOD"] == dm) &
-                           (caps["SHP_LG_VEHICLE_TYPE"] == veh)].copy()
+                # Ordena por SCORE desc y CAP desc
+                pool = pool.sort_values(["SCORE","CAP"], ascending=[False, False]).reset_index(drop=True)
 
-                if sub.empty or sub["CAP"].sum() <= 0:
-                    rows.append([hoy, svc, dm, veh, f"POOL_{dm.split()[-1]}", int(n_veh), np.nan])
-                    continue
-
-                alloc = _largest_remainder_allocation(n_veh, sub.set_index(sub.index)["CAP"])
-                for idx, rutas_mlp in alloc.items():
-                    rutas_mlp = int(rutas_mlp)
-                    if rutas_mlp <= 0:
+                remaining = need
+                for i, rr in pool.iterrows():
+                    if remaining <= 0:
+                        break
+                    cap_i = int(rr["CAP"])
+                    if cap_i <= 0:
                         continue
-                    mlp_name = str(sub.loc[idx, "MLP"])
-                    sc = sub.loc[idx, "Score"] if "Score" in sub.columns else np.nan
-                    rows.append([hoy, svc, dm, veh, mlp_name, rutas_mlp, sc])
+                    assign = min(cap_i, remaining)
+                    remaining -= assign
+                    rows.append([
+                        fecha,
+                        svc,
+                        dm_label,
+                        rr["SHP_LG_VEHICLE_TYPE"],
+                        rr["MLP"],
+                        int(assign),
+                        float(rr["SCORE"])
+                    ])
 
-    out = pd.DataFrame(rows, columns=cols)
-    if out.empty:
-        return pd.DataFrame(columns=cols)
+                # Si quedaron rutas sin asignar, las ignoramos aquí (se verán como faltantes en tu plan)
 
-    # Orden bonito
-    dm_order = pd.CategoricalDtype(["MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
-    veh_order = pd.CategoricalDtype(["Large Van","Small Van","Car"], ordered=True)
-    try:
-        out["DELIVERY_MOD"] = out["DELIVERY_MOD"].astype(dm_order)
-        out["SHP_LG_VEHICLE_TYPE"] = out["SHP_LG_VEHICLE_TYPE"].astype(veh_order)
-        out = out.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"]).reset_index(drop=True)
-    except Exception:
-        out = out.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"]).reset_index(drop=True)
+        out = pd.DataFrame(rows, columns=[
+            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"
+        ])
 
-    return out
+        # Orden visual
+        if not out.empty:
+            dm_order = pd.CategoricalDtype(["MLP SDD","MLP SPOT"], ordered=True)
+            out["DELIVERY_MOD"] = out["DELIVERY_MOD"].astype(dm_order)
+            out = out.sort_values(["SVC","DELIVERY_MOD","Score","MLP"], ascending=[True, True, False, True]).reset_index(drop=True)
 
-####-
+        return out
+
+    except Exception as e:
+        show_exception(e, "Tabla 3 (detalle por MLP)")
+        return pd.DataFrame(columns=[
+            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"
+        ])
 
 
 
