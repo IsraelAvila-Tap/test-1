@@ -3313,6 +3313,12 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
     # --- 8) Empaqueta y devuelve ---
     return FailureModel(pipeline=pipe, features=num_feats + cat_feats)
 
+@st.cache_resource(show_spinner=False)
+def _get_trained_model():
+    return train_failure_model(window_days=730)
+
+
+
 def predict_failure(detalles_df: pd.DataFrame,
                     tabla3_df: pd.DataFrame,
                     model: FailureModel) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -3581,6 +3587,82 @@ if "logo_width" not in st.session_state:
 
 LOGO_WIDTH = int(st.session_state["logo_width"])
 
+# --- UI helpers (pon esto antes de set_page_config y antes de la primera llamada) ---
+
+def render_fixed_header(
+    logo_img=None,
+    title="Mel-IA Ops — Plan táctico (diario por SVC)",
+    subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP • SP • DC",
+    header_h=104,
+    logo_h=500,
+):
+    import io, base64
+    def _img_to_b64(img):
+        buf = io.BytesIO()
+        try:
+            img.save(buf, format="PNG")
+        except Exception:
+            img = img.convert("RGBA")
+            img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    if logo_img is not None:
+        try:
+            b64 = _img_to_b64(logo_img)
+            logo_html = (
+                f'<img src="data:image/png;base64,{b64}" alt="logo" '
+                f'style="height:{int(logo_h)}px !important; width:auto !important; '
+                f'max-height:none !important; max-width:none !important; display:block;" />'
+            )
+        except Exception:
+            logo_html = f'<div style="font-size:{int(logo_h)}px; line-height:{int(logo_h)}px;">🚛</div>'
+    else:
+        logo_html = f'<div style="font-size:{int(logo_h)}px; line-height:{int(logo_h)}px;">🚛</div>'
+
+    st.markdown(
+        f"""
+        <style>
+          :root {{
+            --meli-header-h: {int(header_h)}px;
+            --meli-logo-h: {int(logo_h)}px;
+          }}
+          .meli-fixed {{ position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+            background: #fff; height: var(--meli-header-h);
+            border-bottom: 1px solid rgba(0,0,0,.06);
+            box-shadow: 0 1px 6px rgba(0,0,0,.04);
+            overflow: visible; }}
+          .meli-wrap {{ max-width: 1200px; margin: 0 auto; height: 100%;
+            display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 14px; padding: 6px 12px; }}
+          .meli-logo img {{ height: var(--meli-logo-h) !important; width: auto !important;
+            max-height: none !important; max-width: none !important; display: block; image-rendering: crisp-edges; }}
+          .meli-title {{ margin: 0; font-size: 32px; line-height: 1.15; font-weight: 800; }}
+          .meli-sub {{ margin: 2px 0 0 0; color: #6b7280; font-size: 13px; }}
+          [data-testid="stHeader"] {{ display: none; }}
+          .block-container {{ padding-top: calc(var(--meli-header-h) + 12px) !important; }}
+        </style>
+        <div class="meli-fixed">
+          <div class="meli-wrap">
+            <div class="meli-logo">{logo_html}</div>
+            <div>
+              <h1 class="meli-title">{title}</h1>
+              <div class="meli-sub">{subtitle}</div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+st.set_page_config(... )
+inject_brand_css()
+# ...
+render_fixed_header(
+    logo_img=LOGO_IMAGE,
+    header_h=final_header_h,
+    logo_h=int(st.session_state["logo_h"]),
+)
+
+
+
 
 with st.sidebar.expander("🎨 Apariencia", expanded=False):
     _def_h = int(st.session_state.get("header_h", 60))
@@ -3604,92 +3686,6 @@ render_fixed_header(
     logo_h=int(st.session_state["logo_h"]),
 )
 
-
-
-def render_fixed_header(
-    logo_img=None,
-    title="Mel-IA Ops — Plan táctico (diario por SVC)",
-    subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP • SP • DC",
-    header_h=104,
-    logo_h=500,
-):
-    import io, base64
-    def _img_to_b64(img):
-        buf = io.BytesIO()
-        try:
-            img.save(buf, format="PNG")
-        except Exception:
-            img = img.convert("RGBA")
-            img.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode()
-
-    if logo_img is not None:
-        try:
-            b64 = _img_to_b64(logo_img)
-            # estilo inline con !important por si hay reglas globales
-            logo_html = (
-                f'<img src="data:image/png;base64,{b64}" alt="logo" '
-                f'style="height:{int(logo_h)}px !important; '
-                f'width:auto !important; max-height:none !important; '
-                f'max-width:none !important; display:block;" />'
-            )
-        except Exception:
-            logo_html = f'<div style="font-size:{int(logo_h)}px; line-height:{int(logo_h)}px;">🚛</div>'
-    else:
-        logo_html = f'<div style="font-size:{int(logo_h)}px; line-height:{int(logo_h)}px;">🚛</div>'
-
-    st.markdown(
-        f"""
-        <style>
-          :root {{
-            --meli-header-h: {int(header_h)}px;
-            --meli-logo-h: {int(logo_h)}px;
-          }}
-
-          .meli-fixed {{
-            position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
-            background: #fff; height: var(--meli-header-h);
-            border-bottom: 1px solid rgba(0,0,0,.06);
-            box-shadow: 0 1px 6px rgba(0,0,0,.04);
-            overflow: visible; /* por si el navegador quisiera recortar */
-          }}
-          .meli-wrap {{
-            max-width: 1200px; margin: 0 auto;
-            height: 100%;
-            display: grid; grid-template-columns: auto 1fr;
-            align-items: center; gap: 14px; padding: 6px 12px;
-          }}
-
-          /* Mata cualquier límite global de imágenes dentro del header */
-          .meli-logo img {{
-            height: var(--meli-logo-h) !important;
-            width: auto !important;
-            max-height: none !important;
-            max-width: none !important;
-            display: block;
-            image-rendering: crisp-edges;
-          }}
-
-          .meli-title {{ margin: 0; font-size: 32px; line-height: 1.15; font-weight: 800; }}
-          .meli-sub {{ margin: 2px 0 0 0; color: #6b7280; font-size: 13px; }}
-
-          /* Quita header nativo y compensa offset del main */
-          [data-testid="stHeader"] {{ display: none; }}
-          .block-container {{ padding-top: calc(var(--meli-header-h) + 12px) !important; }}
-        </style>
-
-        <div class="meli-fixed">
-          <div class="meli-wrap">
-            <div class="meli-logo">{logo_html}</div>
-            <div>
-              <h1 class="meli-title">{title}</h1>
-              <div class="meli-sub">{subtitle}</div>
-            </div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 
@@ -3865,8 +3861,6 @@ try:
                     @st.cache_resource(show_spinner=False)
                     def _get_trained_model():
                         return train_failure_model(window_days=730)
-
-                    st.caption(f"Distribución FAIL: {y.value_counts().to_dict()}")
                     
                     model = _get_trained_model()
                     
@@ -4137,46 +4131,7 @@ try:
                     det["Prob_Fallo"] = det["Prob_Fallo"].round(3)
                     return resumen, det
 
-                    # =========================
-                    # Sección: Riesgo de fallo
-                    # =========================
-                    st.markdown("## ⚠️ Riesgo de fallo — Rentals & MLP (DL)")
-                    
-                    # Entrena/recupera modelo (cachea para no recalcular de más)
-                    @st.cache_resource(show_spinner=False)
-                    def _get_trained_model():
-                        return train_failure_model(window_days=730)
-                    
-                    model = _get_trained_model()
-                    
-                    try:
-                        resumen_svc, detalle_riesgo = predict_failure(detalles, tabla3, model)
-                    except Exception as e:
-                        show_exception(e, "Predicción de fallo")
-                        resumen_svc, detalle_riesgo = pd.DataFrame(), pd.DataFrame()
-                    
-                    # --- Tabla resumen por SVC (arriba)
-                    if resumen_svc is None or resumen_svc.empty:
-                        st.info("No hay datos para el resumen de riesgo.")
-                    else:
-                        st.markdown("#### Resumen por SVC")
-                        st.dataframe(resumen_svc, use_container_width=True, hide_index=True)
-                    
-                    # --- Tabla detallada desplegable (abajo)
-                    st.markdown("#### Detalle (día × SVC × DM × vehículo × MLP/Rentals)")
-                    if detalle_riesgo is None or detalle_riesgo.empty:
-                        st.info("Sin detalle de riesgo.")
-                    else:
-                        # Opción A: una sola tabla
-                        st.dataframe(detalle_riesgo, use_container_width=True, hide_index=True)
-                    
-                        # Opción B (si prefieres ‘desplegables’ por SVC):
-                        # for svc, g in detalle_riesgo.groupby("SVC"):
-                        #     with st.expander(f"SVC {svc}", expanded=False):
-                        #         st.dataframe(g, use_container_width=True, hide_index=True)
-
-
-
+                   
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
     show_exception(e, "Traceback completo")
