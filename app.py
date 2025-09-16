@@ -3098,11 +3098,14 @@ def _add_calendar_feats(df, date_col="FECHA", country="MX"):
 def _label_from_arer(arer: pd.DataFrame) -> pd.DataFrame:
     """
     Etiqueta de fallo a nivel fila AR-ER.
-    FAIL = 1 si CONFIRMADO > 0 y EJECUTADO < CONFIRMADO.
+    FAIL = 1 si el proveedor NO se presenta: EJECUTADO < CONFIRMADO_NETO.
+    CONFIRMADO_NETO = CONFIRMADO - CANCELACIONES_NUESTRAS (no penaliza al MLP).
     """
     if arer is None or arer.empty:
-        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-                                     "CONFIRMADO","EJECUTADO","FAIL"])
+        return pd.DataFrame(columns=[
+            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+            "CONFIRMADO","CANCELACIONES_NUESTRAS","CONF_NETO","EJECUTADO","FAIL"
+        ])
 
     df = arer.copy()
 
@@ -3115,24 +3118,34 @@ def _label_from_arer(arer: pd.DataFrame) -> pd.DataFrame:
     find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
     find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
 
+    # Columna de cancelaciones NUESTRAS (no penalizan al MLP)
+    # Ajusta la lista de aliases si tu sheet usa otro nombre.
+    find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_NUESTRAS","CANCELACIONES"], "CANCELACIONES_NUESTRAS", required=False, source_label="AR-ER")
+
     need = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","FECHA","CONFIRMADO","EJECUTADO"]
     if any(c not in df.columns for c in need):
-        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-                                     "CONFIRMADO","EJECUTADO","FAIL"])
+        return pd.DataFrame(columns=[
+            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+            "CONFIRMADO","CANCELACIONES_NUESTRAS","CONF_NETO","EJECUTADO","FAIL"
+        ])
 
-    # Tipos
+    # Tipos/fechas
     df["FECHA"] = parse_es_date_series(df["FECHA"])
     df = df[df["FECHA"].notna()].copy()
-
-    for c in ["CONFIRMADO","EJECUTADO"]:
+    for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_NUESTRAS"]:
+        if c not in df.columns:
+            df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
 
-    # Solo se puede fallar si hubo confirmación (>0)
-    df["FAIL"] = np.where((df["CONFIRMADO"] > 0) & (df["EJECUTADO"] + 1e-9 < df["CONFIRMADO"]), 1, 0).astype(int)
+    # Confirmado neto (nunca negativo)
+    df["CONF_NETO"] = (df["CONFIRMADO"] - df["CANCELACIONES_NUESTRAS"]).clip(lower=0)
 
-    # (debug opcional en UI)
+    # FAIL = no show: ejecutado < confirmado NETO
+    df["FAIL"] = (df["EJECUTADO"] + 1e-9 < df["CONF_NETO"]).astype(int)
+
+    # Debug opcional
     try:
         import streamlit as st
         vc = df["FAIL"].value_counts().to_dict()
@@ -3140,8 +3153,13 @@ def _label_from_arer(arer: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         pass
 
-    return df[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-               "CONFIRMADO","EJECUTADO","FAIL"]]
+    return df[[
+        "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+        "CONFIRMADO","CANCELACIONES_NUESTRAS","CONF_NETO","EJECUTADO","FAIL"
+    ]]
+
+
+
 
 def _attach_tabla2_spr(df_hist: pd.DataFrame) -> pd.DataFrame:
     """
@@ -3181,60 +3199,71 @@ def _attach_tabla2_spr(df_hist: pd.DataFrame) -> pd.DataFrame:
         out.loc[miss, "SPR_T2"] = k["SPR_T2"].values
     return out
 
-def _rolling_stats(df):
-    """Ventanas por MLP/SVC/vehículo: tasa de fail y nivel de confirmados recientes."""
+def _rolling_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ventanas por (SVC, DM, Vehículo, MLP):
+      - FAIL_RATE_*d: media móvil de FAIL
+      - CONF_*d: media móvil de CONF_NETO (lo comprometido neto)
+    Requiere que el dataframe tenga columnas: FAIL y CONF_NETO.
+    """
     d = df.sort_values("FECHA").copy()
     grp = d.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
+
     for w in ROLL_WINDOWS:
         d[f"FAIL_RATE_{w}d"] = (
-            grp["FAIL"].apply(lambda s: s.rolling(w, min_periods=5).mean()).reset_index(level=[0,1,2,3], drop=True)
+            grp["FAIL"].apply(lambda s: s.rolling(w, min_periods=5).mean())
+              .reset_index(level=[0,1,2,3], drop=True)
         )
+        base_conf = "CONF_NETO" if "CONF_NETO" in d.columns else "CONFIRMADO"
         d[f"CONF_{w}d"] = (
-            grp["CONFIRMADO"].apply(lambda s: s.rolling(w, min_periods=5).mean()).reset_index(level=[0,1,2,3], drop=True)
+            grp[base_conf].apply(lambda s: s.rolling(w, min_periods=5).mean())
+              .reset_index(level=[0,1,2,3], drop=True)
         )
     return d
+
+
 
 @dataclass
 class FailureModel:
     pipeline: Pipeline
     features: list
 
-###
 def train_failure_model(window_days: int = 730) -> FailureModel | None:
     """
-    Entrena ~2 años de historia para predecir FAIL a nivel (MLP/Rentals × día × tipo de vehículo).
-    Usa SPR de la Tabla 2 (dinámico), features de calendario y rolling windows.
-    Devuelve FailureModel con el pipeline entrenado.
+    Predice riesgo de NO show (FAIL) a nivel (MLP/Rentals × día × tipo de vehículo).
+    - Etiqueta: FAIL = 1 si EJECUTADO < CONF_NETO (quitando nuestras cancelaciones)
+    - Features ex-ante: SPR_T2, CONF_NETO, calendario, rolling de FAIL/CONF
     """
-    # --- 1) Carga AR-ER crudo (no scores agregados) y etiqueta ---
+    # 1) Carga AR-ER y etiqueta
     try:
         tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
         arer = read_sheet(SHEET_ID, tab_arer)
     except Exception:
         arer = pd.DataFrame()
 
-    ydf = _label_from_arer(arer)  # crea col 'FAIL' (0/1) por fila de ejecución
+    ydf = _label_from_arer(arer)
     if ydf is None or ydf.empty:
         return None
 
-    # --- 2) Enriquecimiento con SPR de la Tabla 2 + calendario + rolling ---
-    ydf = _attach_tabla2_spr(ydf)             # añade SPR_T2 por SVC×DM×Veh×día (dinámico)
-    ydf = _add_calendar_feats(ydf, "FECHA")   # añade DOW, IS_WE, MES, SEM, feriados, etc.
-    ydf = _rolling_stats(ydf)                 # añade FAIL_RATE_*d y CONF_*d por ventana
+    # 2) Enriquecer con SPR histórico (+ calendario + rolling)
+    ydf = _attach_tabla2_spr(ydf)            # añade SPR_T2 por SVC×DM×Veh×día
+    ydf = _add_calendar_feats(ydf, "FECHA")  # DOW, IS_WE, MES, SEM, feriados
+    ydf = _rolling_stats(ydf)                # usa FAIL y CONF_NETO
 
-    # Garantiza presencia de columnas de rolling aunque alguna ventana falte
+    # Garantiza columnas de rolling
     for c in [f"FAIL_RATE_{w}d" for w in ROLL_WINDOWS] + [f"CONF_{w}d" for w in ROLL_WINDOWS]:
         if c not in ydf.columns:
             ydf[c] = np.nan
 
-    # --- 3) Selección de features ---
+    # 3) Selección de features (SIN EJECUTADO)
     num_feats = [
-        "SPR_T2", "CONFIRMADO", "EJECUTADO",
-        "DOW", "IS_WE", "MES", "SEM",
+        "SPR_T2",
+        "CONF_NETO",            # lo comprometido neto (ex-ante)
+        "DOW","IS_WE","MES","SEM",
         *[f"FAIL_RATE_{w}d" for w in ROLL_WINDOWS],
         *[f"CONF_{w}d" for w in ROLL_WINDOWS],
     ]
-    cat_feats = ["SVC", "DELIVERY_MOD", "SHP_LG_VEHICLE_TYPE", "MLP"]
+    cat_feats = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"]
 
     num_feats = [c for c in num_feats if c in ydf.columns]
     cat_feats = [c for c in cat_feats if c in ydf.columns]
@@ -3242,19 +3271,11 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
     X = ydf[num_feats + cat_feats].copy()
     y = ydf["FAIL"].astype(int)
 
-    # Debug de etiquetas (lo verás en la app)
-    try:
-        vc = y.value_counts().to_dict()
-        pos_rate = float(y.mean()) if len(y) else 0.0
-        st.caption(f"Etiquetas FAIL — counts: {vc} · tasa positivos: {pos_rate:.3f}")
-    except Exception:
-        pass
-
-    # Imputación mínima previa (por si acaso)
+    # Imputación pre-pipeline por si hay NaNs sueltos
     if num_feats:
         X[num_feats] = X[num_feats].fillna(X[num_feats].median())
 
-    # --- 4) Preprocesamiento (DENSO) ---
+    # 4) Preprocesamiento DENSO
     num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median"))])
     try:
         cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
@@ -3274,7 +3295,7 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
         sparse_threshold=0.0
     )
 
-    # --- 5) Split estratificado cuando se pueda ---
+    # 5) Split
     do_strat = (y.nunique() == 2) and (y.value_counts().min() >= 2)
     try:
         X_fit, X_eval, y_fit, y_eval = train_test_split(
@@ -3284,25 +3305,18 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
         X_fit, y_fit = X, y
         X_eval, y_eval = X.iloc[:0], y.iloc[:0]
 
-    # --- 6) Selección de modelo con fallback por desbalance ---
-    extreme_imbalance = (y.mean() < 0.05) or (y.mean() > 0.95) or (y.nunique() < 2)
-
-    if extreme_imbalance:
-        # Modelo robusto a desbalance extremo
-        clf = LogisticRegression(max_iter=1000, class_weight="balanced")
-    else:
-        # Modelo principal
-        clf = HistGradientBoostingClassifier(
-            learning_rate=0.08,
-            max_iter=400,
-            max_depth=None,
-            random_state=42
-        )
+    # 6) Modelo (tolera NaNs) — con class_weight por si está desbalanceado
+    clf = HistGradientBoostingClassifier(
+        learning_rate=0.08,
+        max_iter=400,
+        max_depth=None,
+        random_state=42
+    )
 
     pipe = Pipeline([("prep", preprocess), ("clf", clf)])
     pipe.fit(X_fit, y_fit)
 
-    # --- 7) Métrica rápida (opcional) ---
+    # 7) Métrica rápida
     try:
         if len(X_eval) > 0:
             p = pipe.predict_proba(X_eval)[:, 1]
@@ -3311,9 +3325,8 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
     except Exception:
         pass
 
-    # --- 8) Empaqueta y devuelve ---
+    # 8) Devuelve wrapper
     return FailureModel(pipeline=pipe, features=num_feats + cat_feats)
-###
 
 
 
