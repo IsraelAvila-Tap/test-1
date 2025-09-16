@@ -25,6 +25,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import roc_auc_score
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.impute import SimpleImputer
 
 
 # -----------------------------------------------------------------------------
@@ -3223,18 +3224,62 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
     except Exception:
         clf = LogisticRegression(max_iter=200)
 
-    pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
-    pipe.fit(X, y)
+    # === PREPROCESAMIENTO + MODELO ROBUSTO A NaNs ===
+    
+    # 1) Define columnas (ajusta si tu set de features tiene otros nombres)
+    cat_features = ["SVC", "DELIVERY_MOD", "SHP_LG_VEHICLE_TYPE", "MLP"]
+    num_features = [
+        # básicas de Tabla 2 / Tabla 3
+        "Rutas", "SPR", "Shipments",
+        # calendario
+        "dow", "is_weekend", "is_holiday", "is_pre_holiday", "is_post_holiday",
+        "weekofyear", "month",
+        # opcionales de escala/volumen si las generaste
+        "FCST_SVC", "CAP_TOTAL_SVC"
+    ]
+    
+    # Filtra a las que existan realmente en el dataframe de entrenamiento
+    cat_features = [c for c in cat_features if c in X.columns]
+    num_features = [c for c in num_features if c in X.columns]
+    
+    # 2) Preprocesador con imputación
+    num_pipe = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median"))
+    ])
+    cat_pipe = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=True))
+    ])
+    
+    preprocess = ColumnTransformer(
+        transformers=[
+            ("num", num_pipe, num_features),
+            ("cat", cat_pipe, cat_features),
+        ],
+        remainder="drop"  # evita que se cuelen columnas inesperadas con NaN
+    )
+    
+    # 3) Clasificador (tolera NaNs y suele rendir mejor que GB clásico)
+    clf = HistGradientBoostingClassifier(
+        learning_rate=0.08,
+        max_depth=None,
+        max_iter=400,
+        l2_regularization=0.0,
+        random_state=42
+    )
+    
+    pipe = Pipeline(steps=[
+        ("prep", preprocess),
+        ("clf", clf)
+    ])
+    
+    # (opcional) quita filas sin etiqueta
+    mask_y = y.notna()
+    X_fit = X.loc[mask_y].copy()
+    y_fit = y.loc[mask_y].copy()
+    
+    pipe.fit(X_fit, y_fit)
 
-    # (Opcional) métrica rápida
-    try:
-        p = pipe.predict_proba(X)[:,1]
-        auc = roc_auc_score(y, p)
-        st.caption(f"AUC entrenamiento (aprox): {auc:.3f}")
-    except Exception:
-        pass
-
-    return FailureModel(pipeline=pipe, features=num_feats + cat_feats)
 
 
 
@@ -3790,6 +3835,32 @@ try:
                             finf[c] = pd.to_numeric(finf[c], errors="coerce").fillna(0)
                         _as_str_cols(finf, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
                         return finf
+
+                        ###
+                        # Normalizaciones mínimas para evitar NaNs aguas arriba
+                        for c in ["Rutas", "Shipments", "SPR"]:
+                            if c in df.columns:
+                                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+                        
+                        # Features de calendario: asegúrate de que existan sin NaN
+                        if "FECHA" in df.columns:
+                            _fecha = pd.to_datetime(df["FECHA"], errors="coerce")
+                            df["dow"] = _fecha.dt.dayofweek.fillna(0).astype(int)              # 0=Lunes
+                            df["weekofyear"] = _fecha.dt.isocalendar().week.fillna(1).astype(int)
+                            df["month"] = _fecha.dt.month.fillna(1).astype(int)
+                        
+                            # flags de feriados (usa tu función de calendario si ya la tienes)
+                            # Si ya existen estas columnas, solo rellena NaN con 0
+                            for k in ["is_holiday", "is_pre_holiday", "is_post_holiday", "is_weekend"]:
+                                if k not in df.columns:
+                                    df[k] = 0
+                                df[k] = pd.to_numeric(df[k], errors="coerce").fillna(0).astype(int)
+                        
+                        # Categóricas clave sin NaN (evita NaN -> OHE)
+                        for c in ["SVC", "DELIVERY_MOD", "SHP_LG_VEHICLE_TYPE", "MLP"]:
+                            if c in df.columns:
+                                df[c] = df[c].fillna("__NA__").astype(str)
+
                 
                 def predict_failure(detalles_df: pd.DataFrame, tabla3_df: pd.DataFrame, model: FailureModel | None):
                     """
