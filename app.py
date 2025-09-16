@@ -347,36 +347,34 @@ def show_exception(e: Exception, title: str):
 
 ####
 
-# --- Parseo robusto de fechas en español tipo "2 de junio de 2025" ---
+# --- Parseo robusto de fechas en español tipo "2 de junio de 2025" (AR-ER) ---
 _SP_MONTHS = {
     "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
     "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
 }
+
 def _strip_accents(s: str) -> str:
-    return unicodedata.normalize("NFD", s or "").encode("ascii", "ignore").decode("ascii").lower().strip()
+    import unicodedata
+    return unicodedata.normalize("NFD", s or "").encode("ascii", "ignore").decode("ascii")
+
+def _norm_name(s: str) -> str:
+    return _strip_accents(str(s)).lower().replace(" ", "").replace("_","")
 
 def _parse_spanish_date(val):
-    # Fast-path si ya es datetime
     if isinstance(val, (pd.Timestamp, datetime, date)):
-        try:
-            return pd.to_datetime(val)
-        except Exception:
-            return pd.NaT
+        return pd.to_datetime(val, errors="coerce")
     s = str(val or "").strip()
     if not s:
         return pd.NaT
-    # 1) Intento genérico (por si viene ya parseable)
-    try:
-        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
-        if pd.notna(dt):
-            return dt
-    except Exception:
-        pass
-    # 2) Regex "dd de <mes> de yyyy"
+    # 1) intento genérico
+    dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+    if pd.notna(dt):
+        return dt
+    # 2) "dd de <mes> de yyyy"
     m = re.search(r"(\d{1,2})\s+de\s+([A-Za-zÁÉÍÓÚáéíóúñÑ]+)\s+de\s+(\d{4})", s, flags=re.I)
     if m:
         d = int(m.group(1))
-        mon = _strip_accents(m.group(2))
+        mon = _strip_accents(m.group(2)).lower()
         y = int(m.group(3))
         mm = _SP_MONTHS.get(mon)
         if mm:
@@ -387,12 +385,29 @@ def _parse_spanish_date(val):
     return pd.NaT
 
 def coerce_spanish_date_column(df: pd.DataFrame, candidates, outcol: str) -> bool:
-    """Intenta crear df[outcol] a partir de cualquiera de las columnas candidatas, usando _parse_spanish_date."""
-    for c in candidates:
-        if c in df.columns:
-            df[outcol] = df[c].apply(_parse_spanish_date)
+    """
+    Busca la columna de fecha por nombre normalizado (sin acentos/espacios/_),
+    la parsea con _parse_spanish_date y la guarda en df[outcol].
+    Si no encuentra ninguna candidata, intenta autodetectar la mejor columna objeto.
+    """
+    # 1) matching estricto por nombre normalizado
+    norm_map = { _norm_name(c): c for c in df.columns }
+    for cand in candidates:
+        target = _norm_name(cand)
+        if target in norm_map:
+            col = norm_map[target]
+            df[outcol] = df[col].apply(_parse_spanish_date)
             return True
-    return False
+    # 2) autodetección: prueba en columnas de texto y elige la de mayor % parseado
+    best_col, best_ok = None, -1
+    for col in df.columns:
+        if df[col].dtype == object:
+            parsed = df[col].apply(_parse_spanish_date)
+            ok = parsed.notna().mean()
+            if ok > best_ok:
+                best_ok, best_col = ok, col
+                df[outcol] = parsed
+    return best_ok >= 0.2  # al menos 20% parseable
 
 
 # -----------------------------------------------------------------------------
@@ -2699,13 +2714,12 @@ def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
         return pd.DataFrame(columns=out_cols)
     return out[out_cols].reset_index(drop=True)
 
-
 @st.cache_data(show_spinner=False, ttl=300)
-def load_mlp_score_from_arer(lookback_days: int = 90) -> pd.DataFrame:
+def load_mlp_score_from_arer(lookback_days: int = 365) -> pd.DataFrame:
     """
-    Lee la pestaña AR-ER (nuevo formato) y calcula un score por MLP×SVC.
-    Score = promedio_{ventana}[ EJECUTADO / max(CONFIRMADO, 1) ], clip 0..1.
-    Devuelve columnas: MLP, SVC, SCORE (float).
+    Lee AR-ER (nuevo formato) y calcula SCORE por MLP×SVC:
+    SCORE = promedio(FILL_RATE) con FILL_RATE = EJECUTADO / max(CONFIRMADO,1), clip 0..1.
+    Ventana por defecto: 365 días. Si la ventana queda vacía, hace fallback a todo el dataset.
     """
     try:
         ar = read_sheet(SHEET_ID, SHEET_TABS["ar_er"])
@@ -2715,68 +2729,66 @@ def load_mlp_score_from_arer(lookback_days: int = 90) -> pd.DataFrame:
     if ar is None or ar.empty:
         return pd.DataFrame(columns=["MLP","SVC","SCORE"])
 
-    # Normalización de nombres (admite viejo y nuevo formato)
+    # Normalización de columnas
     find_and_rename(ar, ["DELIVERY_MODEL","Delivery model","Model","DM"], "DELIVERY_MODEL", required=False, source_label="AR-ER")
     find_and_rename(ar, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
     find_and_rename(ar, ["SVC","SVCs","LOGISTIC_CENTER_ID","LC","Facility"], "SVC", required=False, source_label="AR-ER")
     find_and_rename(ar, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Tipo de vehiculo"], "VEH_TYPE", required=False, source_label="AR-ER")
 
-    # La nueva columna de fecha en español:
-    # "Mes, Día, Año de FECHA" (acepta variantes por si cambian mayúsculas/acentos)
-    date_ok = coerce_spanish_date_column(
+    # Fecha (nuevo header con comas/acentos)
+    got_date = coerce_spanish_date_column(
         ar,
-        ["Mes, Día, Año de FECHA","Mes, dia, año de fecha","FECHA","Fecha","DATE","OP_DT"],
+        ["Mes, Día, Año de FECHA","Mes, dia, año de fecha","Fecha","FECHA","DATE","OP_DT"],
         "FECHA"
     )
-    if not date_ok:
-        # Fallback al coercer genérico por si Google devuelve ya datetime
+    if not got_date:
+        # Fallback por si ya viene como datetime
         coerce_date_column(ar, ["FECHA","Fecha","DATE","OP_DT"], "FECHA", "AR-ER", required=False)
 
-    # Otras columnas numéricas (con tolerancia a nombres)
+    # Métricas
     find_and_rename(ar, ["SOLICITADO FN","Solicitado FN","Solicitado","Requested"], "SOLICITADO_FN", required=False, source_label="AR-ER")
     find_and_rename(ar, ["CONFIRMADO","Confirmado","CONFIRMADOS"], "CONFIRMADO", required=False, source_label="AR-ER")
     find_and_rename(ar, ["Cancelaciones Form","CANCELACIONES FORM","Cancelaciones"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
     find_and_rename(ar, ["EJECUTADO","Ejecutado","EJECUTADOS"], "EJECUTADO", required=False, source_label="AR-ER")
 
-    # Asegura presencia de columnas clave
+    # Defaults y tipos
     ar = ensure_columns(ar, {
         "MLP":"", "SVC":"", "DELIVERY_MODEL":"", "VEH_TYPE":"",
         "FECHA":pd.NaT, "SOLICITADO_FN":0, "CONFIRMADO":0, "CANCELACIONES_FORM":0, "EJECUTADO":0
     })
-
-    # Tipos
     _as_str_cols(ar, ["MLP","SVC","DELIVERY_MODEL","VEH_TYPE"])
     ar["FECHA"] = pd.to_datetime(ar["FECHA"], errors="coerce")
-    ar["SOLICITADO_FN"]     = pd.to_numeric(ar["SOLICITADO_FN"], errors="coerce").fillna(0)
-    ar["CONFIRMADO"]        = pd.to_numeric(ar["CONFIRMADO"], errors="coerce").fillna(0)
-    ar["CANCELACIONES_FORM"]= pd.to_numeric(ar["CANCELACIONES_FORM"], errors="coerce").fillna(0)
-    ar["EJECUTADO"]         = pd.to_numeric(ar["EJECUTADO"], errors="coerce").fillna(0)
+    ar["SOLICITADO_FN"]      = pd.to_numeric(ar["SOLICITADO_FN"], errors="coerce").fillna(0)
+    ar["CONFIRMADO"]         = pd.to_numeric(ar["CONFIRMADO"], errors="coerce").fillna(0)
+    ar["CANCELACIONES_FORM"] = pd.to_numeric(ar["CANCELACIONES_FORM"], errors="coerce").fillna(0)
+    ar["EJECUTADO"]          = pd.to_numeric(ar["EJECUTADO"], errors="coerce").fillna(0)
 
-    # Ventana temporal (últimos N días)
+    # Ventana: 365d por defecto + fallback si queda vacía
     if ar["FECHA"].notna().any():
         cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=int(lookback_days))
-        ar = ar[ar["FECHA"] >= cutoff].copy()
+        ar_w = ar[ar["FECHA"] >= cutoff].copy()
+        if ar_w.empty:
+            # usa todo el dataset si la ventana queda vacía
+            ar_w = ar.copy()
+        ar = ar_w
 
     if ar.empty:
         return pd.DataFrame(columns=["MLP","SVC","SCORE"])
 
-    # Fill-rate diario y clipping
+    # Fill-rate y score
     ar["FILL_RATE"] = (ar["EJECUTADO"] / ar["CONFIRMADO"].replace(0, np.nan)).clip(0, 1).fillna(0)
-
-    # Score por MLP×SVC (promedio simple en la ventana)
     score = (
         ar.groupby(["MLP","SVC"], dropna=False)["FILL_RATE"]
           .mean()
           .rename("SCORE")
           .reset_index()
     )
-
-    # Limpieza final
     score["MLP"] = score["MLP"].astype(str).str.strip()
     score["SVC"] = score["SVC"].astype(str).str.strip()
     score["SCORE"] = pd.to_numeric(score["SCORE"], errors="coerce").fillna(0).clip(0,1)
 
     return score.sort_values(["SCORE","MLP"], ascending=[False, True]).reset_index(drop=True)
+
 
 
 def build_table3(plan_df: pd.DataFrame) -> pd.DataFrame:
