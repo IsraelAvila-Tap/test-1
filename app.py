@@ -3750,11 +3750,9 @@ try:
 
                     ####
                     def _mk_inference_frame(detalles_df: pd.DataFrame, tabla3_df: pd.DataFrame) -> pd.DataFrame:
-                    """
-                    Construye filas a nivel MLP/día/vehículo (y Rentals) con rutas y SPR de la Tabla 2.
+                    """Construye filas a nivel MLP/día/vehículo (y Rentals) con rutas y SPR de la Tabla 2.
                     - Para MLP: parte de Tabla 3 (Rutas por MLP) y trae SPR desde Tabla 2 por SVC×DM×Veh del mismo día.
-                    - Para Rentals: usa las filas Rentals de Tabla 2 (ya tienen SPR y Rutas).
-                    """
+                    - Para Rentals: usa las filas Rentals de Tabla 2 (ya tienen SPR y Rutas)."""
                     out_cols = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"]
                     if (detalles_df is None or detalles_df.empty) and (tabla3_df is None or tabla3_df.empty):
                         return pd.DataFrame(columns=out_cols)
