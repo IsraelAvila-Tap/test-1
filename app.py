@@ -26,6 +26,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.impute import SimpleImputer
+from sklearn.ensemble import HistGradientBoostingClassifier
 
 
 # -----------------------------------------------------------------------------
@@ -3243,21 +3244,25 @@ def train_failure_model(window_days: int = 730) -> FailureModel | None:
     num_features = [c for c in num_features if c in X.columns]
     
     # 2) Preprocesador con imputación
-    num_pipe = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median"))
-    ])
-    cat_pipe = Pipeline(steps=[
+
+    num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median"))])
+    cat_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=True))
+        ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=True)),  # o sparse=True si <1.2
     ])
     
-    preprocess = ColumnTransformer(
-        transformers=[
-            ("num", num_pipe, num_features),
-            ("cat", cat_pipe, cat_features),
-        ],
-        remainder="drop"  # evita que se cuelen columnas inesperadas con NaN
-    )
+    preprocess = ColumnTransformer([
+        ("num", num_pipe, num_feats),
+        ("cat", cat_pipe, cat_feats),
+    ])
+    
+    clf = HistGradientBoostingClassifier(learning_rate=0.08, max_iter=400, random_state=42)
+    
+    pipe = Pipeline([("prep", preprocess), ("clf", clf)])
+
+
+
+
     
     # 3) Clasificador (tolera NaNs y suele rendir mejor que GB clásico)
     clf = HistGradientBoostingClassifier(
