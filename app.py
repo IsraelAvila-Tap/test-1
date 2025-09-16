@@ -3566,12 +3566,17 @@ def render_pretty_table(df, caption=None):
 # ---------------------------------------------------------------------
 # 6) UI
 # ---------------------------------------------------------------------
+
+# --- Configuración de página (debe ir una sola vez y antes de cualquier st.*) ---
 st.set_page_config(
     page_title="Mel-IA (Copiloto de tu flota en Mercado Libre)",
+    page_icon=LOGO_IMAGE if LOGO_IMAGE is not None else "🚛",
     layout="wide",
-    page_icon=LOGO_IMAGE if LOGO_IMAGE is not None else "🚛"
+    initial_sidebar_state="expanded",
 )
-inject_brand_css()  # ← ACTIVA los estilos de marca
+
+# --- Estilos de marca ---
+inject_brand_css()
 
 # --- Tamaño del logo: default + persistencia ---
 DEFAULT_LOGO_WIDTH = 200
@@ -3587,8 +3592,7 @@ if "logo_width" not in st.session_state:
 
 LOGO_WIDTH = int(st.session_state["logo_width"])
 
-# --- UI helpers (pon esto antes de set_page_config y antes de la primera llamada) ---
-
+# --- UI helpers ---
 def render_fixed_header(
     logo_img=None,
     title="Mel-IA Ops — Plan táctico (diario por SVC)",
@@ -3597,6 +3601,7 @@ def render_fixed_header(
     logo_h=500,
 ):
     import io, base64
+
     def _img_to_b64(img):
         buf = io.BytesIO()
         try:
@@ -3652,15 +3657,13 @@ def render_fixed_header(
         """,
         unsafe_allow_html=True,
     )
-st.set_page_config(... )
-inject_brand_css()
-# ...
+
+# --- Llamada al header fijo (cuando ya tengas final_header_h calculado) ---
 render_fixed_header(
     logo_img=LOGO_IMAGE,
     header_h=final_header_h,
     logo_h=int(st.session_state["logo_h"]),
 )
-
 
 
 
