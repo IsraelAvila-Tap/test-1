@@ -3462,20 +3462,28 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30) -> tuple[pd.DataFr
     find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
     find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_FORM","CANCELACIONES"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
 
-    # ---- Fechas (con D-1) ----
+    # ==========================
+    #  FECHAS (ROBUSTO)  <<< FIX
+    # ==========================
+    # 1) Intento de parser propio (puede dejar 'date' Python)
     try:
         df["FECHA"] = parse_es_date_series(df["FECHA"])
     except Exception:
-        d1 = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
-        d2 = pd.to_datetime(df["FECHA"], errors="coerce")
-        df["FECHA"] = d1.fillna(d2)
+        pass
+    # 2) Si viene como serial numérico de Excel -> convértelo
+    if pd.api.types.is_numeric_dtype(df["FECHA"]):
+        df["FECHA"] = pd.to_datetime(df["FECHA"], unit="D", origin="1899-12-30", errors="coerce")
+    else:
+        # 3) Forzar SIEMPRE datetime64[ns] (no objetos 'date')
+        df["FECHA"] = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")\
+                         .fillna(pd.to_datetime(df["FECHA"], errors="coerce"))
+    # 4) Filtrado temporal usando Timestamps (evita .dt.date)
     df = df[df["FECHA"].notna()].copy()
-    cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).date()
-    df = df[df["FECHA"].dt.date <= cutoff].copy()
-
+    cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1))      # D-1 23:59
+    df = df[df["FECHA"] <= cutoff].copy()
     if days and days > 0:
-        start = (pd.Timestamp.today().normalize() - pd.Timedelta(days=days)).date()
-        df = df[df["FECHA"].dt.date >= start].copy()
+        start = cutoff - pd.Timedelta(days=days-1)
+        df = df[df["FECHA"] >= start].copy()
 
     # ---- Métricas base ----
     for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
@@ -3489,7 +3497,6 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30) -> tuple[pd.DataFr
     df["DM_TRAIN"] = _collapse_dm_for_training(df["DELIVERY_MOD"])
     df["SVC_CAN"]  = df["SVC"].map(_canon_key)
     df["MLP_CAN"]  = df["MLP"].map(_canon_key)
-    # Vehículo canónico (usa tus helpers)
     df["VEH_CAN"]  = df["SHP_LG_VEHICLE_TYPE"].map(_veh_mix_hom).str.upper()
 
     # ---- WAVG por combo completo y por pool ----
@@ -3507,7 +3514,6 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30) -> tuple[pd.DataFr
                  .reset_index(name="SF_RECENT_30_POOL"))
 
     return by_full, by_pool
-
 
 ####
 
