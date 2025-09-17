@@ -3418,6 +3418,103 @@ try:
 except Exception:
     pass
 
+
+
+# --- Helper: colapsar DM a las categorías del entrenamiento ---
+def _collapse_dm_for_training(dm_series: pd.Series) -> pd.Series:
+    s = dm_series.astype(str).str.upper().str.strip()
+    return (
+        s.replace({
+            "MLP SDD": "MLP",
+            "MLP SPOT": "MLP",
+            "MLP BACKLOG": "MLP",
+            "RENTAL": "RENTALS",
+            "RENTALS": "RENTALS",
+            "RENTAS": "RENTALS",
+        })
+        .fillna("__NA__")
+    )
+
+def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30) -> pd.DataFrame:
+    """
+    Devuelve:
+      - by_full: SF_RECENT_30 por (SVC, DM_TRAIN, SHP_LG_VEHICLE_TYPE, MLP)
+      - by_pool: SF_RECENT_30_POOL por (SVC, DM_TRAIN, SHP_LG_VEHICLE_TYPE)
+    Ponderado por CONF_EFECTIVO. Filtra días futuros (usa D-1).
+    """
+    if arer is None or arer.empty:
+        by_full = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT_30"])
+        by_pool = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","SF_RECENT_30_POOL"])
+        return by_full, by_pool
+
+    df = arer.copy()
+
+    # ---- Normaliza encabezados mínimos ----
+    find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
+    find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
+    find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Mes, Día, Año de FECHA","Mes, dia, Año de FECHA","FECHA","OP_DT","DATE"], "FECHA", required=False, source_label="AR-ER")
+    find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
+    find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
+    find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_FORM","CANCELACIONES"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
+
+    # ---- Parseo ROBUSTO de fechas ----
+    # 1) si tienes parse_es_date_series úsalo; si no, hacemos fallback híbrido:
+    try:
+        df["FECHA"] = parse_es_date_series(df["FECHA"])
+    except Exception:
+        # Si viene como número (serial de Sheets/Excel)
+        if pd.api.types.is_numeric_dtype(df["FECHA"]):
+            df["FECHA"] = pd.to_datetime(df["FECHA"], unit="D", origin="1899-12-30", errors="coerce")
+        else:
+            # Intento estándar (día/mes/año y formatos de texto)
+            d1 = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
+            # Segundo intento sin dayfirst por si ya viene iso
+            d2 = pd.to_datetime(df["FECHA"], errors="coerce").fillna(pd.NaT)
+            df["FECHA"] = d1.fillna(d2)
+
+    # Filtra inválidas
+    df = df[df["FECHA"].notna()].copy()
+
+    # ---- D-1 (no usamos día en curso ni futuro) ----
+    cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).date()
+    df = df[df["FECHA"].dt.date <= cutoff].copy()
+
+    # ---- Métricas base ----
+    for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
+        df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
+
+    df["CONF_EFECTIVO"] = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
+    conf = df["CONF_EFECTIVO"].replace(0, np.nan)
+    df["SHORTFALL_PCT"] = ((conf - df["EJECUTADO"]) / conf).clip(lower=0).fillna(0)
+
+    # ---- Claves y DM colapsado (que el modelo sí conoce) ----
+    _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
+    df["DM_TRAIN"] = _collapse_dm_for_training(df["DELIVERY_MOD"])
+
+    # ---- Ventana reciente ----
+    recent_cut = (pd.Timestamp.today().normalize() - pd.Timedelta(days=days)).date()
+    df_recent = df[df["FECHA"].dt.date >= recent_cut].copy()
+
+    # WAVG (ponderada por CONF_EFECTIVO)
+    def _wavg(g):
+        w = pd.to_numeric(g["CONF_EFECTIVO"], errors="coerce").fillna(0)
+        x = pd.to_numeric(g["SHORTFALL_PCT"], errors="coerce").fillna(0)
+        return float(np.average(x, weights=np.where(w>0, w, 0.0))) if w.sum()>0 else 0.0
+
+    by_full = (df_recent.groupby(["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
+               .apply(_wavg).rename("SF_RECENT_30").reset_index())
+
+    by_pool = (df_recent.groupby(["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], dropna=False)
+               .apply(_wavg).rename("SF_RECENT_30_POOL").reset_index())
+
+    return by_full, by_pool
+
+
+
+
+
 ####
 
 @st.cache_resource(show_spinner=False)
@@ -3693,77 +3790,6 @@ def render_pretty_table(df, caption=None):
     if caption:
         st.caption(caption)
     st.table(sty)
-
-# --- Helper: colapsar DM a las categorías del entrenamiento ---
-def _collapse_dm_for_training(dm_series: pd.Series) -> pd.Series:
-    s = dm_series.astype(str).str.upper().str.strip()
-    return (
-        s.replace({
-            "MLP SDD": "MLP",
-            "MLP SPOT": "MLP",
-            "MLP BACKLOG": "MLP",
-            "RENTAL": "RENTALS",
-            "RENTALS": "RENTALS",
-            "RENTAS": "RENTALS",
-        })
-        .fillna("__NA__")
-    )
-
-# --- Señal de corto plazo: tasa reciente (30 días) ponderada por CONF_EFECTIVO ---
-def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30) -> pd.DataFrame:
-    """
-    Devuelve SF_RECENT_30 por (SVC, DM_TRAIN, Vehículo, MLP) y también a nivel pool (sin MLP),
-    ponderado por CONF_EFECTIVO. Filtra días futuros (usa D-1).
-    """
-    if arer is None or arer.empty:
-        return pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT_30"])
-
-    df = arer.copy()
-    # Normaliza encabezados mínimos
-    find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
-    find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
-    find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
-    find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
-    find_and_rename(df, ["Mes, Día, Año de FECHA","Mes, dia, Año de FECHA","FECHA","OP_DT","DATE"], "FECHA", required=False, source_label="AR-ER")
-    find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
-    find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
-    find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_FORM","CANCELACIONES"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
-
-    # Tipos / fechas y D-1
-    df["FECHA"] = parse_es_date_series(df["FECHA"])
-    df = df[df["FECHA"].notna()].copy()
-    cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).date()
-    df = df[df["FECHA"].dt.date <= cutoff].copy()
-
-    # Efectivo: confirmado menos cancelaciones (no penalizamos sobre-ejecución)
-    for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
-        df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
-
-    df["CONF_EFECTIVO"] = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
-    conf = df["CONF_EFECTIVO"].replace(0, np.nan)
-    df["SHORTFALL_PCT"] = ((conf - df["EJECUTADO"]) / conf).clip(lower=0).fillna(0)
-
-    # Claves y DM colapsado para entrenamiento
-    _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
-    df["DM_TRAIN"] = _collapse_dm_for_training(df["DELIVERY_MOD"])
-
-    # Ventana reciente
-    recent_cut = (pd.Timestamp.today().normalize() - pd.Timedelta(days=days)).date()
-    df_recent = df[df["FECHA"].dt.date >= recent_cut].copy()
-
-    # WAVG por combo completo
-    def _wavg(g):
-        w = pd.to_numeric(g["CONF_EFECTIVO"], errors="coerce").fillna(0)
-        x = pd.to_numeric(g["SHORTFALL_PCT"], errors="coerce").fillna(0)
-        return float(np.average(x, weights=np.where(w>0, w, 0.0))) if w.sum()>0 else 0.0
-
-    by_full = (df_recent.groupby(["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
-               .apply(_wavg).rename("SF_RECENT_30").reset_index())
-    # Pool sin MLP (fallback)
-    by_pool = (df_recent.groupby(["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], dropna=False)
-               .apply(_wavg).rename("SF_RECENT_30_POOL").reset_index())
-
-    return by_full, by_pool
 
 
 # ---------------------------------------------------------------------
