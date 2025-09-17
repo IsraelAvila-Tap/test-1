@@ -4145,22 +4145,51 @@ try:
                 try:
                     # Usa la función global ya definida arriba
                     model = _get_trained_model()
-
+                
                     resumen_svc, detalle_riesgo = predict_failure(detalles, tabla3, model)
-
+                
                     if resumen_svc is None or resumen_svc.empty:
                         st.info("Sin datos para evaluar riesgo aún.")
                     else:
+                        # --- Formato: miles sin decimales y % con 1 decimal ---
+                        num0f = "{:,.0f}".format   # 12,345
+                        pct1f = "{:.1%}".format    # 12.3%
+                
                         st.subheader("Resumen por SVC")
-                        st.dataframe(resumen_svc, use_container_width=True, hide_index=True)
-
+                
+                        res_show = resumen_svc.copy()
+                        for c in ["Rutas", "Rutas_riesgo", "Shipments", "Shipments_riesgo", "Prob_peso_ship"]:
+                            if c in res_show.columns:
+                                res_show[c] = pd.to_numeric(res_show[c], errors="coerce")
+                
+                        res_style = res_show.style.format({
+                            "Rutas": num0f,
+                            "Rutas_riesgo": num0f,
+                            "Shipments": num0f,
+                            "Shipments_riesgo": num0f,
+                            "Prob_peso_ship": pct1f,
+                        })
+                        st.dataframe(res_style, use_container_width=True, hide_index=True)
+                
                         with st.expander("Ver detalle por día × DM × vehículo × MLP", expanded=False):
-                            st.dataframe(detalle_riesgo, use_container_width=True, hide_index=True)
-
+                            det_show = detalle_riesgo.copy()
+                            for c in ["Rutas", "Shipments", "Rutas_riesgo", "Shipments_riesgo", "Prob_Fail"]:
+                                if c in det_show.columns:
+                                    det_show[c] = pd.to_numeric(det_show[c], errors="coerce")
+                
+                            det_style = det_show.style.format({
+                                "Rutas": num0f,
+                                "Shipments": num0f,
+                                "Rutas_riesgo": num0f,
+                                "Shipments_riesgo": num0f,
+                                "Prob_Fail": pct1f,
+                            })
+                            st.dataframe(det_style, use_container_width=True, hide_index=True)
+                
                         # Guarda en session_state por si lo usas en otros módulos
                         st.session_state["riesgo_resumen_svc"] = resumen_svc.copy()
                         st.session_state["riesgo_detalle"] = detalle_riesgo.copy()
-
+                
                 except Exception as e:
                     st.error("No se pudo calcular la Tabla 4 (riesgo de fallo).")
                     show_exception(e, "Tabla 4 (riesgo)")
