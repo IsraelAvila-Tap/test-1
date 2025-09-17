@@ -3107,22 +3107,21 @@ def _add_calendar_feats(df, date_col="FECHA", country="MX"):
 
 def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
     """
-    Etiqueta de *riesgo de shortfall proporcional* a nivel fila AR-ER.
-    SHORTFALL_PCT = max((CONF_EFECTIVO - EJECUTADO) / CONF_EFECTIVO, 0) si CONF_EFECTIVO>0; si no, 0.
-    CONF_EFECTIVO = max(CONFIRMADO - CANCELACIONES_FORM, 0).
-    Filtra datos a D-1 (evita "futuros" sin ejecutar).
-    Devuelve además columnas auxiliares para features.
+    Shortfall proporcional por fila AR-ER.
+    SHORTFALL_PCT = max((CONF_EFECTIVO - EJECUTADO)/CONF_EFECTIVO, 0)
+    CONF_EFECTIVO = max(CONFIRMADO - CANCELACIONES_FORM, 0)
+    Filtra a D-1 (evita “futuros” sin ejecutar).
     """
+    out_cols = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+                "CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
+                "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT"]
+
     if arer is None or arer.empty:
-        return pd.DataFrame(columns=[
-            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-            "CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
-            "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT"
-        ])
+        return pd.DataFrame(columns=out_cols)
 
     df = arer.copy()
 
-    # ---- encabezados tolerantes
+    # --- headers tolerantes ---
     find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
     find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
     find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
@@ -3134,20 +3133,24 @@ def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
 
     need = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","FECHA","CONFIRMADO","EJECUTADO"]
     if any(c not in df.columns for c in need):
-        return pd.DataFrame(columns=[
-            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-            "CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
-            "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT"
-        ])
+        return pd.DataFrame(columns=out_cols)
 
-    df["FECHA"] = parse_es_date_series(df["FECHA"])
+    # --- FECHA robusta: siempre a datetime64[ns] ---
+    # 1) intenta con tu parser en español (si lo tienes)
+    try:
+        df["FECHA"] = parse_es_date_series(df["FECHA"])
+    except Exception:
+        pass
+    # 2) garantizamos datetime con coerce (cubre cuando parse_es_date_series deja objetos date/str)
+    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
     df = df[df["FECHA"].notna()].copy()
 
-    # Corte D-1
-    _today = datetime.date.today()
-    cutoff = _today - datetime.timedelta(days=1)
-    df = df[df["FECHA"].dt.date <= cutoff].copy()
+    # --- corte D-1 ---
+    import datetime as _dt
+    cutoff = pd.Timestamp(_dt.date.today() - _dt.timedelta(days=1))
+    df = df[df["FECHA"] <= cutoff].copy()
 
+    # --- tipos numéricos ---
     for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
         if c not in df.columns:
             df[c] = 0
@@ -3155,8 +3158,7 @@ def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
 
     df["CONF_EFECTIVO"]  = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
     den = df["CONF_EFECTIVO"].replace(0, np.nan)
-    sf  = ((df["CONF_EFECTIVO"] - df["EJECUTADO"]) / den).clip(lower=0)
-    df["SHORTFALL_PCT"] = sf.fillna(0.0)
+    df["SHORTFALL_PCT"] = ((df["CONF_EFECTIVO"] - df["EJECUTADO"]) / den).clip(lower=0).fillna(0.0)
     df["SF_WEIGHT"]     = df["CONF_EFECTIVO"].clip(lower=0)
 
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
@@ -3167,9 +3169,7 @@ def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         pass
 
-    return df[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-               "CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
-               "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT"]]
+    return df[out_cols]
 
 
 def _attach_tabla2_spr(df_hist: pd.DataFrame) -> pd.DataFrame:
