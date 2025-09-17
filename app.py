@@ -3556,7 +3556,7 @@ def predict_failure(detalles_df: pd.DataFrame,
     det["SPR"] = pd.to_numeric(det["SPR"], errors="coerce")
 
     dm_str = det["DELIVERY_MOD"].astype(str)
-    focus_dm = ["Rentals", "MLP SDD", "MLP SPOT", "MLP BACKLOG"]
+    focus_dm = ["MLP SDD", "MLP SPOT", "MLP BACKLOG"]
     det = det[dm_str.isin(focus_dm)].copy()
 
     spr_map = (
@@ -3564,18 +3564,10 @@ def predict_failure(detalles_df: pd.DataFrame,
            .mean().rename("SPR_MAP").reset_index()
     )
 
-    # --- 2) RENTALS desde Tabla 2 ---
-    rentals = det[dm_str.eq("Rentals")].copy()
-    if not rentals.empty:
-        rentals = (rentals.groupby(["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)
-                          .agg(Rutas=("Rutas","sum"),
-                               Shipments=("Shipments","sum"),
-                               SPR=("SPR","mean"))
-                          .reset_index())
-        rentals["MLP"] = "RENTALS"
-    else:
-        rentals = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE",
-                                        "Rutas","Shipments","SPR","MLP"])
+    # --- 2) RENTALS desde Tabla 2 (deshabilitado: riesgo solo MLP) ---
+    rentals = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE",
+                                    "Rutas","Shipments","SPR","MLP"])
+
 
     # --- 3) MLP desde Tabla 3 + SPR del mismo día por SVC×DM×Veh ---
     if tabla3_df is None or tabla3_df.empty:
@@ -3592,14 +3584,13 @@ def predict_failure(detalles_df: pd.DataFrame,
         t3["Shipments"] = (t3["Rutas"] * t3["SPR"]).round().astype(int)
         mlp_rows = t3[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"]].copy()
 
-    # --- 4) Unifica RENTALS + MLP ---
-    pred_df = pd.concat([
-        rentals[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"]],
-        mlp_rows
-    ], axis=0, ignore_index=True)
+ 
+    # --- 4) Dataset de predicción: solo MLP ---
+    pred_df = mlp_rows.copy()
     if pred_df.empty:
         empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"])
         return empty_res, pred_df
+
 
     # --- 5) Features calendario + DM colapsado ---
     pred_df["DOW"] = pred_df["FECHA"].dt.weekday
@@ -4209,7 +4200,7 @@ try:
                         show_exception(e, "Debug SRM/Score")
 
                 # 9) Tabla 4 — Riesgo de fallo (usa Tabla 2 + Tabla 3)
-                st.markdown("### Tabla 4 — Riesgo de fallo (MLPs & Rentals)")
+                st.markdown("### Tabla 4 — Riesgo de fallo (MLPs)")
                 try:
                     # Usa la función global ya definida arriba
                     model = _get_trained_model()
