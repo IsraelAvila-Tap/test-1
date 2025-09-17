@@ -3803,7 +3803,7 @@ def render_fixed_header(
     logo_img=None,
     title="Mel-IA Ops — Plan táctico (diario por SVC)",
     subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP • SP • DC",
-    header_h=280,
+    header_h=580,
     logo_h=88,
 ):
     import io, base64
