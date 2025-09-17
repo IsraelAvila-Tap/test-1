@@ -2212,10 +2212,16 @@ def _dm_bucket_for_mix(dm: str) -> str:
 
 @st.cache_data(show_spinner=False, ttl=300)
 def load_spr_by_dm_vehicle(op_date: date, mode: str) -> pd.DataFrame:
-    want = ["SVC","DM","VEH","SPR_SEL"]
-
+    """
+    SPR seleccionado por SVC × (RENTALS/CROWD/MLP) × Vehículo (LV/SV/Car/Bike/Others),
+    usando el mismo criterio que la cabecera:
+      - promedio: mediana de los últimos 4 del mismo weekday (<= op_date)
+      - peak:     p95 de los últimos 12 del mismo weekday (<= op_date)
+      - plan:     último valor del mismo weekday (<= op_date)
+    """
     spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
-    if spr is None or (hasattr(spr, "empty") and spr.empty):
+    want = ["SVC","DM","VEH","SPR_SEL"]
+    if spr.empty:
         return pd.DataFrame(columns=want)
 
     # Normalización de columnas
@@ -2266,18 +2272,17 @@ def load_spr_by_dm_vehicle(op_date: date, mode: str) -> pd.DataFrame:
     else:  # plan
         sel = spr.groupby(["SVC","DM_BKT","VEH_HOM"], dropna=False).apply(agg_plan).reset_index(name="SPR_SEL")
 
-    if sel is None or sel.empty:
-        return pd.DataFrame(columns=want)
-
     sel.rename(columns={"DM_BKT":"DM","VEH_HOM":"VEH"}, inplace=True)
-    sel = sel[["SVC","DM","VEH","SPR_SEL"]]
-    # Garantiza tipos
-    _as_str_cols(sel, ["SVC","DM","VEH"])
-    sel["SPR_SEL"] = pd.to_numeric(sel["SPR_SEL"], errors="coerce")
-    return sel
+    return sel[want]
+
+
 
 
 def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
+    """
+    Expande la tabla 'plan' a nivel vehículo–SVC–día.
+    Columnas: DELIVERY_MOD, FECHA, SVC, SHP_LG_VEHICLE_TYPE, SPR, Rutas, Shipments
+    """
     op_date = date.today()
 
     # SPR histórico por vehículo (local + global) para fallbacks finos
@@ -2290,16 +2295,17 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
     # SPR seleccionado por SVC × DM × VEH (según 'spr_mode')
     spr_dmveh = load_spr_by_dm_vehicle(op_date, spr_mode)
 
-    # 🔒 hardening: asegúrate de tener un DF con columnas esperadas
-    if spr_dmveh is None or not isinstance(spr_dmveh, pd.DataFrame):
-        spr_dmveh = pd.DataFrame(columns=["SVC","DM","VEH","SPR_SEL"])
+    # Mix de 2 semanas SOLO para DM sin apertura (Crowd, DC, SP)
+    mix_crowd = _read_vehicle_mix_from_spr(op_date, "CROWD", weeks=2)
+    mix_dc    = _read_vehicle_mix_from_spr(op_date, "DC",    weeks=2)
+    mix_sp    = _read_vehicle_mix_from_spr(op_date, "SP",    weeks=2)
 
     rows = []
 
     def spr_for(svc: str, dm: str, veh: str, fallback: float) -> float:
         """Prioridad: SPR_dmveh(SVC,DM,veh) → SPR_hist_local(SVC,veh) → SPR_hist_global(veh) → fallback."""
         # 1) por DM × veh
-        if isinstance(spr_dmveh, pd.DataFrame) and not spr_dmveh.empty:
+        if not spr_dmveh.empty:
             hit = spr_dmveh[(spr_dmveh["SVC"] == svc) & (spr_dmveh["DM"] == dm) & (spr_dmveh["VEH"] == veh)]
             if not hit.empty:
                 v = float(pd.to_numeric(hit["SPR_SEL"].iloc[0], errors="coerce"))
@@ -3218,6 +3224,12 @@ def _rolling_stats(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
+
+@dataclass
+class FailureModel:
+    pipeline: Pipeline
+    features: list
+
 def _ensure_shortfall_cols(df: pd.DataFrame) -> pd.DataFrame:
     """
     Asegura columnas para modelar 'riesgo de capacidad insuficiente':
@@ -3357,6 +3369,16 @@ def train_shortfall_model(window_days: int = 730) -> FailureModel | None:
         pass
 
     return FailureModel(pipeline=pipe, features=num_feats + cat_feats)
+
+def _rolling_shortfall(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.sort_values("FECHA").copy()
+    grp = d.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
+    for w in ROLL_WINDOWS:
+        d[f"SF_MEAN_{w}d"] = grp["SHORTFALL_PCT"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
+                              .reset_index(level=[0,1,2,3], drop=True)
+        d[f"CONF_{w}d"]    = grp["CONF_EFECTIVO"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
+                              .reset_index(level=[0,1,2,3], drop=True)
+    return d
 
 
 # --- Helper: colapsar DM a las categorías del entrenamiento ---
@@ -4207,7 +4229,7 @@ st.markdown("## 🤖 Pregunta a Mel-IA sobre tus datos")
 st.caption("Puedes preguntarle a Mel-IA sobre los datos del plan, riesgos, spr, mlps, etc.")
 
 # Si no hay plan persistido, avisa (evita consultas vacías)
-if st.session_state.get("plan_df") is None:
+if not st.session_state.get("plan_df") is not None:
     st.info("Primero calcula el plan (botón 'Calcular plan') para que el chat tenga contexto.")
 
 
