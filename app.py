@@ -4233,8 +4233,13 @@ try:
 
                 # 9) Tabla 4 — Riesgo de fallo (usa Tabla 2 + Tabla 3)
                 st.markdown("### Tabla 4 — Riesgo de fallo (MLPs & Rentals)")
+                
                 try:
-                    model = _get_trained_model()  # usa la función global cacheada
+                    # Usa la función global ya definida arriba:
+                    # @st.cache_resource(show_spinner=False)
+                    # def _get_trained_model():
+                    #     return train_shortfall_model(window_days=730)
+                    model = _get_trained_model()
                 
                     resumen_svc, detalle_riesgo = predict_failure(detalles, tabla3, model)
                 
@@ -4254,6 +4259,7 @@ try:
                 except Exception as e:
                     st.error("No se pudo calcular la Tabla 4 (riesgo de fallo).")
                     show_exception(e, "Tabla 4 (riesgo)")
+
 
 
 # =========================
