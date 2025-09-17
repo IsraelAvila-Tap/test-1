@@ -3444,7 +3444,7 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
     Devuelve:
       - by_full:  SF_RECENT_30 (suavizado), CONF_QTY, N_DAYS por (SVC, DM_TRAIN, Veh, MLP)
       - by_pool:  SF_RECENT_30_POOL (suavizado), CONF_QTY_POOL, N_DAYS_POOL por (SVC, DM_TRAIN, Veh)
-    Usa ventana [hoy-days, ayer]. SHORTFALL = max(CONF_EFECTIVO - EJECUTADO, 0).
+    Ventana: [hoy-days, ayer]. SHORTFALL = max(CONF_EFECTIVO - EJECUTADO, 0).
     """
     if arer is None or arer.empty:
         by_full = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP",
@@ -3454,7 +3454,8 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
         return by_full, by_pool
 
     df = arer.copy()
-    # --- Normaliza encabezados mínimos ---
+
+    # ---- Normaliza encabezados mínimos ----
     find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
     find_and_rename(df, ["Delivery model","DELIVERY_MODEL","DM","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
     find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
@@ -3464,19 +3465,29 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
     find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
     find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_FORM","CANCELACIONES"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
 
-    # --- Fechas robustas + D-1 ---
+    # ---- FECHA robusta y *forzada* a datetime64 ----
     try:
         df["FECHA"] = parse_es_date_series(df["FECHA"])
     except Exception:
+        pass  # seguimos con conversiones abajo
+
+    # Si son seriales de Excel
+    if pd.api.types.is_numeric_dtype(df["FECHA"]):
+        df["FECHA"] = pd.to_datetime(df["FECHA"], unit="D", origin="1899-12-30", errors="coerce")
+    else:
+        # Convierte cualquier cosa a Timestamp (dayfirst por si vienen como "17/09/2025")
         d1 = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
         d2 = pd.to_datetime(df["FECHA"], errors="coerce")
         df["FECHA"] = d1.fillna(d2)
-    df = df[df["FECHA"].notna()].copy()
-    cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).date()
-    start  = cutoff - pd.Timedelta(days=days-1)
-    df = df[(df["FECHA"].dt.date >= start.date()) & (df["FECHA"].dt.date <= cutoff)].copy()
 
-    # --- Métricas base ---
+    df = df[df["FECHA"].notna()].copy()  # quita inválidas
+
+    # ---- Ventana: ayer hacia atrás (sin .dt) ----
+    cutoff_ts = pd.Timestamp.today().normalize() - pd.Timedelta(days=1)
+    start_ts  = cutoff_ts - pd.Timedelta(days=days-1)
+    df = df[(df["FECHA"] >= start_ts) & (df["FECHA"] <= cutoff_ts)].copy()
+
+    # ---- Métricas base ----
     for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
         df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
     df["CONF_EFECTIVO"] = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
@@ -3485,21 +3496,19 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
     df["DM_TRAIN"] = _collapse_dm_for_training(df["DELIVERY_MOD"])
 
-    # --- Agregados FULL (incluye MLP) ---
+    # ---- Agregados FULL (incluye MLP) ----
     gcols_full = ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"]
     agg_full = (df.groupby(gcols_full, dropna=False)
                   .agg(FAIL_QTY=("FAIL_QTY","sum"),
                        CONF_QTY=("CONF_EFECTIVO","sum"),
                        N_DAYS=("FECHA", lambda s: s.dt.date.nunique()))
                   .reset_index())
-    agg_full["SF_RECENT_30_RAW"] = np.where(agg_full["CONF_QTY"]>0,
-                                            agg_full["FAIL_QTY"]/agg_full["CONF_QTY"], 0.0)
     agg_full["SF_RECENT_30"] = (
         (agg_full["FAIL_QTY"] + prior_strength*prior_p) /
         (agg_full["CONF_QTY"] + prior_strength).replace(0, np.nan)
     ).fillna(0.0).clip(0,1)
 
-    # --- Agregados POOL (sin MLP) ---
+    # ---- Agregados POOL (sin MLP) ----
     gcols_pool = ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"]
     agg_pool = (df.groupby(gcols_pool, dropna=False)
                   .agg(FAIL_QTY=("FAIL_QTY","sum"),
