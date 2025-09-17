@@ -3191,7 +3191,7 @@ def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
     Etiqueta continua de 'shortfall' a nivel fila AR-ER.
     SHORTFALL_PCT = max(CONFIRMADO_NETO - EJECUTADO, 0) / max(CONFIRMADO_NETO, 1)
     * CONFIRMADO_NETO = CONFIRMADO - CANCELACIONES_FORM
-    * Filtra sólo historia hasta D-1 (nada de hoy / futuro)
+    * Usa solo historia hasta D-1 (nada de hoy / futuro)
     Devuelve: FECHA, SVC, DELIVERY_MOD, SHP_LG_VEHICLE_TYPE, MLP,
               CONFIRMADO, CANCELACIONES_FORM, CONFIRMADO_NETO, EJECUTADO, SHORTFALL_PCT
     """
@@ -3220,17 +3220,24 @@ def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
             "CONFIRMADO","CANCELACIONES_FORM","CONFIRMADO_NETO","EJECUTADO","SHORTFALL_PCT"
         ])
 
-    # Tipos y corte temporal (<= D-1)
-    df["FECHA"] = parse_es_date_series(df["FECHA"])
+    # ---- FECHA robusto a datetime64 ----
+    # (por si parse_es_date_series devuelve date/str)
+    try:
+        df["FECHA"] = parse_es_date_series(df["FECHA"])
+    except Exception:
+        pass
+    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")   # <- asegura datetime64
     df = df[df["FECHA"].notna()].copy()
-    import datetime as _dt
-    cutoff = _dt.date.today() - _dt.timedelta(days=1)
-    df = df[df["FECHA"].dt.date <= cutoff].copy()
 
+    # Corte temporal: <= D-1
+    cutoff_ts = pd.Timestamp.today().normalize() - pd.Timedelta(days=1)
+    df = df[df["FECHA"] <= cutoff_ts].copy()
+
+    # Numéricos
     for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
         df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
 
-    # Confirmado neto (sin penalizar cancelaciones del formulario)
+    # Confirmado neto (no penaliza al proveedor lo cancelado por nosotros)
     df["CONFIRMADO_NETO"] = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
 
     # Shortfall proporcional
@@ -3239,10 +3246,12 @@ def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
 
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
 
-    # (debug)
+    # Debug opcional
     try:
-        st.caption(f"Shortfall medio ponderado (AR-ER): "
-                   f"{np.average(df['SHORTFALL_PCT'], weights=df['CONFIRMADO_NETO'].clip(lower=1)):.3%}")
+        st.caption(
+            f"Shortfall medio ponderado (AR-ER): "
+            f"{np.average(df['SHORTFALL_PCT'], weights=df['CONFIRMADO_NETO'].clip(lower=1)):.3%}"
+        )
     except Exception:
         pass
 
@@ -3250,7 +3259,6 @@ def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
         "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
         "CONFIRMADO","CANCELACIONES_FORM","CONFIRMADO_NETO","EJECUTADO","SHORTFALL_PCT"
     ]]
-
 
 
 def _attach_tabla2_spr(df_hist: pd.DataFrame) -> pd.DataFrame:
