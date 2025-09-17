@@ -3493,8 +3493,13 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = SF_LOOKBACK_DAYS) -> t
         x = pd.to_numeric(g["SHORTFALL_PCT"], errors="coerce").fillna(0).values
         return float(np.average(x, weights=w)) if w.sum() > 0 else 0.0
 
-    by_full = (df_recent.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
-               .apply(_wavg).rename("SF_RECENT_30").reset_index())
+    by_full = (
+        df_recent.groupby([...])
+        .apply(_wavg)
+        .to_frame("SF_RECENT_30")   # ✅ crea un DataFrame con esa columna
+        .reset_index()
+    )
+
 
     by_pool = (df_recent.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)
                .apply(_wavg).rename("SF_RECENT_30_POOL").reset_index())
