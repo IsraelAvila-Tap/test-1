@@ -3625,26 +3625,24 @@ def predict_failure(detalles_df: pd.DataFrame,
     SF_LOOKBACK_DAYS = locals().get("SF_LOOKBACK_DAYS", 30)
     full_recent, pool_recent = _get_recent_shortfall(arer_raw, days=SF_LOOKBACK_DAYS)
     
-    # Tipos string para que el merge no falle por dtype
+    # Normaliza llaves en ambos
     _as_str_cols(pred_df, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"])
     _as_str_cols(full_recent, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"])
-    _as_str_cols(pool_recent, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"])
+    pred_df["MLP"] = pred_df["MLP"].str.strip().str.upper()
+    full_recent["MLP"] = full_recent["MLP"].str.strip().str.upper()
     
     # Merge 1: por combo completo (incluye MLP)
     pred_df = pred_df.merge(
-        full_recent,  # ya trae columna SF_RECENT_30
+        full_recent,
         on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"],
         how="left"
     )
     
-    # Merge 2 (fallback): sin MLP, rellena sólo donde falte
+    # Merge 2: fallback solo si no hay valor
     miss = pred_df["SF_RECENT_30"].isna()
     if miss.any():
-        fill = pred_df.loc[miss, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"]] \
-                      .merge(pool_recent, on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], how="left")
-        pred_df.loc[miss, "SF_RECENT_30"] = fill["SF_RECENT_30_POOL"].values
-    
-    pred_df["SF_RECENT_30"] = pd.to_numeric(pred_df["SF_RECENT_30"], errors="coerce").fillna(0.0)
+        pred_df.loc[miss, "SF_RECENT_30"] = pred_df.loc[miss, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"]]\
+            .merge(pool_recent, on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], how="left")["SF_RECENT_30_POOL"].values
 
 
     # --- 7) Asegura todas las columnas que espera el modelo ---
