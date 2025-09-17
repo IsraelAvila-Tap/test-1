@@ -3474,6 +3474,10 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30) -> pd.DataFrame:
             d2 = pd.to_datetime(df["FECHA"], errors="coerce").fillna(pd.NaT)
             df["FECHA"] = d1.fillna(d2)
 
+    # 👉 Fuerza datetime pase lo que pase
+    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
+    df = df[df["FECHA"].notna()].copy()
+
     # Filtra inválidas
     df = df[df["FECHA"].notna()].copy()
 
