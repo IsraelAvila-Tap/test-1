@@ -3706,6 +3706,37 @@ def predict_failure(detalles_df: pd.DataFrame,
     pred_df["Rutas_riesgo"]     = pred_df["Prob_Fail"] * pred_df["Rutas"]
     pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pred_df["Shipments"]
 
+########
+    # --- DEBUG: vista rápida de 99MINUTOS (no rompe si faltan columnas) ---
+    try:
+        # normaliza MLP para buscar 99MINUTOS
+        mlp_norm = pred_df["MLP"].astype(str).str.strip().str.upper()
+        mask_99 = mlp_norm.eq("99MINUTOS")
+    
+        # columnas que intentaremos mostrar (solo tomamos las que existan)
+        want_cols = ["SVC", "DELIVERY_MOD", "DM_TRAIN", "SHP_LG_VEHICLE_TYPE",
+                     "MLP", "Rutas", "Shipments", "SF_RECENT_30", "CONF_QTY", "Prob_Fail"]
+        have_cols = [c for c in want_cols if c in pred_df.columns]
+    
+        dbg = (pred_df.loc[mask_99, have_cols]
+                     .sort_values("Shipments", ascending=False)
+                     .head(20)
+                     .copy())
+    
+        # si faltan SF_RECENT_30 o CONF_QTY, agrega columnas “de relleno” para que se vean vacías
+        for c in ["SF_RECENT_30", "CONF_QTY"]:
+            if c not in dbg.columns:
+                dbg[c] = np.nan
+    
+        import streamlit as st
+        st.caption("🔎 Debug 99MINUTOS (recent suavizado y evidencia)")
+        st.dataframe(dbg, use_container_width=True, hide_index=True)
+    except Exception as _e:
+        # no rompas la app por el debug
+        import streamlit as st
+        st.caption(f"Debug 99MINUTOS no disponible: {type(_e).__name__}: {_e}")
+
+   #####                     
     # --- 10) Resumen por SVC ---
     grp = pred_df.groupby("SVC", dropna=False)
     ship_sum = grp["Shipments"].sum().replace(0, np.nan)
@@ -4227,16 +4258,6 @@ try:
                 except Exception as e:
                     st.error("No se pudo calcular la Tabla 4 (riesgo de fallo).")
                     show_exception(e, "Tabla 4 (riesgo)")
-
-                except Exception as e:
-                    st.error("Ocurrió un error durante el cálculo.")
-                    show_exception(e, "Traceback completo")
-                dbg = (pred_df[pred_df["MLP"]=="99MINUTOS"]
-                       [["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
-                         "SF_RECENT_30","CONF_QTY","Prob_Fail"]]
-                       .sort_values("Shipments", ascending=False).head(20))
-                st.caption("Debug 99MINUTOS (recent suavizado y evidencia)")
-                st.dataframe(dbg, use_container_width=True, hide_index=True)
 
 
 # =========================
