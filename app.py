@@ -3391,34 +3391,6 @@ def _rolling_shortfall(df: pd.DataFrame) -> pd.DataFrame:
                               .reset_index(level=[0,1,2,3], drop=True)
     return d
 
-####
-def _recent_empirical_shortfall(arer_df: pd.DataFrame, lookback_days: int = 30) -> pd.DataFrame:
-    if arer_df is None or arer_df.empty:
-        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT"])
-    d = _label_from_arer_shortfall(arer_df)
-    if d.empty:
-        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT"])
-    import datetime as _dt
-    cutoff = (_dt.date.today() - _dt.timedelta(days=1))  # D-1
-    start  = cutoff - _dt.timedelta(days=lookback_days)
-    d = d[(d["FECHA"] >= start) & (d["FECHA"] <= cutoff)].copy()
-    g = (d.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
-           .apply(lambda x: np.average(x["SHORTFALL_PCT"], weights=x["SF_WEIGHT"]))
-           .rename("SF_RECENT").reset_index())
-    return g
-
-# …en tu flujo (por ejemplo, dentro del try que arma Tabla 4):
-try:
-    raw_arer_debug = read_sheet(SHEET_ID, get_tab_name("ar_er", ["AR-ER","AR ER","AR_ER","ARER"]))
-    emp = _recent_empirical_shortfall(raw_arer_debug, lookback_days=30)
-    if not emp.empty:
-        import streamlit as st
-        st.caption("Tasa empírica reciente de shortfall (30 días, ponderada por CONF_EFECTIVO) – primeras 10:")
-        st.dataframe(emp.head(10), use_container_width=True, hide_index=True)
-except Exception:
-    pass
-
-
 
 # --- Helper: colapsar DM a las categorías del entrenamiento ---
 def _collapse_dm_for_training(dm_series: pd.Series) -> pd.Series:
@@ -3674,38 +3646,7 @@ def predict_failure(detalles_df: pd.DataFrame,
     pred_df["Shipments"] = pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
     pred_df["Rutas_riesgo"]     = pred_df["Prob_Fail"] * pred_df["Rutas"]
     pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pred_df["Shipments"]
-
-########
-    # --- DEBUG: vista rápida de 99MINUTOS (no rompe si faltan columnas) ---
-    try:
-        # normaliza MLP para buscar 99MINUTOS
-        mlp_norm = pred_df["MLP"].astype(str).str.strip().str.upper()
-        mask_99 = mlp_norm.eq("99MINUTOS")
-    
-        # columnas que intentaremos mostrar (solo tomamos las que existan)
-        want_cols = ["SVC", "DELIVERY_MOD", "DM_TRAIN", "SHP_LG_VEHICLE_TYPE",
-                     "MLP", "Rutas", "Shipments", "SF_RECENT_30", "CONF_QTY", "Prob_Fail"]
-        have_cols = [c for c in want_cols if c in pred_df.columns]
-    
-        dbg = (pred_df.loc[mask_99, have_cols]
-                     .sort_values("Shipments", ascending=False)
-                     .head(20)
-                     .copy())
-    
-        # si faltan SF_RECENT_30 o CONF_QTY, agrega columnas “de relleno” para que se vean vacías
-        for c in ["SF_RECENT_30", "CONF_QTY"]:
-            if c not in dbg.columns:
-                dbg[c] = np.nan
-    
-        import streamlit as st
-        st.caption("🔎 Debug 99MINUTOS (recent suavizado y evidencia)")
-        st.dataframe(dbg, use_container_width=True, hide_index=True)
-    except Exception as _e:
-        # no rompas la app por el debug
-        import streamlit as st
-        st.caption(f"Debug 99MINUTOS no disponible: {type(_e).__name__}: {_e}")
-
-   #####                     
+                   
     # --- 10) Resumen por SVC ---
     grp = pred_df.groupby("SVC", dropna=False)
     ship_sum = grp["Shipments"].sum().replace(0, np.nan)
