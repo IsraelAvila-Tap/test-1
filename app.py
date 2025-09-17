@@ -3493,16 +3493,27 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = SF_LOOKBACK_DAYS) -> t
         x = pd.to_numeric(g["SHORTFALL_PCT"], errors="coerce").fillna(0).values
         return float(np.average(x, weights=w)) if w.sum() > 0 else 0.0
 
-    by_full = (
-        df_recent.groupby([...])
-        .apply(_wavg)
-        .to_frame("SF_RECENT_30")   # ✅ crea un DataFrame con esa columna
-        .reset_index()
-    )
+   # --- SF por SVC+DM+Vehículo+MLP ---
+    ser_full = df_recent.groupby(
+        ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False
+    ).apply(_wavg)
+    
+    if isinstance(ser_full, pd.Series):
+        by_full = ser_full.to_frame("SF_RECENT_30").reset_index()
+    else:
+        by_full = ser_full.rename(columns={0: "SF_RECENT_30"}).reset_index()
+    
+    
+    # --- SF por SVC+DM+Vehículo (pool) ---
+    ser_pool = df_recent.groupby(
+        ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False
+    ).apply(_wavg)
+    
+    if isinstance(ser_pool, pd.Series):
+        by_pool = ser_pool.to_frame("SF_RECENT_30_POOL").reset_index()
+    else:
+        by_pool = ser_pool.rename(columns={0: "SF_RECENT_30_POOL"}).reset_index()
 
-
-    by_pool = (df_recent.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)
-               .apply(_wavg).rename("SF_RECENT_30_POOL").reset_index())
 
     return by_full, by_pool
 
