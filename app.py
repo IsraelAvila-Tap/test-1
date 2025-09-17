@@ -2251,30 +2251,28 @@ def load_spr_by_dm_vehicle(op_date: date, mode: str) -> pd.DataFrame:
         return pd.DataFrame(columns=want)
 
     # Agregadores por modo
-    def agg_prom(g):
+       # reemplaza el bloque de agregadores por esto:
+    def _agg_lastN(g, n, how):
+        g = g.sort_values("FECHA")
         vals = pd.to_numeric(g["SPR"], errors="coerce").dropna()
-        if len(vals) > 4: vals = vals.iloc[-4:]
-        return float(vals.median()) if len(vals) else np.nan
-
-    def agg_peak(g):
-        vals = pd.to_numeric(g["SPR"], errors="coerce").dropna()
-        if len(vals) > 12: vals = vals.iloc[-12:]
-        return float(np.nanpercentile(vals, 95)) if len(vals) else np.nan
-
-    def agg_plan(g):
-        vals = pd.to_numeric(g["SPR"], errors="coerce").dropna()
-        return float(vals.iloc[-1]) if len(vals) else np.nan
-
+        if len(vals) > n:
+            vals = vals.iloc[-n:]
+        if how == "median": return float(vals.median()) if len(vals) else np.nan
+        if how == "p95":    return float(np.nanpercentile(vals, 95)) if len(vals) else np.nan
+        if how == "last":   return float(vals.iloc[-1]) if len(vals) else np.nan
+    
     if mode == "promedio":
-        sel = spr.groupby(["SVC","DM_BKT","VEH_HOM"], dropna=False).apply(agg_prom).reset_index(name="SPR_SEL")
+        sel = (spr.groupby(["SVC","DM_BKT","VEH_HOM"], dropna=False)
+                  .apply(lambda g: _agg_lastN(g, 4, "median"))
+                  .reset_index(name="SPR_SEL"))
     elif mode == "peak":
-        sel = spr.groupby(["SVC","DM_BKT","VEH_HOM"], dropna=False).apply(agg_peak).reset_index(name="SPR_SEL")
+        sel = (spr.groupby(["SVC","DM_BKT","VEH_HOM"], dropna=False)
+                  .apply(lambda g: _agg_lastN(g, 12, "p95"))
+                  .reset_index(name="SPR_SEL"))
     else:  # plan
-        sel = spr.groupby(["SVC","DM_BKT","VEH_HOM"], dropna=False).apply(agg_plan).reset_index(name="SPR_SEL")
-
-    sel.rename(columns={"DM_BKT":"DM","VEH_HOM":"VEH"}, inplace=True)
-    return sel[want]
-
+        sel = (spr.groupby(["SVC","DM_BKT","VEH_HOM"], dropna=False)
+                  .apply(lambda g: _agg_lastN(g, 1, "last"))
+                  .reset_index(name="SPR_SEL"))
 
 
 
