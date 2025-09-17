@@ -3435,18 +3435,10 @@ def _collapse_dm_for_training(dm_series: pd.Series) -> pd.Series:
         .fillna("__NA__")
     )
 
-# --- Parámetros de control (ajústalos si quieres) ---
-SF_LOOKBACK_DAYS = 30
-SF_MIN_CONF_DIA  = 50   # filtra días de muy bajo volumen para no sesgar
+SF_LOOKBACK_DAYS = 30 #####Ajustar parametros minimos de lectura
+SF_MIN_CONF_DIA  = 50
 
 def _get_recent_shortfall(arer: pd.DataFrame, days: int = SF_LOOKBACK_DAYS) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Devuelve:
-      - by_full:  SF_RECENT_30 por (SVC, DELIVERY_MOD, SHP_LG_VEHICLE_TYPE, MLP)
-      - by_pool:  SF_RECENT_30_POOL por (SVC, DELIVERY_MOD, SHP_LG_VEHICLE_TYPE)
-    Ponderado por CONF_EFECTIVO, filtrando días de bajo volumen (CONF_EFECTIVO < SF_MIN_CONF_DIA).
-    Usa ventana D-1 de 'days'.
-    """
     if arer is None or arer.empty:
         by_full = pd.DataFrame(columns=["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT_30"])
         by_pool = pd.DataFrame(columns=["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","SF_RECENT_30_POOL"])
@@ -3454,7 +3446,7 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = SF_LOOKBACK_DAYS) -> t
 
     df = arer.copy()
 
-    # Normaliza encabezados mínimos
+    # ---- Normalización mínima ----
     find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
     find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
     find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
@@ -3464,18 +3456,24 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = SF_LOOKBACK_DAYS) -> t
     find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
     find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_FORM","CANCELACIONES"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
 
-    # Fechas (robusto) y D-1
-    try:
-        df["FECHA"] = parse_es_date_series(df["FECHA"])
-    except Exception:
-        d1 = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
-        d2 = pd.to_datetime(df["FECHA"], errors="coerce")
-        df["FECHA"] = d1.fillna(d2)
+    # ---- Parseo ROBUSTO de FECHA a timestamp (obligatorio) ----
+    # 1) si viene como serial numérico de Excel/Sheets
+    if pd.api.types.is_numeric_dtype(df["FECHA"]):
+        df["FECHA"] = pd.to_datetime(df["FECHA"], unit="D", origin="1899-12-30", errors="coerce")
+    else:
+        # primero intenta tu parser; si falla, cae a to_datetime genérico
+        try:
+            df["FECHA"] = parse_es_date_series(df["FECHA"])
+        except Exception:
+            pass
+        df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
     df = df[df["FECHA"].notna()].copy()
-    cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).date()
-    df = df[df["FECHA"].dt.date <= cutoff].copy()
 
-    # Métricas base
+    # ---- D-1 (usa timestamps, no .dt.date) ----
+    cutoff_ts = pd.Timestamp.today().normalize() - pd.Timedelta(days=1)
+    df = df[df["FECHA"] <= cutoff_ts].copy()
+
+    # ---- Métricas base ----
     for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
         df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
     df["CONF_EFECTIVO"] = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
@@ -3484,12 +3482,12 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = SF_LOOKBACK_DAYS) -> t
 
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
 
-    # Ventana reciente y filtro de bajo volumen por fila
-    recent_cut = (pd.Timestamp.today().normalize() - pd.Timedelta(days=days)).date()
-    df_recent = df[df["FECHA"].dt.date >= recent_cut].copy()
+    # ---- Ventana reciente (también con timestamps) + filtro bajo volumen ----
+    recent_cut_ts = pd.Timestamp.today().normalize() - pd.Timedelta(days=days)
+    df_recent = df[df["FECHA"] >= recent_cut_ts].copy()
     df_recent = df_recent[df_recent["CONF_EFECTIVO"] >= SF_MIN_CONF_DIA].copy()
 
-    # Promedio ponderado por CONF_EFECTIVO
+    # ---- Promedio ponderado por CONF_EFECTIVO ----
     def _wavg(g):
         w = pd.to_numeric(g["CONF_EFECTIVO"], errors="coerce").fillna(0).values
         x = pd.to_numeric(g["SHORTFALL_PCT"], errors="coerce").fillna(0).values
@@ -3502,7 +3500,6 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = SF_LOOKBACK_DAYS) -> t
                .apply(_wavg).rename("SF_RECENT_30_POOL").reset_index())
 
     return by_full, by_pool
-
 
 
 ####
