@@ -4230,35 +4230,34 @@ try:
                     except Exception as e:
                         show_exception(e, "Debug SRM/Score")
 
-
                 # 9) Tabla 4 — Riesgo de fallo (usa Tabla 2 + Tabla 3)
                 st.markdown("### Tabla 4 — Riesgo de fallo (MLPs & Rentals)")
-                
                 try:
-                    # Usa la función global ya definida arriba:
-                    # @st.cache_resource(show_spinner=False)
-                    # def _get_trained_model():
-                    #     return train_shortfall_model(window_days=730)
+                    # Usa la función global ya definida arriba
                     model = _get_trained_model()
-                
+
                     resumen_svc, detalle_riesgo = predict_failure(detalles, tabla3, model)
-                
+
                     if resumen_svc is None or resumen_svc.empty:
                         st.info("Sin datos para evaluar riesgo aún.")
                     else:
                         st.subheader("Resumen por SVC")
                         st.dataframe(resumen_svc, use_container_width=True, hide_index=True)
-                
+
                         with st.expander("Ver detalle por día × DM × vehículo × MLP", expanded=False):
                             st.dataframe(detalle_riesgo, use_container_width=True, hide_index=True)
-                
+
                         # Guarda en session_state por si lo usas en otros módulos
                         st.session_state["riesgo_resumen_svc"] = resumen_svc.copy()
                         st.session_state["riesgo_detalle"] = detalle_riesgo.copy()
-                
+
                 except Exception as e:
                     st.error("No se pudo calcular la Tabla 4 (riesgo de fallo).")
                     show_exception(e, "Tabla 4 (riesgo)")
+
+except Exception as e:
+    st.error("Ocurrió un error durante el cálculo.")
+    show_exception(e, "Traceback completo")
 
 # =========================
 # 🤖 Chat Mel-IA (Bloque B)
