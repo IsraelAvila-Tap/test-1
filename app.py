@@ -3156,17 +3156,6 @@ def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
 
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
 
-    # --- debug en UI: muestra el rango de fechas realmente usado ---
-    try:
-        import streamlit as st
-        dmin = df["FECHA"].min()
-        dmax = df["FECHA"].max()
-        st.caption(f"AR-ER para entrenamiento (D-1): {dmin} → {dmax} · cutoff={cutoff}")
-        vc = pd.cut(df["SHORTFALL_PCT"], bins=[-1,0,0.05,0.1,0.2,1.01]).value_counts().sort_index()
-        st.caption(f"Histograma SHORTFALL_PCT (conteos): {vc.to_dict()}")
-    except Exception:
-        pass
-
     return df[[
         "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
         "CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
