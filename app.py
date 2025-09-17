@@ -3438,25 +3438,26 @@ def _collapse_dm_for_training(dm_series: pd.Series) -> pd.Series:
 SF_LOOKBACK_DAYS = 30 #####Ajustar parametros minimos de lectura
 SF_MIN_CONF_DIA  = 50
 
-def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
+                          MIN_CONF: int = 50) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Devuelve:
       - by_full: SF_RECENT_30 por (SVC, DM_TRAIN, SHP_LG_VEHICLE_TYPE, MLP)
       - by_pool: SF_RECENT_30_POOL por (SVC, DM_TRAIN, SHP_LG_VEHICLE_TYPE)
-    Ponderado por CONF_EFECTIVO. Filtra días futuros (usa D-1).
+    Reglas:
+      - Usa solo datos hasta D-1 (excluye hoy y futuro)
+      - Pondera por CONF_EFECTIVO
+      - Filtra días de bajo volumen (CONF_EFECTIVO < MIN_CONF) para evitar ruido
     """
-    import numpy as np
-    import pandas as pd
-
-    # --- Salidas vacías por defecto ---
-    by_full = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT_30"])
-    by_pool = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","SF_RECENT_30_POOL"])
+    # Si no hay datos
     if arer is None or arer.empty:
+        by_full = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT_30"])
+        by_pool = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","SF_RECENT_30_POOL"])
         return by_full, by_pool
 
     df = arer.copy()
 
-    # ---- Normaliza encabezados mínimos ----
+    # ---- Normaliza columnas mínimas ----
     find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
     find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
     find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
@@ -3466,64 +3467,61 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30) -> tuple[pd.DataFr
     find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
     find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_FORM","CANCELACIONES"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
 
-    # ---- Parseo ROBUSTO de fechas ----
+    # ---- FECHA robusta + corte D-1 ----
+    # (Evita .dt.date; comparamos Timestamp con Timestamp)
+    # 1) parse robusto
     try:
         df["FECHA"] = parse_es_date_series(df["FECHA"])
     except Exception:
-        if pd.api.types.is_numeric_dtype(df["FECHA"]):
-            df["FECHA"] = pd.to_datetime(df["FECHA"], unit="D", origin="1899-12-30", errors="coerce")
-        else:
-            d1 = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
-            d2 = pd.to_datetime(df["FECHA"], errors="coerce")
-            df["FECHA"] = d1.fillna(d2)
-
+        d1 = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
+        d2 = pd.to_datetime(df["FECHA"], errors="coerce")
+        df["FECHA"] = d1.fillna(d2)
     df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
     df = df[df["FECHA"].notna()].copy()
 
-    # ---- D-1 (no usamos día en curso ni futuro) ----
-    cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).date()
-    df = df[df["FECHA"].dt.date <= cutoff].copy()
+    # 2) D-1 (excluye hoy y futuro)
+    cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=1)
+    df = df[df["FECHA"] <= cutoff].copy()
 
     # ---- Métricas base ----
     for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
         df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
     df["CONF_EFECTIVO"] = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
-    conf = df["CONF_EFECTIVO"].replace(0, np.nan)
-    df["SHORTFALL_PCT"] = ((conf - df["EJECUTADO"]) / conf).clip(lower=0).fillna(0)
+    denom = df["CONF_EFECTIVO"].replace(0, np.nan)
+    df["SHORTFALL_PCT"] = ((denom - df["EJECUTADO"]) / denom).clip(lower=0).fillna(0)
 
-    # ---- Claves y DM colapsado (que el modelo sí conoce) ----
+    # ---- Claves + colapsado de DM al espacio del modelo ----
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
     df["DM_TRAIN"] = _collapse_dm_for_training(df["DELIVERY_MOD"])
 
-    # ---- Ventana reciente ----
-    recent_cut = (pd.Timestamp.today().normalize() - pd.Timedelta(days=days)).date()
-    df_recent = df[df["FECHA"].dt.date >= recent_cut].copy()
+    # ---- Ventana reciente + filtro de volumen ----
+    recent_cut = pd.Timestamp.today().normalize() - pd.Timedelta(days=days)
+    df_recent = df[df["FECHA"] >= recent_cut].copy()
+    if MIN_CONF and MIN_CONF > 0:
+        df_recent = df_recent[df_recent["CONF_EFECTIVO"] >= MIN_CONF].copy()
+
+    # Si quedó vacío tras filtros → devuelve vacíos con esquema correcto
     if df_recent.empty:
+        by_full = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT_30"])
+        by_pool = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","SF_RECENT_30_POOL"])
         return by_full, by_pool
 
-    # WAVG (ponderada por CONF_EFECTIVO)
-    def _wavg(g: pd.DataFrame) -> float:
-        w = pd.to_numeric(g["CONF_EFECTIVO"], errors="coerce").fillna(0)
-        x = pd.to_numeric(g["SHORTFALL_PCT"], errors="coerce").fillna(0)
+    # ---- Promedio ponderado por CONF_EFECTIVO ----
+    def _wavg(g):
+        w = pd.to_numeric(g["CONF_EFECTIVO"], errors="coerce").fillna(0).values
+        x = pd.to_numeric(g["SHORTFALL_PCT"], errors="coerce").fillna(0).values
         return float(np.average(x, weights=np.where(w > 0, w, 0.0))) if w.sum() > 0 else 0.0
 
-    # --- SF por SVC + DM_TRAIN + Veh + MLP ---
-    by_full = (
-        df_recent
-        .groupby(["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
-        .apply(_wavg)
-        .reset_index(name="SF_RECENT_30")
-    )
+    ser_full = df_recent.groupby(["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)\
+                        .apply(_wavg)
+    by_full = ser_full.reset_index(name="SF_RECENT_30")
 
-    # --- SF por SVC + DM_TRAIN + Veh (pool sin MLP) ---
-    by_pool = (
-        df_recent
-        .groupby(["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], dropna=False)
-        .apply(_wavg)
-        .reset_index(name="SF_RECENT_30_POOL")
-    )
+    ser_pool = df_recent.groupby(["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], dropna=False)\
+                        .apply(_wavg)
+    by_pool = ser_pool.reset_index(name="SF_RECENT_30_POOL")
 
     return by_full, by_pool
+
 
 
 ####
