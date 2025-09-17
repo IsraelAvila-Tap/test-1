@@ -3647,19 +3647,27 @@ def predict_failure(detalles_df: pd.DataFrame,
         else:
             X_pred[c] = np.nan
 
-    # --- 8) Predicción (shortfall esperado 0..1) ---
+    # 8) Predicción / shortfall esperado -> Prob_Fail (clipeado 0..1 y sin NaN)
     try:
-        shortfall = model.pipeline.predict(X_pred)
+        shortfall = model.pipeline.predict(X_pred)  # si tu modelo es reg. de shortfall
     except Exception:
-        # Si el modelo es clasificador con predict_proba, toma la segunda columna
         try:
-            shortfall = model.pipeline.predict_proba(X_pred)[:, 1]
+            shortfall = model.pipeline.predict_proba(X_pred)[:, 1]  # si es clasificador
         except Exception:
             shortfall = np.zeros(len(pred_df), dtype=float)
+    
+    # Asegura array float y sanea NaN/Inf
+    vals = np.asarray(shortfall, dtype=float)
+    vals = np.nan_to_num(vals, nan=0.0, posinf=1.0, neginf=0.0)
+    vals = np.clip(vals, 0.0, 1.0)
+    
+    # Asigna con mismo índice del pred_df
+    pred_df["Prob_Fail"] = pd.Series(vals, index=pred_df.index)
+    
+    # Riesgos ponderados
+    pred_df["Rutas_riesgo"] = pred_df["Prob_Fail"] * pd.to_numeric(pred_df["Rutas"], errors="coerce").fillna(0)
+    pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
 
-    pred_df["Prob_Fail"] = np.clip(pd.to_numeric(shortfall, errors="coerce").fillna(0.0), 0.0, 1.0)
-    pred_df["Rutas_riesgo"] = pred_df["Prob_Fail"] * pred_df["Rutas"]
-    pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pred_df["Shipments"]
 
     # --- 9) Resumen por SVC (ponderada por shipments) ---
     grp = pred_df.groupby("SVC", dropna=False)
