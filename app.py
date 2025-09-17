@@ -3697,7 +3697,7 @@ def predict_failure(detalles_df: pd.DataFrame,
             "Rutas_riesgo_BLEND","Shipments_riesgo_BLEND","Prob_fallar_BLEND"
         ]
         return resumen[cols_res], pred_df[cols_det]
-f[cols_det]
+
 
 
 # -----------------------------------------------------------------------------
