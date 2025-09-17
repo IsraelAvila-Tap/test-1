@@ -3219,21 +3219,77 @@ class FailureModel:
     pipeline: Pipeline
     features: list
 
+def _ensure_shortfall_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Asegura columnas para modelar 'riesgo de capacidad insuficiente':
+      - CANCELACIONES_FORM (normalizada)
+      - CONF_NET = max(CONFIRMADO - CANCELACIONES_FORM, 0)
+      - SHORTFALL = max(CONF_NET - EJECUTADO, 0)
+      - SHORTFALL_PCT = SHORTFALL / max(CONF_NET, 1)   (en [0,1])
+    No modifica el df original: devuelve una copia con las columnas añadidas.
+    """
+    if df is None or df.empty:
+        return df
+
+    d = df.copy()
+
+    # Normaliza encabezados posibles de cancelaciones (ajusta alias si en tu Sheet usa otro nombre)
+    find_and_rename(d,
+                    ["CANCELACIONES_FORM", "Cancelaciones Form", "CANCELACIONES", "CANCELACION_FORM"],
+                    "CANCELACIONES_FORM",
+                    required=False, source_label="AR-ER")
+
+    # Numéricos seguros
+    for c in ["CONFIRMADO", "EJECUTADO", "CANCELACIONES_FORM"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
+        else:
+            d[c] = 0.0
+
+    # Confirmado neto (lo que realmente esperábamos que ejecutaran)
+    d["CONF_NET"] = (d["CONFIRMADO"] - d["CANCELACIONES_FORM"]).clip(lower=0)
+
+    # Falta de ejecución (si ejecutó de más, NO penaliza)
+    d["SHORTFALL"] = (d["CONF_NET"] - d["EJECUTADO"]).clip(lower=0)
+
+    # Proporción de shortfall respecto al compromiso neto
+    den = d["CONF_NET"].replace(0, np.nan)
+    d["SHORTFALL_PCT"] = (d["SHORTFALL"] / den).fillna(0.0).clip(0, 1)
+
+    return d
+
+
+
 def _rolling_shortfall(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ventanas por (SVC,DM,Veh,MLP):
-      - media de shortfall (%)
-      - nivel medio de confirmados
+    Calcula features de ventanas móviles por (SVC, DM, Vehículo, MLP):
+      - SF_MEAN_{w}d : promedio móvil de SHORTFALL_PCT
+      - CONF_{w}d    : promedio móvil de CONF_NET (nivel)
+    Si 'SHORTFALL_PCT' / 'CONF_NET' no existen, los crea.
     """
-    d = df.sort_values("FECHA").copy()
-    grp = d.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
+    if df is None or df.empty:
+        return df
+
+    d = _ensure_shortfall_cols(df)  # 👈 garantiza columnas necesarias
+    d = d.sort_values("FECHA").copy()
+
+    grp = d.groupby(["SVC", "DELIVERY_MOD", "SHP_LG_VEHICLE_TYPE", "MLP"], dropna=False)
+
     for w in ROLL_WINDOWS:
+        # promedio móvil de la proporción de faltante
         d[f"SF_MEAN_{w}d"] = (
-            grp["SHORTFALL_PCT"].apply(lambda s: s.rolling(w, min_periods=5).mean()).reset_index(level=[0,1,2,3], drop=True)
+            grp["SHORTFALL_PCT"]
+            .apply(lambda s: s.rolling(w, min_periods=5).mean())
+            .reset_index(level=[0, 1, 2, 3], drop=True)
         )
+
+        # nivel de confirmados recientes (para dar contexto de volumen)
         d[f"CONF_{w}d"] = (
-            grp["CONFIRMADO"].apply(lambda s: s.rolling(w, min_periods=5).mean()).reset_index(level=[0,1,2,3], drop=True)
+            grp["CONF_NET"]
+            .apply(lambda s: s.rolling(w, min_periods=5).mean())
+            .reset_index(level=[0, 1, 2, 3], drop=True)
         )
+
     return d
 
 
