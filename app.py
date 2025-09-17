@@ -28,6 +28,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import train_test_split
+from sklearn.ensemble import HistGradientBoostingRegressor
 
 
 
