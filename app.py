@@ -29,6 +29,14 @@ from sklearn.impute import SimpleImputer
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import train_test_split
 
+# --- Cutoff de historia: usar hasta D-1 (excluir hoy)
+import datetime as _dt
+
+def _cutoff_dminus1() -> datetime.date:
+    """Último día confiable del histórico (D-1)."""
+    return _dt.date.today() - _dt.timedelta(days=1)
+
+
 # -----------------------------------------------------------------------------
 # 0) Credenciales y configuración
 # -----------------------------------------------------------------------------
@@ -2823,15 +2831,14 @@ def load_mlp_score_from_arer(window_days: int = 120) -> pd.DataFrame:
         # 3) Tipos y ventana temporal
         df["FECHA"] = parse_es_date_series(df["FECHA"])
         df = df[df["FECHA"].notna()].copy()
-
+        
+        # Excluir hoy y futuro (usar D-1 como último día confiable)
+        df = df[df["FECHA"] <= _cutoff_dminus1()].copy()
+        
         if window_days and window_days > 0:
-            cutoff = datetime.date.today() - datetime.timedelta(days=window_days)
+            cutoff = _cutoff_dminus1() - datetime.timedelta(days=window_days-1)
             df = df[df["FECHA"] >= cutoff].copy()
 
-        for c in ["CONFIRMADO","EJECUTADO"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-
-        _as_str_cols(df, ["MLP","SVC"])
 
         # 4) Agregado por texto original
         agg = (
@@ -3097,20 +3104,17 @@ def _add_calendar_feats(df, date_col="FECHA", country="MX"):
 
 def _label_from_arer(arer: pd.DataFrame) -> pd.DataFrame:
     """
-    Genera etiqueta continua de 'shortfall' a nivel fila AR-ER.
-    SHORTFALL_PCT = max(0, (CONFIRMADO - (EJECUTADO + CAN_MELI)) / CONFIRMADO).
-    - CAN_MELI: cancelaciones propias (no penalizan al proveedor).
-    - Mantiene FAIL (binario) solo para debug/estadística, pero el modelo usará SHORTFALL_PCT.
+    Etiqueta de fallo a nivel fila AR-ER.
+    FAIL = 1 si CONFIRMADO > 0 y EJECUTADO < CONFIRMADO.
+    *EXCLUYE* filas con FECHA > D-1 para no sesgar con días incompletos.
     """
     if arer is None or arer.empty:
-        return pd.DataFrame(columns=[
-            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-            "CONFIRMADO","EJECUTADO","CAN_MELI","SHORTFALL_PCT","FAIL"
-        ])
+        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+                                     "CONFIRMADO","EJECUTADO","FAIL"])
 
     df = arer.copy()
 
-    # Normalización de encabezados
+    # Normalización encabezados
     find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
     find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
     find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
@@ -3119,50 +3123,33 @@ def _label_from_arer(arer: pd.DataFrame) -> pd.DataFrame:
     find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
     find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
 
-    # Columna de cancelaciones MELI (si existe)
-    find_and_rename(df, ["Cancelaciones Meli","CANCELACIONES_MELI","CANCELA_MELI","CAN_MELI"], "CAN_MELI",
-                    required=False, source_label="AR-ER")
-
     need = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","FECHA","CONFIRMADO","EJECUTADO"]
     if any(c not in df.columns for c in need):
-        return pd.DataFrame(columns=[
-            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-            "CONFIRMADO","EJECUTADO","CAN_MELI","SHORTFALL_PCT","FAIL"
-        ])
+        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+                                     "CONFIRMADO","EJECUTADO","FAIL"])
 
-    # Tipos
+    # Tipos y filtro a D-1
     df["FECHA"] = parse_es_date_series(df["FECHA"])
     df = df[df["FECHA"].notna()].copy()
+    df = df[df["FECHA"] <= _cutoff_dminus1()].copy()   # 👈 excluye hoy y futuro
 
-    for c in ["CONFIRMADO","EJECUTADO","CAN_MELI"]:
-        if c not in df.columns:
-            df[c] = 0
+    for c in ["CONFIRMADO","EJECUTADO"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
 
-    # Ejecutado “efectivo” para evaluar al proveedor
-    eff_exec = df["EJECUTADO"] + df["CAN_MELI"]
+    # Solo se puede fallar si hubo confirmación (>0)
+    df["FAIL"] = np.where((df["CONFIRMADO"] > 0) & (df["EJECUTADO"] + 1e-9 < df["CONFIRMADO"]), 1, 0).astype(int)
 
-    # Shortfall proporcional (0..1). Si CONFIRMADO=0 => 0
-    den = df["CONFIRMADO"].replace(0, np.nan)
-    df["SHORTFALL_PCT"] = ((df["CONFIRMADO"] - eff_exec) / den).clip(lower=0).fillna(0).clip(0, 1)
-
-    # FAIL binario (solo debug)
-    df["FAIL"] = (df["SHORTFALL_PCT"] > 0).astype(int)
-
-    # Debug opcional
+    # (debug opcional)
     try:
         import streamlit as st
-        vc = df["FAIL"].value_counts().to_dict()
-        st.caption(f"Distribución de etiquetas FAIL (AR-ER): {vc}")
-        st.caption(f"Shortfall medio histórico: {df['SHORTFALL_PCT'].mean():.3f}")
+        st.caption(f"Dist. FAIL (AR-ER, hasta D-1): {df['FAIL'].value_counts().to_dict()}")
     except Exception:
         pass
 
     return df[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-               "CONFIRMADO","EJECUTADO","CAN_MELI","SHORTFALL_PCT","FAIL"]]
-
+               "CONFIRMADO","EJECUTADO","FAIL"]]
 
 
 def _attach_tabla2_spr(df_hist: pd.DataFrame) -> pd.DataFrame:
