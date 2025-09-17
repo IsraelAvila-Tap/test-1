@@ -3530,9 +3530,6 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
 def _get_trained_model():
     return train_shortfall_model(window_days=730)
 
-
-
-
 def predict_failure(detalles_df: pd.DataFrame,
                     tabla3_df: pd.DataFrame,
                     model: FailureModel) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -3602,13 +3599,12 @@ def predict_failure(detalles_df: pd.DataFrame,
         empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"])
         return empty_res, pred_df
 
-    # --- 5) Features calendario + DM colapsado (¡clave!) ---
+    # --- 5) Features calendario + DM colapsado ---
     pred_df["DOW"] = pred_df["FECHA"].dt.weekday
     pred_df["IS_WE"] = pred_df["DOW"].isin([5,6]).astype(int)
     pred_df["MES"] = pred_df["FECHA"].dt.month
     pred_df["SEM"] = pred_df["FECHA"].dt.isocalendar().week.astype(int)
     pred_df["SPR_T2"] = pd.to_numeric(pred_df["SPR"], errors="coerce")
-    # DM que verá el modelo
     pred_df["DM_TRAIN"] = _collapse_dm_for_training(pred_df["DELIVERY_MOD"])
 
     # --- 6) Señal de corto plazo: SF_RECENT_30 ---
@@ -3617,33 +3613,29 @@ def predict_failure(detalles_df: pd.DataFrame,
         arer_raw = read_sheet(SHEET_ID, tab_arer)
     except Exception:
         arer_raw = pd.DataFrame()
-    
-    # Asegura DM_TRAIN en pred_df (ya lo calculaste antes, pero por si acaso)
-    pred_df["DM_TRAIN"] = _collapse_dm_for_training(pred_df["DELIVERY_MOD"])
-    
-    # Obtén recientes (devuelven DM_TRAIN, no DELIVERY_MOD)
+
     SF_LOOKBACK_DAYS = locals().get("SF_LOOKBACK_DAYS", 30)
     full_recent, pool_recent = _get_recent_shortfall(arer_raw, days=SF_LOOKBACK_DAYS)
-    
-    # Normaliza llaves en ambos
+
     _as_str_cols(pred_df, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"])
     _as_str_cols(full_recent, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"])
     pred_df["MLP"] = pred_df["MLP"].str.strip().str.upper()
     full_recent["MLP"] = full_recent["MLP"].str.strip().str.upper()
-    
-    # Merge 1: por combo completo (incluye MLP)
+
     pred_df = pred_df.merge(
         full_recent,
         on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"],
         how="left"
     )
-    
-    # Merge 2: fallback solo si no hay valor
+
     miss = pred_df["SF_RECENT_30"].isna()
     if miss.any():
         pred_df.loc[miss, "SF_RECENT_30"] = pred_df.loc[miss, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"]]\
             .merge(pool_recent, on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], how="left")["SF_RECENT_30_POOL"].values
 
+    # ✅ Sanitiza la señal reciente
+    pred_df["SF_RECENT_30"] = pd.to_numeric(pred_df.get("SF_RECENT_30"), errors="coerce")\
+                                   .fillna(0.0).clip(0.0, 1.0)
 
     # --- 7) Asegura todas las columnas que espera el modelo ---
     X_cols = list(model.features) if hasattr(model, "features") else []
@@ -3653,42 +3645,39 @@ def predict_failure(detalles_df: pd.DataFrame,
     X_pred = pd.DataFrame(index=pred_df.index)
     for c in X_cols:
         if c == "DELIVERY_MOD":
-            X_pred[c] = pred_df["DM_TRAIN"]  # << usamos el DM colapsado
+            X_pred[c] = pred_df["DM_TRAIN"]
         elif c in pred_df.columns:
             X_pred[c] = pred_df[c]
         else:
             X_pred[c] = np.nan
 
-    # 8) Predicción / shortfall esperado -> Prob_Fail (clipeado 0..1 y sin NaN)
+    # --- 8) Predicción del modelo ---
     try:
-        shortfall = model.pipeline.predict(X_pred)  # si tu modelo es reg. de shortfall
+        shortfall = model.pipeline.predict(X_pred)
     except Exception:
         try:
-            shortfall = model.pipeline.predict_proba(X_pred)[:, 1]  # si es clasificador
+            shortfall = model.pipeline.predict_proba(X_pred)[:, 1]
         except Exception:
             shortfall = np.zeros(len(pred_df), dtype=float)
-    
-    # Asegura array float y sanea NaN/Inf
+
     vals = np.asarray(shortfall, dtype=float)
     vals = np.nan_to_num(vals, nan=0.0, posinf=1.0, neginf=0.0)
     vals = np.clip(vals, 0.0, 1.0)
-    
-    # Asigna con mismo índice del pred_df
     pred_df["Prob_Fail"] = pd.Series(vals, index=pred_df.index)
 
-    ##Ajustamos cuando hay poca data
-    # Después de obtener pred_df["Prob_Fail"] del modelo:
-    pred_df["Prob_Fail"] = np.clip(
-        0.5 * pred_df["Prob_Fail"].astype(float) + 0.5 * pred_df["SF_RECENT_30"].astype(float),
-        0.0, 1.0
-    )
+    # 🔧 Mezcla modelo + señal reciente (sin NaN)
+    pred_df["Prob_Fail"] = (
+        0.5 * pd.to_numeric(pred_df["Prob_Fail"], errors="coerce").fillna(0.0) +
+        0.5 * pred_df["SF_RECENT_30"]
+    ).clip(0.0, 1.0)
 
-    # Riesgos ponderados
-    pred_df["Rutas_riesgo"] = pred_df["Prob_Fail"] * pd.to_numeric(pred_df["Rutas"], errors="coerce").fillna(0)
-    pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
+    # --- 9) Riesgos ponderados ---
+    pred_df["Rutas"]     = pd.to_numeric(pred_df["Rutas"], errors="coerce").fillna(0)
+    pred_df["Shipments"] = pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
+    pred_df["Rutas_riesgo"]     = pred_df["Prob_Fail"] * pred_df["Rutas"]
+    pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pred_df["Shipments"]
 
-
-    # --- 9) Resumen por SVC (ponderada por shipments) ---
+    # --- 10) Resumen por SVC ---
     grp = pred_df.groupby("SVC", dropna=False)
     ship_sum = grp["Shipments"].sum().replace(0, np.nan)
     prob_w = (grp.apply(lambda g: (g["Prob_Fail"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_peso_ship")
@@ -3703,7 +3692,7 @@ def predict_failure(detalles_df: pd.DataFrame,
 
     resumen = resumen.sort_values("Shipments_riesgo", ascending=False).reset_index(drop=True)
 
-    # --- 10) Orden del detalle para lectura (mantenemos el DM original para mostrar) ---
+    # --- 11) Orden del detalle ---
     try:
         ord_dm = pd.CategoricalDtype(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
         pred_df["DELIVERY_MOD"] = pred_df["DELIVERY_MOD"].astype(ord_dm)
