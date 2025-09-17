@@ -3222,12 +3222,6 @@ def _rolling_stats(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-
-@dataclass
-class FailureModel:
-    pipeline: Pipeline
-    features: list
-
 def _ensure_shortfall_cols(df: pd.DataFrame) -> pd.DataFrame:
     """
     Asegura columnas para modelar 'riesgo de capacidad insuficiente':
@@ -3367,16 +3361,6 @@ def train_shortfall_model(window_days: int = 730) -> FailureModel | None:
         pass
 
     return FailureModel(pipeline=pipe, features=num_feats + cat_feats)
-
-def _rolling_shortfall(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.sort_values("FECHA").copy()
-    grp = d.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
-    for w in ROLL_WINDOWS:
-        d[f"SF_MEAN_{w}d"] = grp["SHORTFALL_PCT"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
-                              .reset_index(level=[0,1,2,3], drop=True)
-        d[f"CONF_{w}d"]    = grp["CONF_EFECTIVO"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
-                              .reset_index(level=[0,1,2,3], drop=True)
-    return d
 
 
 # --- Helper: colapsar DM a las categorías del entrenamiento ---
