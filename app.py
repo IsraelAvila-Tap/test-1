@@ -3803,8 +3803,8 @@ def render_fixed_header(
     logo_img=None,
     title="Mel-IA Ops — Plan táctico (diario por SVC)",
     subtitle="Copiloto de planificación táctica de flota • Rentals • Crowd • MLP • SP • DC",
-    header_h=104,
-    logo_h=500,
+    header_h=120,
+    logo_h=88,
 ):
     import io, base64
 
@@ -3837,6 +3837,7 @@ def render_fixed_header(
             --meli-header-h: {int(header_h)}px;
             --meli-logo-h: {int(logo_h)}px;
           }}
+          .meli-logo { margin-left: -8px; }  /* mueve solo el logo a la izquierda */
           .meli-fixed {{ position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
             background: #fff; height: var(--meli-header-h);
             border-bottom: 1px solid rgba(0,0,0,.06);
