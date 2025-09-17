@@ -4260,8 +4260,6 @@ try:
                     st.error("No se pudo calcular la Tabla 4 (riesgo de fallo).")
                     show_exception(e, "Tabla 4 (riesgo)")
 
-
-
 # =========================
 # 🤖 Chat Mel-IA (Bloque B)
 # =========================
