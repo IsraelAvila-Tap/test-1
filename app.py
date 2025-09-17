@@ -3431,47 +3431,54 @@ def predict_failure(detalles_df: pd.DataFrame,
                     tabla3_df: pd.DataFrame,
                     model: FailureModel) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
+    Predice shortfall proporcional esperado (0..1) por (día×SVC×DM×Veh×MLP/Rentals).
     Devuelve:
-      - resumen por SVC
-      - detalle con Prob_Fail (= shortfall_pct esperado), Rutas_riesgo y Shipments_riesgo
+      - resumen por SVC (arriba)
+      - detalle con Prob_Fail (=shortfall esperado), rutas/shipments en riesgo.
     """
-    empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"])
-    empty_det = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-                                      "Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"])
-
-    if model is None or getattr(model, "pipeline", None) is None:
-        return empty_res, empty_det
-    if detalles_df is None or detalles_df.empty:
+    # Vacíos
+    if model is None or getattr(model, "pipeline", None) is None or detalles_df is None or detalles_df.empty:
+        empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"])
+        empty_det = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+                                          "Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"])
         return empty_res, empty_det
 
-    # === 1) SPR por (fecha, svc, dm, veh) desde Tabla 2
+    # --- 1) SPR por (fecha,svc,dm,veh) desde Tabla 2 (detalles) ---
     det = detalles_df.copy()
-    det["FECHA"]     = pd.to_datetime(det["FECHA"], errors="coerce").dt.date
-    det["Rutas"]     = pd.to_numeric(det["Rutas"], errors="coerce").fillna(0).astype(int)
+    det["FECHA"] = pd.to_datetime(det["FECHA"], errors="coerce")
+    det["Rutas"] = pd.to_numeric(det["Rutas"], errors="coerce").fillna(0).astype(int)
     det["Shipments"] = pd.to_numeric(det["Shipments"], errors="coerce").fillna(0).astype(int)
-    det["SPR"]       = pd.to_numeric(det["SPR"], errors="coerce")
+    det["SPR"] = pd.to_numeric(det["SPR"], errors="coerce")
+
     dm_str = det["DELIVERY_MOD"].astype(str)
-    det = det[dm_str.isin(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"])].copy()
+    focus_dm = ["Rentals", "MLP SDD", "MLP SPOT", "MLP BACKLOG"]
+    det = det[dm_str.isin(focus_dm)].copy()
 
-    spr_map = (det.groupby(["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)["SPR"]
-                 .mean().rename("SPR_MAP").reset_index())
+    spr_map = (
+        det.groupby(["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)["SPR"]
+           .mean().rename("SPR_MAP").reset_index()
+    )
 
-    # === 2) Rentals desde Tabla 2
+    # --- 2) RENTALS desde Tabla 2 ---
     rentals = det[dm_str.eq("Rentals")].copy()
     if not rentals.empty:
         rentals = (rentals.groupby(["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)
-                          .agg(Rutas=("Rutas","sum"), Shipments=("Shipments","sum"), SPR=("SPR","mean"))
+                          .agg(Rutas=("Rutas","sum"),
+                               Shipments=("Shipments","sum"),
+                               SPR=("SPR","mean"))
                           .reset_index())
         rentals["MLP"] = "RENTALS"
     else:
-        rentals = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","Rutas","Shipments","SPR","MLP"])
+        rentals = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE",
+                                        "Rutas","Shipments","SPR","MLP"])
 
-    # === 3) MLP desde Tabla 3 + SPR de Tabla 2
+    # --- 3) MLP desde Tabla 3 + SPR del mismo día por SVC×DM×Veh ---
     if tabla3_df is None or tabla3_df.empty:
-        mlp_rows = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"])
+        mlp_rows = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE",
+                                         "MLP","Rutas","SPR","Shipments"])
     else:
         t3 = tabla3_df.copy()
-        t3["FECHA"] = pd.to_datetime(t3["FECHA"], errors="coerce").dt.date
+        t3["FECHA"] = pd.to_datetime(t3["FECHA"], errors="coerce")
         t3["Rutas"] = pd.to_numeric(t3["Rutas"], errors="coerce").fillna(0).astype(int)
         t3 = t3.merge(spr_map, on=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], how="left")
         t3["SPR"] = pd.to_numeric(t3["SPR_MAP"], errors="coerce")
@@ -3480,46 +3487,83 @@ def predict_failure(detalles_df: pd.DataFrame,
         t3["Shipments"] = (t3["Rutas"] * t3["SPR"]).round().astype(int)
         mlp_rows = t3[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"]].copy()
 
-    # === 4) Unifica
+    # --- 4) Unifica RENTALS + MLP ---
     pred_df = pd.concat([
         rentals[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"]],
         mlp_rows
     ], axis=0, ignore_index=True)
     if pred_df.empty:
+        empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"])
         return empty_res, pred_df
 
-    # === 5) Features para el pipeline
-    pred_df["FECHA"] = pd.to_datetime(pred_df["FECHA"], errors="coerce")
-    pred_df["DOW"]   = pred_df["FECHA"].dt.weekday
+    # --- 5) Features calendario + DM colapsado (¡clave!) ---
+    pred_df["DOW"] = pred_df["FECHA"].dt.weekday
     pred_df["IS_WE"] = pred_df["DOW"].isin([5,6]).astype(int)
-    pred_df["MES"]   = pred_df["FECHA"].dt.month
-    pred_df["SEM"]   = pred_df["FECHA"].dt.isocalendar().week.astype(int)
-    pred_df["SPR_T2"]= pd.to_numeric(pred_df["SPR"], errors="coerce")
+    pred_df["MES"] = pred_df["FECHA"].dt.month
+    pred_df["SEM"] = pred_df["FECHA"].dt.isocalendar().week.astype(int)
+    pred_df["SPR_T2"] = pd.to_numeric(pred_df["SPR"], errors="coerce")
+    # DM que verá el modelo
+    pred_df["DM_TRAIN"] = _collapse_dm_for_training(pred_df["DELIVERY_MOD"])
 
-    # CONF_EFECTIVO “proxy” para ponderación futura (no lo tenemos; usamos Shipments)
-    pred_df["CONF_EFECTIVO"] = pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
+    # --- 6) Señal de corto plazo: SF_RECENT_30 ---
+    # Reutilizamos el AR-ER crudo a través de la función interna de entrenamiento si la tienes a mano:
+    try:
+        tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
+        arer_raw = read_sheet(SHEET_ID, tab_arer)
+    except Exception:
+        arer_raw = pd.DataFrame()
 
-    # Orden/columnas como en el modelo
-    X_cols = list(model.features)
+    full_recent, pool_recent = _get_recent_shortfall(arer_raw, days=30)
+    # Merge por combo completo
+    pred_df = pred_df.merge(
+        full_recent.rename(columns={"SF_RECENT_30": "SF_RECENT_30"}),
+        left_on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"],
+        right_on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"],
+        how="left"
+    )
+    # Fallback sin MLP
+    miss = pred_df["SF_RECENT_30"].isna()
+    if miss.any():
+        pred_df.loc[miss, "SF_RECENT_30"] = pred_df.loc[miss].merge(
+            pool_recent,
+            left_on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"],
+            right_on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"],
+            how="left"
+        )["SF_RECENT_30_POOL"].values
+    pred_df["SF_RECENT_30"] = pd.to_numeric(pred_df["SF_RECENT_30"], errors="coerce").fillna(0.0)
+
+    # --- 7) Asegura todas las columnas que espera el modelo ---
+    X_cols = list(model.features) if hasattr(model, "features") else []
+    if not X_cols:
+        X_cols = ["SPR_T2","DOW","IS_WE","MES","SEM","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT_30"]
+
     X_pred = pd.DataFrame(index=pred_df.index)
     for c in X_cols:
-        X_pred[c] = pred_df[c] if c in pred_df.columns else np.nan
+        if c == "DELIVERY_MOD":
+            X_pred[c] = pred_df["DM_TRAIN"]  # << usamos el DM colapsado
+        elif c in pred_df.columns:
+            X_pred[c] = pred_df[c]
+        else:
+            X_pred[c] = np.nan
 
-    # === 6) Predicción (regresor)
+    # --- 8) Predicción (shortfall esperado 0..1) ---
     try:
-        shortfall = np.clip(model.pipeline.predict(X_pred), 0.0, 1.0)
+        shortfall = model.pipeline.predict(X_pred)
     except Exception:
-        # si algo falla, no uses fallback “constante”; devuelve 0 y que se note
-        shortfall = np.zeros(len(pred_df), dtype=float)
+        # Si el modelo es clasificador con predict_proba, toma la segunda columna
+        try:
+            shortfall = model.pipeline.predict_proba(X_pred)[:, 1]
+        except Exception:
+            shortfall = np.zeros(len(pred_df), dtype=float)
 
-    pred_df["Prob_Fail"]       = shortfall
-    pred_df["Rutas_riesgo"]    = pred_df["Prob_Fail"] * pred_df["Rutas"]
-    pred_df["Shipments_riesgo"]= pred_df["Prob_Fail"] * pred_df["Shipments"]
+    pred_df["Prob_Fail"] = np.clip(pd.to_numeric(shortfall, errors="coerce").fillna(0.0), 0.0, 1.0)
+    pred_df["Rutas_riesgo"] = pred_df["Prob_Fail"] * pred_df["Rutas"]
+    pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pred_df["Shipments"]
 
-    # === 7) Resumen por SVC (pondera por CONF_EFECTIVO)
+    # --- 9) Resumen por SVC (ponderada por shipments) ---
     grp = pred_df.groupby("SVC", dropna=False)
-    w   = grp["CONF_EFECTIVO"].sum().replace(0, np.nan)
-    prob_w = (grp.apply(lambda g: (g["Prob_Fail"] * g["CONF_EFECTIVO"]).sum()) / w).fillna(0).rename("Prob_peso_ship")
+    ship_sum = grp["Shipments"].sum().replace(0, np.nan)
+    prob_w = (grp.apply(lambda g: (g["Prob_Fail"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_peso_ship")
 
     resumen = pd.concat([
         grp["Rutas"].sum().rename("Rutas"),
@@ -3527,14 +3571,18 @@ def predict_failure(detalles_df: pd.DataFrame,
         grp["Shipments"].sum().rename("Shipments"),
         grp["Shipments_riesgo"].sum().rename("Shipments_riesgo"),
         prob_w
-    ], axis=1).reset_index().sort_values("Shipments_riesgo", ascending=False).reset_index(drop=True)
+    ], axis=1).reset_index()
 
-    # Orden visual
+    resumen = resumen.sort_values("Shipments_riesgo", ascending=False).reset_index(drop=True)
+
+    # --- 10) Orden del detalle para lectura (mantenemos el DM original para mostrar) ---
     try:
         ord_dm = pd.CategoricalDtype(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
         pred_df["DELIVERY_MOD"] = pred_df["DELIVERY_MOD"].astype(ord_dm)
-        pred_df = pred_df.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_Fail"],
-                                      ascending=[True, True, True, True, False]).reset_index(drop=True)
+        pred_df = pred_df.sort_values(
+            ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_Fail"],
+            ascending=[True, True, True, True, False]
+        ).reset_index(drop=True)
     except Exception:
         pass
 
@@ -3542,6 +3590,7 @@ def predict_failure(detalles_df: pd.DataFrame,
     cols_det = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
                 "Prob_Fail","Rutas_riesgo","Shipments_riesgo"]
     return resumen[cols_res], pred_df[cols_det]
+
 
 
 
@@ -3644,6 +3693,78 @@ def render_pretty_table(df, caption=None):
     if caption:
         st.caption(caption)
     st.table(sty)
+
+# --- Helper: colapsar DM a las categorías del entrenamiento ---
+def _collapse_dm_for_training(dm_series: pd.Series) -> pd.Series:
+    s = dm_series.astype(str).str.upper().str.strip()
+    return (
+        s.replace({
+            "MLP SDD": "MLP",
+            "MLP SPOT": "MLP",
+            "MLP BACKLOG": "MLP",
+            "RENTAL": "RENTALS",
+            "RENTALS": "RENTALS",
+            "RENTAS": "RENTALS",
+        })
+        .fillna("__NA__")
+    )
+
+# --- Señal de corto plazo: tasa reciente (30 días) ponderada por CONF_EFECTIVO ---
+def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30) -> pd.DataFrame:
+    """
+    Devuelve SF_RECENT_30 por (SVC, DM_TRAIN, Vehículo, MLP) y también a nivel pool (sin MLP),
+    ponderado por CONF_EFECTIVO. Filtra días futuros (usa D-1).
+    """
+    if arer is None or arer.empty:
+        return pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT_30"])
+
+    df = arer.copy()
+    # Normaliza encabezados mínimos
+    find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
+    find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
+    find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Mes, Día, Año de FECHA","Mes, dia, Año de FECHA","FECHA","OP_DT","DATE"], "FECHA", required=False, source_label="AR-ER")
+    find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
+    find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
+    find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_FORM","CANCELACIONES"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
+
+    # Tipos / fechas y D-1
+    df["FECHA"] = parse_es_date_series(df["FECHA"])
+    df = df[df["FECHA"].notna()].copy()
+    cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).date()
+    df = df[df["FECHA"].dt.date <= cutoff].copy()
+
+    # Efectivo: confirmado menos cancelaciones (no penalizamos sobre-ejecución)
+    for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
+        df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
+
+    df["CONF_EFECTIVO"] = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
+    conf = df["CONF_EFECTIVO"].replace(0, np.nan)
+    df["SHORTFALL_PCT"] = ((conf - df["EJECUTADO"]) / conf).clip(lower=0).fillna(0)
+
+    # Claves y DM colapsado para entrenamiento
+    _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
+    df["DM_TRAIN"] = _collapse_dm_for_training(df["DELIVERY_MOD"])
+
+    # Ventana reciente
+    recent_cut = (pd.Timestamp.today().normalize() - pd.Timedelta(days=days)).date()
+    df_recent = df[df["FECHA"].dt.date >= recent_cut].copy()
+
+    # WAVG por combo completo
+    def _wavg(g):
+        w = pd.to_numeric(g["CONF_EFECTIVO"], errors="coerce").fillna(0)
+        x = pd.to_numeric(g["SHORTFALL_PCT"], errors="coerce").fillna(0)
+        return float(np.average(x, weights=np.where(w>0, w, 0.0))) if w.sum()>0 else 0.0
+
+    by_full = (df_recent.groupby(["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
+               .apply(_wavg).rename("SF_RECENT_30").reset_index())
+    # Pool sin MLP (fallback)
+    by_pool = (df_recent.groupby(["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], dropna=False)
+               .apply(_wavg).rename("SF_RECENT_30_POOL").reset_index())
+
+    return by_full, by_pool
+
 
 # ---------------------------------------------------------------------
 # 6) UI
