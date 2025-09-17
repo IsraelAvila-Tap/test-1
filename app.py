@@ -3186,6 +3186,72 @@ def _label_from_arer(arer: pd.DataFrame) -> pd.DataFrame:
         "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT","FAIL"
     ]]
 
+def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
+    """
+    Etiqueta continua de 'shortfall' a nivel fila AR-ER.
+    SHORTFALL_PCT = max(CONFIRMADO_NETO - EJECUTADO, 0) / max(CONFIRMADO_NETO, 1)
+    * CONFIRMADO_NETO = CONFIRMADO - CANCELACIONES_FORM
+    * Filtra sólo historia hasta D-1 (nada de hoy / futuro)
+    Devuelve: FECHA, SVC, DELIVERY_MOD, SHP_LG_VEHICLE_TYPE, MLP,
+              CONFIRMADO, CANCELACIONES_FORM, CONFIRMADO_NETO, EJECUTADO, SHORTFALL_PCT
+    """
+    if arer is None or arer.empty:
+        return pd.DataFrame(columns=[
+            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+            "CONFIRMADO","CANCELACIONES_FORM","CONFIRMADO_NETO","EJECUTADO","SHORTFALL_PCT"
+        ])
+
+    df = arer.copy()
+
+    # Normalización de columnas
+    find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
+    find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
+    find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
+    find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Mes, Día, Año de FECHA","Mes, dia, Año de FECHA","FECHA","OP_DT","DATE"], "FECHA", required=False, source_label="AR-ER")
+    find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
+    find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
+    find_and_rename(df, ["Cancelaciones Form","CANCELACIONES","CANCELACIONES_FORM"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
+
+    need = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","FECHA","CONFIRMADO","EJECUTADO"]
+    if any(c not in df.columns for c in need):
+        return pd.DataFrame(columns=[
+            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+            "CONFIRMADO","CANCELACIONES_FORM","CONFIRMADO_NETO","EJECUTADO","SHORTFALL_PCT"
+        ])
+
+    # Tipos y corte temporal (<= D-1)
+    df["FECHA"] = parse_es_date_series(df["FECHA"])
+    df = df[df["FECHA"].notna()].copy()
+    import datetime as _dt
+    cutoff = _dt.date.today() - _dt.timedelta(days=1)
+    df = df[df["FECHA"].dt.date <= cutoff].copy()
+
+    for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
+        df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
+
+    # Confirmado neto (sin penalizar cancelaciones del formulario)
+    df["CONFIRMADO_NETO"] = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
+
+    # Shortfall proporcional
+    den = df["CONFIRMADO_NETO"].replace(0, np.nan)
+    df["SHORTFALL_PCT"] = ((df["CONFIRMADO_NETO"] - df["EJECUTADO"]).clip(lower=0) / den).fillna(0).clip(0, 1)
+
+    _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
+
+    # (debug)
+    try:
+        st.caption(f"Shortfall medio ponderado (AR-ER): "
+                   f"{np.average(df['SHORTFALL_PCT'], weights=df['CONFIRMADO_NETO'].clip(lower=1)):.3%}")
+    except Exception:
+        pass
+
+    return df[[
+        "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+        "CONFIRMADO","CANCELACIONES_FORM","CONFIRMADO_NETO","EJECUTADO","SHORTFALL_PCT"
+    ]]
+
+
 
 def _attach_tabla2_spr(df_hist: pd.DataFrame) -> pd.DataFrame:
     """
@@ -3317,6 +3383,7 @@ def _rolling_shortfall(df: pd.DataFrame) -> pd.DataFrame:
         )
     return d
 
+
 @dataclass
 class FailureModel:
     pipeline: Pipeline
@@ -3324,93 +3391,95 @@ class FailureModel:
 
 def train_shortfall_model(window_days: int = 730) -> FailureModel | None:
     """
-    Entrena un modelo de REGRESIÓN para predecir SHORTFALL_PCT (0..1),
-    ponderando cada ejemplo por log1p(CONF_EFECTIVO).
-    Usa SPR_T2 (de Tabla 2), calendario y rolling.
+    Predice SHORTFALL_PCT (continuo) a partir de AR-ER histórico.
+    Modelo: HistGradientBoostingRegressor con sample_weight = CONFIRMADO_NETO.
     """
-    # 1) Carga AR-ER y etiqueta (con D-1, cancelaciones, shortfall%)
+    # 1) Carga AR-ER y etiqueta continua
     try:
         tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
         arer = read_sheet(SHEET_ID, tab_arer)
     except Exception:
         arer = pd.DataFrame()
 
-    ydf = _label_from_arer(arer)
+    ydf = _label_from_arer_shortfall(arer)
     if ydf is None or ydf.empty:
         return None
 
-    # Filtra ventana temporal si se pide (sobre FECHA ya recortado a D-1)
+    # Ventana de historia (p. ej. 2 años)
     if window_days and window_days > 0:
-        cutoff = (pd.Timestamp.today().date() - pd.Timedelta(days=window_days))
-        ydf = ydf[ydf["FECHA"] >= cutoff].copy()
-        if ydf.empty:
-            return None
+        cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=window_days)).date()
+        ydf = ydf[ydf["FECHA"].dt.date >= cutoff].copy()
 
-    # 2) Enriquecer con SPR histórico + calendario + rolling
-    ydf = _attach_tabla2_spr(ydf)              # SPR_T2 por SVC×DM×Veh×día
-    ydf = _add_calendar_feats(ydf, "FECHA")    # DOW, IS_WE, MES, SEM, FERIADO
-    ydf = _rolling_shortfall(ydf)              # SF_MEAN_*d, CONF_*d
+    # 2) Features extra
+    ydf = _attach_tabla2_spr(ydf)           # SPR_T2 por SVC×DM×Veh×día (si existe)
+    ydf = _add_calendar_feats(ydf, "FECHA") # DOW, IS_WE, MES, SEM
+    # (Opcional) rolling de shortfall y nivel de conf
+    def _rolling_shortfall(d):
+        d = d.sort_values("FECHA").copy()
+        g = d.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
+        for w in [14, 30, 90]:
+            d[f"SF_MEAN_{w}d"] = g["SHORTFALL_PCT"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
+                                   .reset_index(level=[0,1,2,3], drop=True)
+            d[f"CONF_{w}d"]    = g["CONFIRMADO_NETO"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
+                                   .reset_index(level=[0,1,2,3], drop=True)
+        return d
+    ydf = _rolling_shortfall(ydf)
 
-    # 3) Selección de features
-    num_feats = [
-        "SPR_T2","CONF_EFECTIVO",
-        "DOW","IS_WE","MES","SEM","FERIADO",
-        *[f"SF_MEAN_{w}d" for w in ROLL_WINDOWS],
-        *[f"CONF_{w}d" for w in ROLL_WINDOWS],
-    ]
-    cat_feats = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"]
-
-    num_feats = [c for c in num_feats if c in ydf.columns]
-    cat_feats = [c for c in cat_feats if c in ydf.columns]
+    # 3) Columnas (filtradas a las que existan)
+    num_feats = [c for c in [
+        "SPR_T2","CONFIRMADO_NETO","EJECUTADO","DOW","IS_WE","MES","SEM",
+        "SF_MEAN_14d","SF_MEAN_30d","SF_MEAN_90d","CONF_14d","CONF_30d","CONF_90d"
+    ] if c in ydf.columns]
+    cat_feats = [c for c in ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"] if c in ydf.columns]
 
     X = ydf[num_feats + cat_feats].copy()
-    y = ydf["FAIL"].astype(float).clip(lower=0, upper=1)     # SHORTFALL_PCT
-    w = ydf.get("SF_WEIGHT", pd.Series(1.0, index=ydf.index)).astype(float)
+    y = pd.to_numeric(ydf["SHORTFALL_PCT"], errors="coerce").fillna(0).clip(0,1)
+    w = pd.to_numeric(ydf["CONFIRMADO_NETO"], errors="coerce").fillna(0).clip(lower=1.0)  # ← peso
 
-    # 4) Preprocesamiento (denso)
+    # 4) Preprocesado denso
     num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median"))])
     try:
         cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
         cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
-    cat_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("ohe", cat_ohe),
-    ])
+    cat_pipe = Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("ohe", cat_ohe)])
+
     preprocess = ColumnTransformer(
-        transformers=[
-            ("num", num_pipe, num_feats),
-            ("cat", cat_pipe, cat_feats),
-        ],
+        transformers=[("num", num_pipe, num_feats), ("cat", cat_pipe, cat_feats)],
         remainder="drop",
         sparse_threshold=0.0
     )
 
-    # 5) Train/Valid split (estratificación no aplica en regresión)
+    # 5) Split (mantén pesos emparejados)
+    do_strat = False  # regresión
     try:
         X_fit, X_eval, y_fit, y_eval, w_fit, w_eval = train_test_split(
-            X, y, w, test_size=0.20, random_state=42
+            X, y, w, test_size=0.20, random_state=42, stratify=None if not do_strat else None
         )
     except Exception:
         X_fit, y_fit, w_fit = X, y, w
         X_eval, y_eval, w_eval = X.iloc[:0], y.iloc[:0], w.iloc[:0]
 
-    # 6) Modelo (regresión) tolerante a NaNs internos
-    gbr = HistGradientBoostingRegressor(
+    # 6) Modelo (regresión)
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    clf = HistGradientBoostingRegressor(
         learning_rate=0.08,
         max_iter=400,
         random_state=42
     )
-    pipe = Pipeline([("prep", preprocess), ("reg", gbr)])
+    pipe = Pipeline([("prep", preprocess), ("clf", clf)])
 
-    pipe.fit(X_fit, y_fit, reg__sample_weight=w_fit)
+    # ✅ Entrega los pesos al último estimador con el prefijo del step
+    pipe.fit(X_fit, y_fit, **{"clf__sample_weight": w_fit})
 
-    # 7) Métrica rápida (opcional): MAE en valid
+    # 7) Métrica rápida (MAE ponderado)
     try:
         if len(X_eval) > 0:
-            pred = np.clip(pipe.predict(X_eval), 0, 1)
-            mae = float(np.abs(pred - y_eval.to_numpy()).mean())
-            st.caption(f"MAE validación (aprox, shortfall%): {mae:.3f}")
+            y_pred = pipe.predict(X_eval).clip(0,1)
+            mae = np.average(np.abs(y_eval - y_pred), weights=w_eval) / max(1e-9, (w_eval.mean()))
+            st.caption(f"MAE ponderado (aprox): {mae:.4f}")
+        # Muestra también el shortfall medio ponderado en train
+        st.caption(f"Shortfall medio (peso=CONF): {np.average(y_fit, weights=w_fit):.3%}")
     except Exception:
         pass
 
@@ -3528,13 +3597,11 @@ def predict_failure(detalles_df: pd.DataFrame,
     shortfall = np.clip(yhat, 0.0, 1.0)
     
     # Columnas de salida (riesgo proporcional)
-    pred_df["Prob_Fail"] = shortfall                       # ← shortfall_pct esperado
-    pred_df["Rutas"] = pd.to_numeric(pred_df["Rutas"], errors="coerce").fillna(0)
-    pred_df["Shipments"] = pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
-    pred_df["Rutas_riesgo"] = pred_df["Prob_Fail"] * pred_df["Rutas"]
-    pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pred_df["Shipments"]
+    pred_df["Prob_Fail"]       = shortfall  # salida del regressor ya en [0,1]
+    pred_df["Rutas_riesgo"]    = pred_df["Prob_Fail"] * pred_df["Rutas"]
+    pred_df["Shipments_riesgo"]= pred_df["Prob_Fail"] * pred_df["Shipments"]
 
-
+                        
     # 8) Resumen por SVC (ponderado por shipments)
     grp = pred_df.groupby("SVC", dropna=False)
     ship_sum = grp["Shipments"].sum().replace(0, np.nan)
