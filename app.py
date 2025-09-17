@@ -3613,59 +3613,91 @@ def predict_failure(detalles_df: pd.DataFrame,
         else:
             X_pred[c] = np.nan
     
-    # 8) Predicción
-    try:
-        shortfall = model.pipeline.predict(X_pred)
-    except Exception:
+        # 8) Predicción ML pura
         try:
-            shortfall = model.pipeline.predict_proba(X_pred)[:, 1]
+            y_hat = model.pipeline.predict(X_pred)
         except Exception:
-            shortfall = np.zeros(len(pred_df), dtype=float)
+            try:
+                y_hat = model.pipeline.predict_proba(X_pred)[:, 1]
+            except Exception:
+                y_hat = np.zeros(len(pred_df), dtype=float)
     
-    vals = np.asarray(shortfall, dtype=float)
-    vals = np.nan_to_num(vals, nan=0.0, posinf=1.0, neginf=0.0)
-    vals = np.clip(vals, 0.0, 1.0)
+        y_hat = np.asarray(y_hat, dtype=float)
+        y_hat = np.nan_to_num(y_hat, nan=0.0, posinf=1.0, neginf=0.0)
+        y_hat = np.clip(y_hat, 0.0, 1.0)
     
-    # Blend con recent ponderado por evidencia (CONF_QTY); satura a partir de 200 confirmados
-    w = np.clip(pred_df["CONF_QTY"] / 200.0, 0.0, 1.0)
-    pred_df["Prob_Fail"] = np.clip((1.0 - w) * vals + w * pred_df["SF_RECENT_30"], 0.0, 1.0)
-
-    # --- 9) Riesgos ponderados ---
-    pred_df["Rutas"]     = pd.to_numeric(pred_df["Rutas"], errors="coerce").fillna(0)
-    pred_df["Shipments"] = pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
-    pred_df["Rutas_riesgo"]     = pred_df["Prob_Fail"] * pred_df["Rutas"]
-    pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pred_df["Shipments"]
-                   
-    # --- 10) Resumen por SVC ---
-    grp = pred_df.groupby("SVC", dropna=False)
-    ship_sum = grp["Shipments"].sum().replace(0, np.nan)
-    prob_w = (grp.apply(lambda g: (g["Prob_Fail"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Probabilidad_de_fallar")
-
-    resumen = pd.concat([
-        grp["Rutas"].sum().rename("Rutas"),
-        grp["Rutas_riesgo"].sum().rename("Rutas_riesgo"),
-        grp["Shipments"].sum().rename("Shipments"),
-        grp["Shipments_riesgo"].sum().rename("Shipments_riesgo"),
-        prob_w
-    ], axis=1).reset_index()
-
-    resumen = resumen.sort_values("Shipments_riesgo", ascending=False).reset_index(drop=True)
-
-    # --- 11) Orden del detalle ---
-    try:
-        ord_dm = pd.CategoricalDtype(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
-        pred_df["DELIVERY_MOD"] = pred_df["DELIVERY_MOD"].astype(ord_dm)
-        pred_df = pred_df.sort_values(
-            ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_Fail"],
-            ascending=[True, True, True, True, False]
-        ).reset_index(drop=True)
-    except Exception:
-        pass
-
-    cols_res = ["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Probabilidad_de_fallar"]
-    cols_det = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
-                "Prob_Fail","Rutas_riesgo","Shipments_riesgo"]
-    return resumen[cols_res], pred_df[cols_det]
+        # Señal DP = reciente (ya anexada arriba en SF_RECENT_30)
+        pred_df["Prob_Fail_ML"] = y_hat
+        pred_df["Prob_Fail_DP"] = pred_df["SF_RECENT_30"].clip(0.0, 1.0)
+    
+        # (Opcional) Blend si quieres conservarlo para diagnóstico
+        w = np.clip(pred_df["CONF_QTY"] / 200.0, 0.0, 1.0)
+        pred_df["Prob_Fail_BLEND"] = np.clip(
+            (1.0 - w) * pred_df["Prob_Fail_ML"] + w * pred_df["Prob_Fail_DP"],
+            0.0, 1.0
+        )
+    
+        # --- 9) Riesgos ponderados (para ML y DP por separado) ---
+        pred_df["Rutas"]     = pd.to_numeric(pred_df["Rutas"], errors="coerce").fillna(0)
+        pred_df["Shipments"] = pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
+    
+        for key in ["ML", "DP", "BLEND"]:
+            p = pred_df[f"Prob_Fail_{key}"]
+            pred_df[f"Rutas_riesgo_{key}"]     = p * pred_df["Rutas"]
+            pred_df[f"Shipments_riesgo_{key}"] = p * pred_df["Shipments"]
+    
+        # --- 10) Resumen por SVC, con ML y DP (y BLEND opcional) ---
+        grp = pred_df.groupby("SVC", dropna=False)
+        ship_sum = grp["Shipments"].sum().replace(0, np.nan)
+    
+        resumen = pd.concat([
+            grp["Rutas"].sum().rename("Rutas"),
+            grp["Shipments"].sum().rename("Shipments"),
+    
+            grp["Rutas_riesgo_ML"].sum().rename("Rutas_riesgo_ML"),
+            grp["Shipments_riesgo_ML"].sum().rename("Shipments_riesgo_ML"),
+            (grp.apply(lambda g: (g["Prob_Fail_ML"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_fallar_ML"),
+    
+            grp["Rutas_riesgo_DP"].sum().rename("Rutas_riesgo_DP"),
+            grp["Shipments_riesgo_DP"].sum().rename("Shipments_riesgo_DP"),
+            (grp.apply(lambda g: (g["Prob_Fail_DP"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_fallar_DP"),
+    
+            # Deja BLEND por si lo quieres mostrar/ocultar
+            grp["Rutas_riesgo_BLEND"].sum().rename("Rutas_riesgo_BLEND"),
+            grp["Shipments_riesgo_BLEND"].sum().rename("Shipments_riesgo_BLEND"),
+            (grp.apply(lambda g: (g["Prob_Fail_BLEND"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_fallar_BLEND"),
+        ], axis=1).reset_index()
+    
+        # Orden sugerido por Shipments_riesgo (ML)
+        resumen = resumen.sort_values("Shipments_riesgo_ML", ascending=False).reset_index(drop=True)
+    
+        # --- 11) Orden del detalle (con nuevas columnas) ---
+        try:
+            ord_dm = pd.CategoricalDtype(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
+            pred_df["DELIVERY_MOD"] = pred_df["DELIVERY_MOD"].astype(ord_dm)
+            pred_df = pred_df.sort_values(
+                ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_Fail_ML"],
+                ascending=[True, True, True, True, False]
+            ).reset_index(drop=True)
+        except Exception:
+            pass
+    
+        # Columnas de salida (detalle con ML & DP)
+        cols_det = [
+            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+            "Rutas","Shipments",
+            "Prob_Fail_ML","Prob_Fail_DP","Prob_Fail_BLEND",
+            "Rutas_riesgo_ML","Rutas_riesgo_DP","Rutas_riesgo_BLEND",
+            "Shipments_riesgo_ML","Shipments_riesgo_DP","Shipments_riesgo_BLEND"
+        ]
+        cols_res = [
+            "SVC","Rutas","Shipments",
+            "Rutas_riesgo_ML","Shipments_riesgo_ML","Prob_fallar_ML",
+            "Rutas_riesgo_DP","Shipments_riesgo_DP","Prob_fallar_DP",
+            "Rutas_riesgo_BLEND","Shipments_riesgo_BLEND","Prob_fallar_BLEND"
+        ]
+        return resumen[cols_res], pred_df[cols_det]
+f[cols_det]
 
 
 # -----------------------------------------------------------------------------
@@ -4147,19 +4179,38 @@ try:
                 
                         st.subheader("Resumen por SVC")
                 
+                        st.subheader("Resumen por SVC — Comparativo ML vs DP")
+
                         res_show = resumen_svc.copy()
-                        for c in ["Rutas", "Rutas_riesgo", "Shipments", "Shipments_riesgo", "Probabilidad_de_fallar"]:
-                            if c in res_show.columns:
-                                res_show[c] = pd.to_numeric(res_show[c], errors="coerce")
-                
+                        fmt_num0 = "{:,.0f}".format
+                        fmt_pct1 = "{:.1%}".format
+                        
                         res_style = res_show.style.format({
-                            "Rutas": num0f,
-                            "Rutas_riesgo": num0f,
-                            "Shipments": num0f,
-                            "Shipments_riesgo": num0f,
-                            "Probabilidad_de_fallar": pct1f,
+                            "Rutas": fmt_num0,
+                            "Shipments": fmt_num0,
+                            "Rutas_riesgo_ML": fmt_num0,
+                            "Shipments_riesgo_ML": fmt_num0,
+                            "Prob_fallar_ML": fmt_pct1,
+                            "Rutas_riesgo_DP": fmt_num0,
+                            "Shipments_riesgo_DP": fmt_num0,
+                            "Prob_fallar_DP": fmt_pct1,
+                            # Muestra u oculta BLEND según prefieras
+                            "Rutas_riesgo_BLEND": fmt_num0,
+                            "Shipments_riesgo_BLEND": fmt_num0,
+                            "Prob_fallar_BLEND": fmt_pct1,
                         })
                         st.dataframe(res_style, use_container_width=True, hide_index=True)
+                        
+                        with st.expander("Ver detalle por día × DM × vehículo × MLP (ML vs DP)", expanded=False):
+                            det_show = detalle_riesgo.copy()
+                            det_style = det_show.style.format({
+                                "Rutas": fmt_num0, "Shipments": fmt_num0,
+                                "Prob_Fail_ML": fmt_pct1, "Prob_Fail_DP": fmt_pct1, "Prob_Fail_BLEND": fmt_pct1,
+                                "Rutas_riesgo_ML": fmt_num0, "Rutas_riesgo_DP": fmt_num0, "Rutas_riesgo_BLEND": fmt_num0,
+                                "Shipments_riesgo_ML": fmt_num0, "Shipments_riesgo_DP": fmt_num0, "Shipments_riesgo_BLEND": fmt_num0,
+                            })
+                            st.dataframe(det_style, use_container_width=True, hide_index=True)
+
                 
                         with st.expander("Ver detalle por día × DM × vehículo × MLP", expanded=False):
                             det_show = detalle_riesgo.copy()
