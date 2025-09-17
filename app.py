@@ -3435,26 +3435,28 @@ def _collapse_dm_for_training(dm_series: pd.Series) -> pd.Series:
         .fillna("__NA__")
     )
 
-SF_LOOKBACK_DAYS = 30 #####Ajustar parametros minimos de lectura
-SF_MIN_CONF_DIA  = 50
+#SF_LOOKBACK_DAYS = 30 #####Ajustar parametros minimos de lectura
+#SF_MIN_CONF_DIA  = 50
 
-def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
+                          prior_p: float = 0.08, prior_strength: int = 100):
     """
     Devuelve:
-      - by_full: SF_RECENT_30 por (SVC_CAN, DM_TRAIN, VEH_CAN, MLP_CAN)
-      - by_pool: SF_RECENT_30_POOL por (SVC_CAN, DM_TRAIN, VEH_CAN)
-    Ponderado por CONF_EFECTIVO. Filtra hasta D-1.
+      - by_full:  SF_RECENT_30 (suavizado), CONF_QTY, N_DAYS por (SVC, DM_TRAIN, Veh, MLP)
+      - by_pool:  SF_RECENT_30_POOL (suavizado), CONF_QTY_POOL, N_DAYS_POOL por (SVC, DM_TRAIN, Veh)
+    Usa ventana [hoy-days, ayer]. SHORTFALL = max(CONF_EFECTIVO - EJECUTADO, 0).
     """
     if arer is None or arer.empty:
-        by_full = pd.DataFrame(columns=["SVC_CAN","DM_TRAIN","VEH_CAN","MLP_CAN","SF_RECENT_30"])
-        by_pool = pd.DataFrame(columns=["SVC_CAN","DM_TRAIN","VEH_CAN","SF_RECENT_30_POOL"])
+        by_full = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP",
+                                        "SF_RECENT_30","CONF_QTY","N_DAYS"])
+        by_pool = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE",
+                                        "SF_RECENT_30_POOL","CONF_QTY_POOL","N_DAYS_POOL"])
         return by_full, by_pool
 
     df = arer.copy()
-
-    # ---- Normaliza encabezados ----
+    # --- Normaliza encabezados mínimos ---
     find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
-    find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Delivery model","DELIVERY_MODEL","DM","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
     find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
     find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
     find_and_rename(df, ["Mes, Día, Año de FECHA","Mes, dia, Año de FECHA","FECHA","OP_DT","DATE"], "FECHA", required=False, source_label="AR-ER")
@@ -3462,58 +3464,58 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30) -> tuple[pd.DataFr
     find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
     find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_FORM","CANCELACIONES"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
 
-    # ==========================
-    #  FECHAS (ROBUSTO)  <<< FIX
-    # ==========================
-    # 1) Intento de parser propio (puede dejar 'date' Python)
+    # --- Fechas robustas + D-1 ---
     try:
         df["FECHA"] = parse_es_date_series(df["FECHA"])
     except Exception:
-        pass
-    # 2) Si viene como serial numérico de Excel -> convértelo
-    if pd.api.types.is_numeric_dtype(df["FECHA"]):
-        df["FECHA"] = pd.to_datetime(df["FECHA"], unit="D", origin="1899-12-30", errors="coerce")
-    else:
-        # 3) Forzar SIEMPRE datetime64[ns] (no objetos 'date')
-        df["FECHA"] = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")\
-                         .fillna(pd.to_datetime(df["FECHA"], errors="coerce"))
-    # 4) Filtrado temporal usando Timestamps (evita .dt.date)
+        d1 = pd.to_datetime(df["FECHA"], dayfirst=True, errors="coerce")
+        d2 = pd.to_datetime(df["FECHA"], errors="coerce")
+        df["FECHA"] = d1.fillna(d2)
     df = df[df["FECHA"].notna()].copy()
-    cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1))      # D-1 23:59
-    df = df[df["FECHA"] <= cutoff].copy()
-    if days and days > 0:
-        start = cutoff - pd.Timedelta(days=days-1)
-        df = df[df["FECHA"] >= start].copy()
+    cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=1)).date()
+    start  = cutoff - pd.Timedelta(days=days-1)
+    df = df[(df["FECHA"].dt.date >= start.date()) & (df["FECHA"].dt.date <= cutoff)].copy()
 
-    # ---- Métricas base ----
+    # --- Métricas base ---
     for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
         df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
     df["CONF_EFECTIVO"] = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
-    conf = df["CONF_EFECTIVO"].replace(0, np.nan)
-    df["SHORTFALL_PCT"] = ((conf - df["EJECUTADO"]) / conf).clip(lower=0).fillna(0)
+    df["FAIL_QTY"] = (df["CONF_EFECTIVO"] - df["EJECUTADO"]).clip(lower=0)
 
-    # ---- Claves y DM colapsado ----
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
     df["DM_TRAIN"] = _collapse_dm_for_training(df["DELIVERY_MOD"])
-    df["SVC_CAN"]  = df["SVC"].map(_canon_key)
-    df["MLP_CAN"]  = df["MLP"].map(_canon_key)
-    df["VEH_CAN"]  = df["SHP_LG_VEHICLE_TYPE"].map(_veh_mix_hom).str.upper()
 
-    # ---- WAVG por combo completo y por pool ----
-    def _wavg(g):
-        w = pd.to_numeric(g["CONF_EFECTIVO"], errors="coerce").fillna(0)
-        x = pd.to_numeric(g["SHORTFALL_PCT"], errors="coerce").fillna(0)
-        return float(np.average(x, weights=np.where(w>0, w, 0.0))) if w.sum() > 0 else 0.0
+    # --- Agregados FULL (incluye MLP) ---
+    gcols_full = ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"]
+    agg_full = (df.groupby(gcols_full, dropna=False)
+                  .agg(FAIL_QTY=("FAIL_QTY","sum"),
+                       CONF_QTY=("CONF_EFECTIVO","sum"),
+                       N_DAYS=("FECHA", lambda s: s.dt.date.nunique()))
+                  .reset_index())
+    agg_full["SF_RECENT_30_RAW"] = np.where(agg_full["CONF_QTY"]>0,
+                                            agg_full["FAIL_QTY"]/agg_full["CONF_QTY"], 0.0)
+    agg_full["SF_RECENT_30"] = (
+        (agg_full["FAIL_QTY"] + prior_strength*prior_p) /
+        (agg_full["CONF_QTY"] + prior_strength).replace(0, np.nan)
+    ).fillna(0.0).clip(0,1)
 
-    keys_full = ["SVC_CAN","DM_TRAIN","VEH_CAN","MLP_CAN"]
-    keys_pool = ["SVC_CAN","DM_TRAIN","VEH_CAN"]
+    # --- Agregados POOL (sin MLP) ---
+    gcols_pool = ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"]
+    agg_pool = (df.groupby(gcols_pool, dropna=False)
+                  .agg(FAIL_QTY=("FAIL_QTY","sum"),
+                       CONF_QTY=("CONF_EFECTIVO","sum"),
+                       N_DAYS=("FECHA", lambda s: s.dt.date.nunique()))
+                  .reset_index())
+    agg_pool["SF_RECENT_30_POOL"] = (
+        (agg_pool["FAIL_QTY"] + prior_strength*prior_p) /
+        (agg_pool["CONF_QTY"] + prior_strength).replace(0, np.nan)
+    ).fillna(0.0).clip(0,1)
+    agg_pool.rename(columns={"CONF_QTY":"CONF_QTY_POOL","N_DAYS":"N_DAYS_POOL"}, inplace=True)
 
-    by_full = (df.groupby(keys_full, dropna=False).apply(_wavg)
-                 .reset_index(name="SF_RECENT_30"))
-    by_pool = (df.groupby(keys_pool, dropna=False).apply(_wavg)
-                 .reset_index(name="SF_RECENT_30_POOL"))
-
+    by_full = agg_full[["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT_30","CONF_QTY","N_DAYS"]]
+    by_pool = agg_pool[["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","SF_RECENT_30_POOL","CONF_QTY_POOL","N_DAYS_POOL"]]
     return by_full, by_pool
+
 
 ####
 
@@ -3597,44 +3599,45 @@ def predict_failure(detalles_df: pd.DataFrame,
     pred_df["SEM"] = pred_df["FECHA"].dt.isocalendar().week.astype(int)
     pred_df["SPR_T2"] = pd.to_numeric(pred_df["SPR"], errors="coerce")
     pred_df["DM_TRAIN"] = _collapse_dm_for_training(pred_df["DELIVERY_MOD"])
-
-   # --- 6) Señal de corto plazo: SF_RECENT_30 ---
+    
+    # --- 6) Señal de corto plazo: SF_RECENT_30 (suavizado) ---
     try:
         tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
         arer_raw = read_sheet(SHEET_ID, tab_arer)
     except Exception:
         arer_raw = pd.DataFrame()
-    
-    SF_LOOKBACK_DAYS = locals().get("SF_LOOKBACK_DAYS", 30)
-    full_recent, pool_recent = _get_recent_shortfall(arer_raw, days=SF_LOOKBACK_DAYS)
-    
-    # Claves canónicas para el merge
+
+    # Normaliza llaves antes del merge
     pred_df["DM_TRAIN"] = _collapse_dm_for_training(pred_df["DELIVERY_MOD"])
-    pred_df["SVC_CAN"]  = pred_df["SVC"].map(_canon_key)
-    pred_df["MLP_CAN"]  = pred_df["MLP"].map(_canon_key)
-    pred_df["VEH_CAN"]  = pred_df["SHP_LG_VEHICLE_TYPE"].map(_veh_mix_hom).str.upper()
-    
-    # Merge 1: combo completo por claves canónicas
+    _as_str_cols(pred_df, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"])
+    pred_df["MLP"] = pred_df["MLP"].fillna("").astype(str).str.strip().str.upper()
+
+    # Recent (con suavizado y conteos)
+    SF_LOOKBACK_DAYS = locals().get("SF_LOOKBACK_DAYS", 30)
+    full_recent, pool_recent = _get_recent_shortfall(arer_raw, days=SF_LOOKBACK_DAYS,
+                                                     prior_p=0.08, prior_strength=100)
+    _as_str_cols(full_recent, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"])
+    full_recent["MLP"] = full_recent["MLP"].fillna("").astype(str).str.strip().str.upper()
+
+    # Merge 1: match completo
     pred_df = pred_df.merge(
         full_recent,
-        on=["SVC_CAN","DM_TRAIN","VEH_CAN","MLP_CAN"],
+        on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"],
         how="left"
     )
-    pred_df["SF_SOURCE"] = np.where(pred_df["SF_RECENT_30"].notna(), "full", "")
-    
-    # Merge 2 (fallback pool): solo si faltó
+
+    # Fallback por pool si falta
     miss = pred_df["SF_RECENT_30"].isna()
     if miss.any():
-        pool_vals = pred_df.loc[miss, ["SVC_CAN","DM_TRAIN","VEH_CAN"]]\
-            .merge(pool_recent, on=["SVC_CAN","DM_TRAIN","VEH_CAN"], how="left")
-        pred_df.loc[miss, "SF_RECENT_30"] = pool_vals["SF_RECENT_30_POOL"].values
-        pred_df.loc[miss & pred_df["SF_RECENT_30"].notna(), "SF_SOURCE"] = "pool"
-    
-    # Limpieza final de la señal
-    pred_df["SF_RECENT_30"] = pd.to_numeric(pred_df["SF_RECENT_30"], errors="coerce").fillna(0.0).clip(0,1)
-    pred_df["SF_SOURCE"] = pred_df["SF_SOURCE"].replace("", "default")
+        pool_m = pred_df.loc[miss, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"]]\
+            .merge(pool_recent, on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], how="left")
+        pred_df.loc[miss, "SF_RECENT_30"] = pool_m["SF_RECENT_30_POOL"].values
+        pred_df.loc[miss, "CONF_QTY"]     = pool_m["CONF_QTY_POOL"].values
 
-    # --- 7) Asegura todas las columnas que espera el modelo ---
+    pred_df["SF_RECENT_30"] = pd.to_numeric(pred_df["SF_RECENT_30"], errors="coerce").fillna(0.0).clip(0,1)
+    pred_df["CONF_QTY"]     = pd.to_numeric(pred_df["CONF_QTY"], errors="coerce").fillna(0.0)
+
+    # --- 7) Asegura columnas del modelo y predice (igual que ya tienes) ---
     X_cols = list(model.features) if hasattr(model, "features") else []
     if not X_cols:
         X_cols = ["SPR_T2","DOW","IS_WE","MES","SEM","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT_30"]
@@ -3647,6 +3650,26 @@ def predict_failure(detalles_df: pd.DataFrame,
             X_pred[c] = pred_df[c]
         else:
             X_pred[c] = np.nan
+
+    try:
+        mdl = model.pipeline.predict(X_pred)
+    except Exception:
+        try:
+            mdl = model.pipeline.predict_proba(X_pred)[:, 1]
+        except Exception:
+            mdl = np.zeros(len(pred_df), dtype=float)
+
+    mdl = np.nan_to_num(np.asarray(mdl, dtype=float), nan=0.0, posinf=1.0, neginf=0.0).clip(0,1)
+
+    # --- Blend dinámico según evidencia reciente ---
+    # w = CONF_QTY / (CONF_QTY + prior_strength)
+    prior_strength = 100.0
+    w = (pred_df["CONF_QTY"] / (pred_df["CONF_QTY"] + prior_strength)).fillna(0.0).clip(0,1)
+    pred_df["Prob_Fail"] = ((1.0 - w) * mdl + w * pred_df["SF_RECENT_30"]).clip(0,1)
+
+    # Riesgos ponderados (igual)
+    pred_df["Rutas_riesgo"]     = pred_df["Prob_Fail"] * pd.to_numeric(pred_df["Rutas"], errors="coerce").fillna(0)
+    pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
 
     # --- 8) Predicción del modelo ---
     try:
