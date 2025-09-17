@@ -3504,7 +3504,7 @@ def predict_failure(detalles_df: pd.DataFrame,
     """
     # Vacíos
     if model is None or getattr(model, "pipeline", None) is None or detalles_df is None or detalles_df.empty:
-        empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"])
+        empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Probabilidad_de_fallar"])
         empty_det = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
                                           "Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"])
         return empty_res, empty_det
@@ -3549,7 +3549,7 @@ def predict_failure(detalles_df: pd.DataFrame,
     # --- 4) Dataset de predicción: solo MLP ---
     pred_df = mlp_rows.copy()
     if pred_df.empty:
-        empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"])
+        empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Probabilidad_de_fallar"])
         return empty_res, pred_df
 
 
@@ -3639,7 +3639,7 @@ def predict_failure(detalles_df: pd.DataFrame,
     # --- 10) Resumen por SVC ---
     grp = pred_df.groupby("SVC", dropna=False)
     ship_sum = grp["Shipments"].sum().replace(0, np.nan)
-    prob_w = (grp.apply(lambda g: (g["Prob_Fail"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_peso_ship")
+    prob_w = (grp.apply(lambda g: (g["Prob_Fail"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Probabilidad_de_fallar")
 
     resumen = pd.concat([
         grp["Rutas"].sum().rename("Rutas"),
@@ -3662,7 +3662,7 @@ def predict_failure(detalles_df: pd.DataFrame,
     except Exception:
         pass
 
-    cols_res = ["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"]
+    cols_res = ["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Probabilidad_de_fallar"]
     cols_det = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
                 "Prob_Fail","Rutas_riesgo","Shipments_riesgo"]
     return resumen[cols_res], pred_df[cols_det]
@@ -4147,7 +4147,7 @@ try:
                         st.subheader("Resumen por SVC")
                 
                         res_show = resumen_svc.copy()
-                        for c in ["Rutas", "Rutas_riesgo", "Shipments", "Shipments_riesgo", "Prob_peso_ship"]:
+                        for c in ["Rutas", "Rutas_riesgo", "Shipments", "Shipments_riesgo", "Probabilidad_de_fallar"]:
                             if c in res_show.columns:
                                 res_show[c] = pd.to_numeric(res_show[c], errors="coerce")
                 
@@ -4156,7 +4156,7 @@ try:
                             "Rutas_riesgo": num0f,
                             "Shipments": num0f,
                             "Shipments_riesgo": num0f,
-                            "Prob_peso_ship": pct1f,
+                            "Probabilidad_de_fallar": pct1f,
                         })
                         st.dataframe(res_style, use_container_width=True, hide_index=True)
                 
