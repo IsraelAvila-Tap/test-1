@@ -3104,36 +3104,32 @@ def _add_calendar_feats(df, date_col="FECHA", country="MX"):
     d["FERIADO"] = is_hol.astype(int)
     return d
 
-def _label_from_arer(arer: pd.DataFrame) -> pd.DataFrame:
+
+def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
     """
     Etiqueta de *riesgo de shortfall proporcional* a nivel fila AR-ER.
-    FAIL := SHORTFALL_PCT = max((CONF_EFECTIVO - EJECUTADO)/CONF_EFECTIVO, 0)
-    Donde CONF_EFECTIVO = max(CONFIRMADO - CANCELACIONES_FORM, 0)
-    Filtra datos a D-1 (evita “futuros” sin ejecutar).
+    SHORTFALL_PCT = max((CONF_EFECTIVO - EJECUTADO) / CONF_EFECTIVO, 0) si CONF_EFECTIVO>0; si no, 0.
+    CONF_EFECTIVO = max(CONFIRMADO - CANCELACIONES_FORM, 0).
+    Filtra datos a D-1 (evita "futuros" sin ejecutar).
     Devuelve además columnas auxiliares para features.
     """
     if arer is None or arer.empty:
         return pd.DataFrame(columns=[
             "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
             "CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
-            "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT","FAIL"
+            "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT"
         ])
 
     df = arer.copy()
 
-    # -------- Normalización de encabezados tolerante --------
+    # ---- encabezados tolerantes
     find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
     find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
     find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
     find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
-
-    find_and_rename(df, [
-        "Mes, Día, Año de FECHA","Mes, dia, Año de FECHA","FECHA","OP_DT","DATE","Fecha"
-    ], "FECHA", required=False, source_label="AR-ER")
-
-    find_and_rename(df, ["SOLICITADO FN","SOLICITADO","REQUESTED","Solicitado"], "SOLICITADO_FN", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Mes, Día, Año de FECHA","Mes, dia, Año de FECHA","FECHA","OP_DT","DATE"], "FECHA", required=False, source_label="AR-ER")
     find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
-    find_and_rename(df, ["Cancelaciones Form","CANCELACIONES FORM","Cancelaciones","CANCELACIONES"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_FORM","CANCEL_FORM"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
     find_and_rename(df, ["EJECUTADO","Ejecutado"], "EJECUTADO", required=False, source_label="AR-ER")
 
     need = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","FECHA","CONFIRMADO","EJECUTADO"]
@@ -3141,124 +3137,39 @@ def _label_from_arer(arer: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=[
             "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
             "CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
-            "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT","FAIL"
+            "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT"
         ])
 
-    # -------- Tipos y filtro D-1 --------
     df["FECHA"] = parse_es_date_series(df["FECHA"])
     df = df[df["FECHA"].notna()].copy()
 
-    # Excluye día actual y futuros (queda hasta D-1)
-    import datetime as _dt
-    cutoff = _dt.date.today() - _dt.timedelta(days=1)
-    df = df[df["FECHA"] <= cutoff].copy()
+    # Corte D-1
+    _today = datetime.date.today()
+    cutoff = _today - datetime.timedelta(days=1)
+    df = df[df["FECHA"].dt.date <= cutoff].copy()
 
-    for c in ["SOLICITADO_FN","CONFIRMADO","CANCELACIONES_FORM","EJECUTADO"]:
+    for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
         if c not in df.columns:
             df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
-
-    # -------- Shortfall proporcional ponderado --------
-    df["CONF_EFECTIVO"] = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
+    df["CONF_EFECTIVO"]  = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
     den = df["CONF_EFECTIVO"].replace(0, np.nan)
-    sf_pct = ((df["CONF_EFECTIVO"] - df["EJECUTADO"]) / den).clip(lower=0)  # sólo cuando ejecutan menos
-    df["SHORTFALL_PCT"] = sf_pct.fillna(0)
-
-    # Peso por volumen confirmado: log(CONF_EFECTIVO + 1)
-    df["SF_WEIGHT"] = np.log1p(df["CONF_EFECTIVO"])
-
-    # Target del modelo: proporción (mantén nombre FAIL por compatibilidad)
-    df["FAIL"] = df["SHORTFALL_PCT"]
-
-    # (debug opcional)
-    try:
-        import streamlit as st
-        mean_sf = float(df["SHORTFALL_PCT"].mean())
-        st.caption(f"Distribución FAIL (shortfall%): media={mean_sf:.3f} · N={len(df)} (D-1)")
-    except Exception:
-        pass
-
-    return df[[
-        "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-        "SOLICITADO_FN","CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
-        "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT","FAIL"
-    ]]
-
-def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
-    """
-    Etiqueta continua de 'shortfall' a nivel fila AR-ER.
-    SHORTFALL_PCT = max(CONFIRMADO_NETO - EJECUTADO, 0) / max(CONFIRMADO_NETO, 1)
-    * CONFIRMADO_NETO = CONFIRMADO - CANCELACIONES_FORM
-    * Usa solo historia hasta D-1 (nada de hoy / futuro)
-    Devuelve: FECHA, SVC, DELIVERY_MOD, SHP_LG_VEHICLE_TYPE, MLP,
-              CONFIRMADO, CANCELACIONES_FORM, CONFIRMADO_NETO, EJECUTADO, SHORTFALL_PCT
-    """
-    if arer is None or arer.empty:
-        return pd.DataFrame(columns=[
-            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-            "CONFIRMADO","CANCELACIONES_FORM","CONFIRMADO_NETO","EJECUTADO","SHORTFALL_PCT"
-        ])
-
-    df = arer.copy()
-
-    # Normalización de columnas
-    find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
-    find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
-    find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
-    find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
-    find_and_rename(df, ["Mes, Día, Año de FECHA","Mes, dia, Año de FECHA","FECHA","OP_DT","DATE"], "FECHA", required=False, source_label="AR-ER")
-    find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
-    find_and_rename(df, ["EJECUTADO","Ejecutado"],  "EJECUTADO",  required=False, source_label="AR-ER")
-    find_and_rename(df, ["Cancelaciones Form","CANCELACIONES","CANCELACIONES_FORM"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
-
-    need = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","FECHA","CONFIRMADO","EJECUTADO"]
-    if any(c not in df.columns for c in need):
-        return pd.DataFrame(columns=[
-            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-            "CONFIRMADO","CANCELACIONES_FORM","CONFIRMADO_NETO","EJECUTADO","SHORTFALL_PCT"
-        ])
-
-    # ---- FECHA robusto a datetime64 ----
-    # (por si parse_es_date_series devuelve date/str)
-    try:
-        df["FECHA"] = parse_es_date_series(df["FECHA"])
-    except Exception:
-        pass
-    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")   # <- asegura datetime64
-    df = df[df["FECHA"].notna()].copy()
-
-    # Corte temporal: <= D-1
-    cutoff_ts = pd.Timestamp.today().normalize() - pd.Timedelta(days=1)
-    df = df[df["FECHA"] <= cutoff_ts].copy()
-
-    # Numéricos
-    for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
-        df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
-
-    # Confirmado neto (no penaliza al proveedor lo cancelado por nosotros)
-    df["CONFIRMADO_NETO"] = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
-
-    # Shortfall proporcional
-    den = df["CONFIRMADO_NETO"].replace(0, np.nan)
-    df["SHORTFALL_PCT"] = ((df["CONFIRMADO_NETO"] - df["EJECUTADO"]).clip(lower=0) / den).fillna(0).clip(0, 1)
+    sf  = ((df["CONF_EFECTIVO"] - df["EJECUTADO"]) / den).clip(lower=0)
+    df["SHORTFALL_PCT"] = sf.fillna(0.0)
+    df["SF_WEIGHT"]     = df["CONF_EFECTIVO"].clip(lower=0)
 
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
 
-    # Debug opcional
+    # debug opcional
     try:
-        st.caption(
-            f"Shortfall medio ponderado (AR-ER): "
-            f"{np.average(df['SHORTFALL_PCT'], weights=df['CONFIRMADO_NETO'].clip(lower=1)):.3%}"
-        )
+        st.caption(f"Shortfall medio (train): mean={df['SHORTFALL_PCT'].mean():.3f} · mediana={df['SHORTFALL_PCT'].median():.3f} · n={len(df)}")
     except Exception:
         pass
 
-    return df[[
-        "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-        "CONFIRMADO","CANCELACIONES_FORM","CONFIRMADO_NETO","EJECUTADO","SHORTFALL_PCT"
-    ]]
+    return df[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+               "CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
+               "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT"]]
 
 
 def _attach_tabla2_spr(df_hist: pd.DataFrame) -> pd.DataFrame:
@@ -3391,7 +3302,6 @@ def _rolling_shortfall(df: pd.DataFrame) -> pd.DataFrame:
         )
     return d
 
-
 @dataclass
 class FailureModel:
     pipeline: Pipeline
@@ -3399,10 +3309,8 @@ class FailureModel:
 
 def train_shortfall_model(window_days: int = 730) -> FailureModel | None:
     """
-    Predice SHORTFALL_PCT (continuo) a partir de AR-ER histórico.
-    Modelo: HistGradientBoostingRegressor con sample_weight = CONFIRMADO_NETO.
+    Regresor de SHORTFALL_PCT ponderado por CONF_EFECTIVO.
     """
-    # 1) Carga AR-ER y etiqueta continua
     try:
         tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
         arer = read_sheet(SHEET_ID, tab_arer)
@@ -3413,91 +3321,79 @@ def train_shortfall_model(window_days: int = 730) -> FailureModel | None:
     if ydf is None or ydf.empty:
         return None
 
-    # Ventana de historia (p. ej. 2 años)
-    if window_days and window_days > 0:
-        cutoff = (pd.Timestamp.today().normalize() - pd.Timedelta(days=window_days)).date()
-        ydf = ydf[ydf["FECHA"].dt.date >= cutoff].copy()
+    # Enriquecimiento
+    ydf = _attach_tabla2_spr(ydf)            # SPR_T2
+    ydf = _add_calendar_feats(ydf, "FECHA")  # DOW, IS_WE, MES, SEM
+    ydf = _rolling_shortfall(ydf)            # SF_MEAN_*d, CONF_*d
 
-    # 2) Features extra
-    ydf = _attach_tabla2_spr(ydf)           # SPR_T2 por SVC×DM×Veh×día (si existe)
-    ydf = _add_calendar_feats(ydf, "FECHA") # DOW, IS_WE, MES, SEM
-    # (Opcional) rolling de shortfall y nivel de conf
-    def _rolling_shortfall(d):
-        d = d.sort_values("FECHA").copy()
-        g = d.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
-        for w in [14, 30, 90]:
-            d[f"SF_MEAN_{w}d"] = g["SHORTFALL_PCT"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
-                                   .reset_index(level=[0,1,2,3], drop=True)
-            d[f"CONF_{w}d"]    = g["CONFIRMADO_NETO"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
-                                   .reset_index(level=[0,1,2,3], drop=True)
-        return d
-    ydf = _rolling_shortfall(ydf)
+    # Features
+    num_feats = ["SPR_T2","CONF_EFECTIVO","DOW","IS_WE","MES","SEM"] + \
+                [f"SF_MEAN_{w}d" for w in ROLL_WINDOWS] + \
+                [f"CONF_{w}d"    for w in ROLL_WINDOWS]
+    cat_feats = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"]
 
-    # 3) Columnas (filtradas a las que existan)
-    num_feats = [c for c in [
-        "SPR_T2","CONFIRMADO_NETO","EJECUTADO","DOW","IS_WE","MES","SEM",
-        "SF_MEAN_14d","SF_MEAN_30d","SF_MEAN_90d","CONF_14d","CONF_30d","CONF_90d"
-    ] if c in ydf.columns]
-    cat_feats = [c for c in ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"] if c in ydf.columns]
+    num_feats = [c for c in num_feats if c in ydf.columns]
+    cat_feats = [c for c in cat_feats if c in ydf.columns]
 
+    # X / y / weight
     X = ydf[num_feats + cat_feats].copy()
-    y = pd.to_numeric(ydf["SHORTFALL_PCT"], errors="coerce").fillna(0).clip(0,1)
-    w = pd.to_numeric(ydf["CONFIRMADO_NETO"], errors="coerce").fillna(0).clip(lower=1.0)  # ← peso
+    y = pd.to_numeric(ydf["SHORTFALL_PCT"], errors="coerce").fillna(0.0).clip(0, 1)
+    w = pd.to_numeric(ydf.get("SF_WEIGHT", 0), errors="coerce").fillna(0.0)
 
-    # 4) Preprocesado denso
-    num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median"))])
+    # Preprocesador (denso)
+    num_pipe = Pipeline([ ("imputer", SimpleImputer(strategy="median")), ])
     try:
         cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
         cat_ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
-    cat_pipe = Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("ohe", cat_ohe)])
+    cat_pipe = Pipeline([ ("imputer", SimpleImputer(strategy="most_frequent")), ("ohe", cat_ohe), ])
 
     preprocess = ColumnTransformer(
-        transformers=[("num", num_pipe, num_feats), ("cat", cat_pipe, cat_feats)],
+        transformers=[
+            ("num", num_pipe, num_feats),
+            ("cat", cat_pipe, cat_feats),
+        ],
         remainder="drop",
-        sparse_threshold=0.0
+        sparse_threshold=0.0,
     )
 
-    # 5) Split (mantén pesos emparejados)
-    do_strat = False  # regresión
-    try:
-        X_fit, X_eval, y_fit, y_eval, w_fit, w_eval = train_test_split(
-            X, y, w, test_size=0.20, random_state=42, stratify=None if not do_strat else None
-        )
-    except Exception:
-        X_fit, y_fit, w_fit = X, y, w
-        X_eval, y_eval, w_eval = X.iloc[:0], y.iloc[:0], w.iloc[:0]
-
-    # 6) Modelo (regresión)
-    from sklearn.ensemble import HistGradientBoostingRegressor
-    clf = HistGradientBoostingRegressor(
+    # Regresor que tolera NaNs
+    reg = HistGradientBoostingRegressor(
         learning_rate=0.08,
         max_iter=400,
         random_state=42
     )
-    pipe = Pipeline([("prep", preprocess), ("clf", clf)])
+    pipe = Pipeline([("prep", preprocess), ("reg", reg)])
 
-    # ✅ Entrega los pesos al último estimador con el prefijo del step
-    pipe.fit(X_fit, y_fit, **{"clf__sample_weight": w_fit})
+    # Fit con pesos (si todos 0 → None)
+    sample_weight = None if float(w.sum()) == 0 else w.values
+    pipe.fit(X, y, **({"reg__sample_weight": sample_weight} if sample_weight is not None else {}))
 
-    # 7) Métrica rápida (MAE ponderado)
+    # Monitoreo rápido
     try:
-        if len(X_eval) > 0:
-            y_pred = pipe.predict(X_eval).clip(0,1)
-            mae = np.average(np.abs(y_eval - y_pred), weights=w_eval) / max(1e-9, (w_eval.mean()))
-            st.caption(f"MAE ponderado (aprox): {mae:.4f}")
-        # Muestra también el shortfall medio ponderado en train
-        st.caption(f"Shortfall medio (peso=CONF): {np.average(y_fit, weights=w_fit):.3%}")
+        y_hat = np.clip(pipe.predict(X), 0, 1)
+        mae = np.mean(np.abs(y - y_hat))
+        st.caption(f"Train: n={len(y)} · shortfall_mean={y.mean():.3f} · MAE(in-sample)={mae:.3f}")
     except Exception:
         pass
 
     return FailureModel(pipeline=pipe, features=num_feats + cat_feats)
 
+def _rolling_shortfall(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.sort_values("FECHA").copy()
+    grp = d.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
+    for w in ROLL_WINDOWS:
+        d[f"SF_MEAN_{w}d"] = grp["SHORTFALL_PCT"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
+                              .reset_index(level=[0,1,2,3], drop=True)
+        d[f"CONF_{w}d"]    = grp["CONF_EFECTIVO"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
+                              .reset_index(level=[0,1,2,3], drop=True)
+    return d
 
 
 @st.cache_resource(show_spinner=False)
 def _get_trained_model():
-    return train_failure_model(window_days=730)
+    return train_shortfall_model(window_days=730)
+
 
 
 
@@ -3505,12 +3401,10 @@ def predict_failure(detalles_df: pd.DataFrame,
                     tabla3_df: pd.DataFrame,
                     model: FailureModel) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Predice shortfall esperado (0..1) a nivel (día × SVC × DM × Veh × MLP/Rentals).
-    Reusa SPR actual de Tabla 2. Devuelve:
+    Devuelve:
       - resumen por SVC
-      - detalle (con Prob_Fail = shortfall_pct esperado)
+      - detalle con Prob_Fail (= shortfall_pct esperado), Rutas_riesgo y Shipments_riesgo
     """
-    # Validaciones
     empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"])
     empty_det = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
                                       "Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"])
@@ -3520,39 +3414,31 @@ def predict_failure(detalles_df: pd.DataFrame,
     if detalles_df is None or detalles_df.empty:
         return empty_res, empty_det
 
-    # 1) SPR por (fecha, svc, dm, veh) desde Tabla 2 (detalles)
+    # === 1) SPR por (fecha, svc, dm, veh) desde Tabla 2
     det = detalles_df.copy()
-    det["FECHA"] = pd.to_datetime(det["FECHA"], errors="coerce").dt.date
-    det["Rutas"] = pd.to_numeric(det["Rutas"], errors="coerce").fillna(0).astype(int)
+    det["FECHA"]     = pd.to_datetime(det["FECHA"], errors="coerce").dt.date
+    det["Rutas"]     = pd.to_numeric(det["Rutas"], errors="coerce").fillna(0).astype(int)
     det["Shipments"] = pd.to_numeric(det["Shipments"], errors="coerce").fillna(0).astype(int)
-    det["SPR"] = pd.to_numeric(det["SPR"], errors="coerce")
-
+    det["SPR"]       = pd.to_numeric(det["SPR"], errors="coerce")
     dm_str = det["DELIVERY_MOD"].astype(str)
-    focus_dm = ["Rentals", "MLP SDD", "MLP SPOT", "MLP BACKLOG"]
-    det = det[dm_str.isin(focus_dm)].copy()
+    det = det[dm_str.isin(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"])].copy()
 
-    spr_map = (
-        det.groupby(["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)["SPR"]
-           .mean().rename("SPR_MAP").reset_index()
-    )
+    spr_map = (det.groupby(["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)["SPR"]
+                 .mean().rename("SPR_MAP").reset_index())
 
-    # 2) Rentals (agrega)
+    # === 2) Rentals desde Tabla 2
     rentals = det[dm_str.eq("Rentals")].copy()
     if not rentals.empty:
         rentals = (rentals.groupby(["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)
-                          .agg(Rutas=("Rutas","sum"),
-                               Shipments=("Shipments","sum"),
-                               SPR=("SPR","mean"))
+                          .agg(Rutas=("Rutas","sum"), Shipments=("Shipments","sum"), SPR=("SPR","mean"))
                           .reset_index())
         rentals["MLP"] = "RENTALS"
     else:
-        rentals = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE",
-                                        "Rutas","Shipments","SPR","MLP"])
+        rentals = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","Rutas","Shipments","SPR","MLP"])
 
-    # 3) MLP desde Tabla 3 + SPR actual Tabla 2
+    # === 3) MLP desde Tabla 3 + SPR de Tabla 2
     if tabla3_df is None or tabla3_df.empty:
-        mlp_rows = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE",
-                                         "MLP","Rutas","SPR","Shipments"])
+        mlp_rows = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"])
     else:
         t3 = tabla3_df.copy()
         t3["FECHA"] = pd.to_datetime(t3["FECHA"], errors="coerce").dt.date
@@ -3564,7 +3450,7 @@ def predict_failure(detalles_df: pd.DataFrame,
         t3["Shipments"] = (t3["Rutas"] * t3["SPR"]).round().astype(int)
         mlp_rows = t3[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"]].copy()
 
-    # 4) Unifica
+    # === 4) Unifica
     pred_df = pd.concat([
         rentals[["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","SPR","Shipments"]],
         mlp_rows
@@ -3572,48 +3458,38 @@ def predict_failure(detalles_df: pd.DataFrame,
     if pred_df.empty:
         return empty_res, pred_df
 
-    # 5) Feats mínimas (SPR_T2 + calendario)
+    # === 5) Features para el pipeline
     pred_df["FECHA"] = pd.to_datetime(pred_df["FECHA"], errors="coerce")
-    pred_df["DOW"] = pred_df["FECHA"].dt.weekday
+    pred_df["DOW"]   = pred_df["FECHA"].dt.weekday
     pred_df["IS_WE"] = pred_df["DOW"].isin([5,6]).astype(int)
-    pred_df["MES"] = pred_df["FECHA"].dt.month
-    pred_df["SEM"] = pred_df["FECHA"].dt.isocalendar().week.astype(int)
-    pred_df["FERIADO"] = 0  # si quieres, conecta con tu hoja de Calendario
-    pred_df["SPR_T2"] = pd.to_numeric(pred_df["SPR"], errors="coerce")
+    pred_df["MES"]   = pred_df["FECHA"].dt.month
+    pred_df["SEM"]   = pred_df["FECHA"].dt.isocalendar().week.astype(int)
+    pred_df["SPR_T2"]= pd.to_numeric(pred_df["SPR"], errors="coerce")
 
-    # 6) Arma X en el orden del modelo
-    X_cols = list(model.features) if hasattr(model, "features") else []
-    if not X_cols:
-        X_cols = ["SPR_T2","DOW","IS_WE","MES","SEM","FERIADO","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"]
+    # CONF_EFECTIVO “proxy” para ponderación futura (no lo tenemos; usamos Shipments)
+    pred_df["CONF_EFECTIVO"] = pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
 
+    # Orden/columnas como en el modelo
+    X_cols = list(model.features)
     X_pred = pd.DataFrame(index=pred_df.index)
     for c in X_cols:
         X_pred[c] = pred_df[c] if c in pred_df.columns else np.nan
 
-
-    # 7) Predicción (shortfall esperado en [0,1])
+    # === 6) Predicción (regresor)
     try:
-        # Si el modelo es REGRESOR (nuestro caso), usa predict()
-        yhat = model.pipeline.predict(X_pred)
+        shortfall = np.clip(model.pipeline.predict(X_pred), 0.0, 1.0)
     except Exception:
-        # Si por alguna razón es CLASIFICADOR, cae a predict_proba
-        try:
-            yhat = model.pipeline.predict_proba(X_pred)[:, 1]
-        except Exception:
-            yhat = np.zeros(len(X_pred), dtype=float)
-    
-    shortfall = np.clip(yhat, 0.0, 1.0)
-    
-    # Columnas de salida (riesgo proporcional)
-    pred_df["Prob_Fail"]       = shortfall  # salida del regressor ya en [0,1]
+        # si algo falla, no uses fallback “constante”; devuelve 0 y que se note
+        shortfall = np.zeros(len(pred_df), dtype=float)
+
+    pred_df["Prob_Fail"]       = shortfall
     pred_df["Rutas_riesgo"]    = pred_df["Prob_Fail"] * pred_df["Rutas"]
     pred_df["Shipments_riesgo"]= pred_df["Prob_Fail"] * pred_df["Shipments"]
 
-                        
-    # 8) Resumen por SVC (ponderado por shipments)
+    # === 7) Resumen por SVC (pondera por CONF_EFECTIVO)
     grp = pred_df.groupby("SVC", dropna=False)
-    ship_sum = grp["Shipments"].sum().replace(0, np.nan)
-    prob_w = (grp.apply(lambda g: (g["Prob_Fail"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_peso_ship")
+    w   = grp["CONF_EFECTIVO"].sum().replace(0, np.nan)
+    prob_w = (grp.apply(lambda g: (g["Prob_Fail"] * g["CONF_EFECTIVO"]).sum()) / w).fillna(0).rename("Prob_peso_ship")
 
     resumen = pd.concat([
         grp["Rutas"].sum().rename("Rutas"),
@@ -3623,19 +3499,18 @@ def predict_failure(detalles_df: pd.DataFrame,
         prob_w
     ], axis=1).reset_index().sort_values("Shipments_riesgo", ascending=False).reset_index(drop=True)
 
-    # 9) Orden detalle
-    ord_dm = pd.CategoricalDtype(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
+    # Orden visual
     try:
+        ord_dm = pd.CategoricalDtype(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
         pred_df["DELIVERY_MOD"] = pred_df["DELIVERY_MOD"].astype(ord_dm)
-        pred_df = pred_df.sort_values(
-            ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_Fail"],
-            ascending=[True, True, True, True, False]
-        ).reset_index(drop=True)
+        pred_df = pred_df.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_Fail"],
+                                      ascending=[True, True, True, True, False]).reset_index(drop=True)
     except Exception:
         pass
 
     cols_res = ["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_peso_ship"]
-    cols_det = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"]
+    cols_det = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
+                "Prob_Fail","Rutas_riesgo","Shipments_riesgo"]
     return resumen[cols_res], pred_df[cols_det]
 
 
