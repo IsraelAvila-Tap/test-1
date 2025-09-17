@@ -3620,25 +3620,31 @@ def predict_failure(detalles_df: pd.DataFrame,
     except Exception:
         arer_raw = pd.DataFrame()
     
+    # Asegura DM_TRAIN en pred_df (ya lo calculaste antes, pero por si acaso)
+    pred_df["DM_TRAIN"] = _collapse_dm_for_training(pred_df["DELIVERY_MOD"])
+    
+    # Obtén recientes (devuelven DM_TRAIN, no DELIVERY_MOD)
+    SF_LOOKBACK_DAYS = locals().get("SF_LOOKBACK_DAYS", 30)
     full_recent, pool_recent = _get_recent_shortfall(arer_raw, days=SF_LOOKBACK_DAYS)
     
-    # 🔁 MERGE por DELIVERY_MOD (NO usar DM_TRAIN aquí)
+    # Tipos string para que el merge no falle por dtype
+    _as_str_cols(pred_df, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"])
+    _as_str_cols(full_recent, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"])
+    _as_str_cols(pool_recent, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"])
+    
+    # Merge 1: por combo completo (incluye MLP)
     pred_df = pred_df.merge(
-        full_recent.rename(columns={"SF_RECENT_30": "SF_RECENT_30"}),
-        left_on=["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"],
-        right_on=["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"],
+        full_recent,  # ya trae columna SF_RECENT_30
+        on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"],
         how="left"
     )
     
-    # Fallback sin MLP
+    # Merge 2 (fallback): sin MLP, rellena sólo donde falte
     miss = pred_df["SF_RECENT_30"].isna()
     if miss.any():
-        pred_df.loc[miss, "SF_RECENT_30"] = pred_df.loc[miss].merge(
-            pool_recent,
-            left_on=["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"],
-            right_on=["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"],
-            how="left"
-        )["SF_RECENT_30_POOL"].values
+        fill = pred_df.loc[miss, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"]] \
+                      .merge(pool_recent, on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], how="left")
+        pred_df.loc[miss, "SF_RECENT_30"] = fill["SF_RECENT_30_POOL"].values
     
     pred_df["SF_RECENT_30"] = pd.to_numeric(pred_df["SF_RECENT_30"], errors="coerce").fillna(0.0)
 
