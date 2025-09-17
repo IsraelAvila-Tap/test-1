@@ -3108,69 +3108,70 @@ def _add_calendar_feats(df, date_col="FECHA", country="MX"):
 
 def _label_from_arer_shortfall(arer: pd.DataFrame) -> pd.DataFrame:
     """
-    Shortfall proporcional por fila AR-ER.
+    Etiqueta de *riesgo proporcional de shortfall* a nivel fila AR-ER.
     SHORTFALL_PCT = max((CONF_EFECTIVO - EJECUTADO)/CONF_EFECTIVO, 0)
-    CONF_EFECTIVO = max(CONFIRMADO - CANCELACIONES_FORM, 0)
-    Filtra a D-1 (evita “futuros” sin ejecutar).
-    """
-    out_cols = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-                "CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
-                "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT"]
+    donde CONF_EFECTIVO = max(CONFIRMADO - CANCELACIONES_FORM, 0)
 
+    Además: filtra a D-1 (no usa el día actual ni futuro).
+    Devuelve columnas auxiliares para features.
+    """
     if arer is None or arer.empty:
-        return pd.DataFrame(columns=out_cols)
+        return pd.DataFrame(columns=[
+            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+            "CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
+            "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT"
+        ])
 
     df = arer.copy()
 
-    # --- headers tolerantes ---
+    # --- normaliza encabezados ---
     find_and_rename(df, ["Detalle MLP","MLP","Carrier","Proveedor"], "MLP", required=False, source_label="AR-ER")
     find_and_rename(df, ["SVC","Facility","LC","LOGISTIC_CENTER_ID"], "SVC", required=False, source_label="AR-ER")
     find_and_rename(df, ["DELIVERY_MODEL","DM","Delivery model","Modelo"], "DELIVERY_MOD", required=False, source_label="AR-ER")
     find_and_rename(df, ["VEHICLE TYPE H","Vehicle type","Tipo de vehículo","Vehículo"], "SHP_LG_VEHICLE_TYPE", required=False, source_label="AR-ER")
     find_and_rename(df, ["Mes, Día, Año de FECHA","Mes, dia, Año de FECHA","FECHA","OP_DT","DATE"], "FECHA", required=False, source_label="AR-ER")
     find_and_rename(df, ["CONFIRMADO","Confirmado"], "CONFIRMADO", required=False, source_label="AR-ER")
-    find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_FORM","CANCEL_FORM"], "CANCELACIONES_FORM", required=False, source_label="AR-ER")
     find_and_rename(df, ["EJECUTADO","Ejecutado"], "EJECUTADO", required=False, source_label="AR-ER")
+    find_and_rename(df, ["Cancelaciones Form","CANCELACIONES_FORM","CANCELACIONES"], "CANCELACIONES_FORM",
+                    required=False, source_label="AR-ER")
 
-    need = ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","FECHA","CONFIRMADO","EJECUTADO"]
-    if any(c not in df.columns for c in need):
-        return pd.DataFrame(columns=out_cols)
-
-    # --- FECHA robusta: siempre a datetime64[ns] ---
-    # 1) intenta con tu parser en español (si lo tienes)
-    try:
-        df["FECHA"] = parse_es_date_series(df["FECHA"])
-    except Exception:
-        pass
-    # 2) garantizamos datetime con coerce (cubre cuando parse_es_date_series deja objetos date/str)
-    df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
+    # --- tipos y limpieza ---
+    df["FECHA"] = parse_es_date_series(df["FECHA"])                     # -> date
     df = df[df["FECHA"].notna()].copy()
+    for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
+        df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
 
-    # --- corte D-1 ---
+    # --- filtro D-1 (usa hasta ayer inclusive) ---
     import datetime as _dt
-    cutoff = pd.Timestamp(_dt.date.today() - _dt.timedelta(days=1))
+    cutoff = _dt.date.today() - _dt.timedelta(days=1)
     df = df[df["FECHA"] <= cutoff].copy()
 
-    # --- tipos numéricos ---
-    for c in ["CONFIRMADO","EJECUTADO","CANCELACIONES_FORM"]:
-        if c not in df.columns:
-            df[c] = 0
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-
-    df["CONF_EFECTIVO"]  = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
-    den = df["CONF_EFECTIVO"].replace(0, np.nan)
-    df["SHORTFALL_PCT"] = ((df["CONF_EFECTIVO"] - df["EJECUTADO"]) / den).clip(lower=0).fillna(0.0)
-    df["SF_WEIGHT"]     = df["CONF_EFECTIVO"].clip(lower=0)
+    # --- métricas de shortfall proporcional ---
+    conf_efectivo = (df["CONFIRMADO"] - df["CANCELACIONES_FORM"]).clip(lower=0)
+    denom = conf_efectivo.replace(0, np.nan)
+    shortfall_pct = ((conf_efectivo - df["EJECUTADO"]) / denom).clip(lower=0).fillna(0.0)
+    df["CONF_EFECTIVO"] = conf_efectivo
+    df["SHORTFALL_PCT"] = shortfall_pct
+    df["SF_WEIGHT"] = conf_efectivo.clip(lower=1)  # peso por tamaño
 
     _as_str_cols(df, ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"])
 
-    # debug opcional
+    # --- debug en UI: muestra el rango de fechas realmente usado ---
     try:
-        st.caption(f"Shortfall medio (train): mean={df['SHORTFALL_PCT'].mean():.3f} · mediana={df['SHORTFALL_PCT'].median():.3f} · n={len(df)}")
+        import streamlit as st
+        dmin = df["FECHA"].min()
+        dmax = df["FECHA"].max()
+        st.caption(f"AR-ER para entrenamiento (D-1): {dmin} → {dmax} · cutoff={cutoff}")
+        vc = pd.cut(df["SHORTFALL_PCT"], bins=[-1,0,0.05,0.1,0.2,1.01]).value_counts().sort_index()
+        st.caption(f"Histograma SHORTFALL_PCT (conteos): {vc.to_dict()}")
     except Exception:
         pass
 
-    return df[out_cols]
+    return df[[
+        "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+        "CONFIRMADO","CANCELACIONES_FORM","EJECUTADO",
+        "CONF_EFECTIVO","SHORTFALL_PCT","SF_WEIGHT"
+    ]]
 
 
 def _attach_tabla2_spr(df_hist: pd.DataFrame) -> pd.DataFrame:
@@ -3390,6 +3391,34 @@ def _rolling_shortfall(df: pd.DataFrame) -> pd.DataFrame:
                               .reset_index(level=[0,1,2,3], drop=True)
     return d
 
+####
+def _recent_empirical_shortfall(arer_df: pd.DataFrame, lookback_days: int = 30) -> pd.DataFrame:
+    if arer_df is None or arer_df.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT"])
+    d = _label_from_arer_shortfall(arer_df)
+    if d.empty:
+        return pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT"])
+    import datetime as _dt
+    cutoff = (_dt.date.today() - _dt.timedelta(days=1))  # D-1
+    start  = cutoff - _dt.timedelta(days=lookback_days)
+    d = d[(d["FECHA"] >= start) & (d["FECHA"] <= cutoff)].copy()
+    g = (d.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
+           .apply(lambda x: np.average(x["SHORTFALL_PCT"], weights=x["SF_WEIGHT"]))
+           .rename("SF_RECENT").reset_index())
+    return g
+
+# …en tu flujo (por ejemplo, dentro del try que arma Tabla 4):
+try:
+    raw_arer_debug = read_sheet(SHEET_ID, get_tab_name("ar_er", ["AR-ER","AR ER","AR_ER","ARER"]))
+    emp = _recent_empirical_shortfall(raw_arer_debug, lookback_days=30)
+    if not emp.empty:
+        import streamlit as st
+        st.caption("Tasa empírica reciente de shortfall (30 días, ponderada por CONF_EFECTIVO) – primeras 10:")
+        st.dataframe(emp.head(10), use_container_width=True, hide_index=True)
+except Exception:
+    pass
+
+####
 
 @st.cache_resource(show_spinner=False)
 def _get_trained_model():
