@@ -4228,15 +4228,15 @@ try:
                     st.error("No se pudo calcular la Tabla 4 (riesgo de fallo).")
                     show_exception(e, "Tabla 4 (riesgo)")
 
-except Exception as e:
-    st.error("Ocurrió un error durante el cálculo.")
-    show_exception(e, "Traceback completo")
-dbg = (pred_df[pred_df["MLP"]=="99MINUTOS"]
-       [["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
-         "SF_RECENT_30","CONF_QTY","Prob_Fail"]]
-       .sort_values("Shipments", ascending=False).head(20))
-st.caption("Debug 99MINUTOS (recent suavizado y evidencia)")
-st.dataframe(dbg, use_container_width=True, hide_index=True)
+                except Exception as e:
+                    st.error("Ocurrió un error durante el cálculo.")
+                    show_exception(e, "Traceback completo")
+                dbg = (pred_df[pred_df["MLP"]=="99MINUTOS"]
+                       [["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
+                         "SF_RECENT_30","CONF_QTY","Prob_Fail"]]
+                       .sort_values("Shipments", ascending=False).head(20))
+                st.caption("Debug 99MINUTOS (recent suavizado y evidencia)")
+                st.dataframe(dbg, use_container_width=True, hide_index=True)
 
 
 # =========================
