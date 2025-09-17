@@ -3435,8 +3435,8 @@ def _collapse_dm_for_training(dm_series: pd.Series) -> pd.Series:
         .fillna("__NA__")
     )
 
-#SF_LOOKBACK_DAYS = 30 #####Ajustar parametros minimos de lectura
-#SF_MIN_CONF_DIA  = 50
+SF_LOOKBACK_DAYS = 30 #####Ajustar parametros minimos de lectura
+SF_MIN_CONF_DIA  = 50
 
 def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
                           prior_p: float = 0.08, prior_strength: int = 100):
