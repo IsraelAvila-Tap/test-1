@@ -3609,78 +3609,59 @@ def predict_failure(detalles_df: pd.DataFrame,
     pred_df["SPR_T2"] = pd.to_numeric(pred_df["SPR"], errors="coerce")
     pred_df["DM_TRAIN"] = _collapse_dm_for_training(pred_df["DELIVERY_MOD"])
     
-    # --- 6) Señal de corto plazo: SF_RECENT_30 (suavizado) ---
+    # --- 6) Señal de corto plazo: SF_RECENT_30 ---
     try:
         tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
         arer_raw = read_sheet(SHEET_ID, tab_arer)
     except Exception:
         arer_raw = pd.DataFrame()
-
-    # Normaliza llaves antes del merge
-    pred_df["DM_TRAIN"] = _collapse_dm_for_training(pred_df["DELIVERY_MOD"])
-    _as_str_cols(pred_df, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"])
-    pred_df["MLP"] = pred_df["MLP"].fillna("").astype(str).str.strip().str.upper()
-
-    # Recent (con suavizado y conteos)
+    
+    # Clave solo para el merge del recent (NO tocar columnas usadas por el modelo)
+    pred_df["DM_TRAIN"] = _collapse_dm_for_training(pred_df["DELIVERY_MOD"])  # solo para recent
+    pred_df["MLP_KEY"]  = pred_df["MLP"].astype(str).str.strip().str.upper()
+    
     SF_LOOKBACK_DAYS = locals().get("SF_LOOKBACK_DAYS", 30)
-    full_recent, pool_recent = _get_recent_shortfall(arer_raw, days=SF_LOOKBACK_DAYS,
-                                                     prior_p=0.08, prior_strength=100)
-    _as_str_cols(full_recent, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"])
-    full_recent["MLP"] = full_recent["MLP"].fillna("").astype(str).str.strip().str.upper()
-
-    # Merge 1: match completo
+    full_recent, pool_recent = _get_recent_shortfall(arer_raw, days=SF_LOOKBACK_DAYS)
+    
+    # Normaliza llaves en los dataframes de recent
+    full_recent = full_recent.copy()
+    full_recent["MLP_KEY"] = full_recent["MLP"].astype(str).str.strip().str.upper()
+    
+    # Merge 1: combo completo (incluye MLP_KEY)
     pred_df = pred_df.merge(
-        full_recent,
-        on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"],
+        full_recent.drop(columns=["MLP"], errors="ignore"),
+        on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP_KEY"],
         how="left"
     )
-
-    # Fallback por pool si falta
+    
+    # Merge 2: fallback sin MLP
     miss = pred_df["SF_RECENT_30"].isna()
     if miss.any():
-        pool_m = pred_df.loc[miss, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"]]\
+        pred_df.loc[miss, "SF_RECENT_30"] = (
+            pred_df.loc[miss, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"]]
             .merge(pool_recent, on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], how="left")
-        pred_df.loc[miss, "SF_RECENT_30"] = pool_m["SF_RECENT_30_POOL"].values
-        pred_df.loc[miss, "CONF_QTY"]     = pool_m["CONF_QTY_POOL"].values
-
-    pred_df["SF_RECENT_30"] = pd.to_numeric(pred_df["SF_RECENT_30"], errors="coerce").fillna(0.0).clip(0,1)
-    pred_df["CONF_QTY"]     = pd.to_numeric(pred_df["CONF_QTY"], errors="coerce").fillna(0.0)
-
-    # --- 7) Asegura columnas del modelo y predice (igual que ya tienes) ---
+            ["SF_RECENT_30_POOL"].values
+        )
+    
+    # Limpia la clave temporal
+    pred_df.drop(columns=["MLP_KEY"], inplace=True, errors="ignore")
+    pred_df["SF_RECENT_30"] = pd.to_numeric(pred_df["SF_RECENT_30"], errors="coerce").fillna(0.0)
+    pred_df["CONF_QTY"]     = pd.to_numeric(pred_df.get("CONF_QTY", 0), errors="coerce").fillna(0.0)
+    
+    # --- 7) Asegura todas las columnas que espera el modelo ---
     X_cols = list(model.features) if hasattr(model, "features") else []
     if not X_cols:
-        X_cols = ["SPR_T2","DOW","IS_WE","MES","SEM","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","SF_RECENT_30"]
-
+        X_cols = ["SPR_T2","DOW","IS_WE","MES","SEM","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"]
+    
     X_pred = pd.DataFrame(index=pred_df.index)
     for c in X_cols:
-        if c == "DELIVERY_MOD":
-            X_pred[c] = pred_df["DM_TRAIN"]
-        elif c in pred_df.columns:
+        # IMPORTANTE: ahora usamos el DELIVERY_MOD ORIGINAL y el MLP ORIGINAL
+        if c in pred_df.columns:
             X_pred[c] = pred_df[c]
         else:
             X_pred[c] = np.nan
-
-    try:
-        mdl = model.pipeline.predict(X_pred)
-    except Exception:
-        try:
-            mdl = model.pipeline.predict_proba(X_pred)[:, 1]
-        except Exception:
-            mdl = np.zeros(len(pred_df), dtype=float)
-
-    mdl = np.nan_to_num(np.asarray(mdl, dtype=float), nan=0.0, posinf=1.0, neginf=0.0).clip(0,1)
-
-    # --- Blend dinámico según evidencia reciente ---
-    # w = CONF_QTY / (CONF_QTY + prior_strength)
-    prior_strength = 100.0
-    w = (pred_df["CONF_QTY"] / (pred_df["CONF_QTY"] + prior_strength)).fillna(0.0).clip(0,1)
-    pred_df["Prob_Fail"] = ((1.0 - w) * mdl + w * pred_df["SF_RECENT_30"]).clip(0,1)
-
-    # Riesgos ponderados (igual)
-    pred_df["Rutas_riesgo"]     = pred_df["Prob_Fail"] * pd.to_numeric(pred_df["Rutas"], errors="coerce").fillna(0)
-    pred_df["Shipments_riesgo"] = pred_df["Prob_Fail"] * pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
-
-    # --- 8) Predicción del modelo ---
+    
+    # 8) Predicción
     try:
         shortfall = model.pipeline.predict(X_pred)
     except Exception:
@@ -3688,17 +3669,14 @@ def predict_failure(detalles_df: pd.DataFrame,
             shortfall = model.pipeline.predict_proba(X_pred)[:, 1]
         except Exception:
             shortfall = np.zeros(len(pred_df), dtype=float)
-
+    
     vals = np.asarray(shortfall, dtype=float)
     vals = np.nan_to_num(vals, nan=0.0, posinf=1.0, neginf=0.0)
     vals = np.clip(vals, 0.0, 1.0)
-    pred_df["Prob_Fail"] = pd.Series(vals, index=pred_df.index)
-
-    # Mezcla modelo + señal reciente
-    pred_df["Prob_Fail"] = (
-        0.5 * pd.to_numeric(pred_df["Prob_Fail"], errors="coerce").fillna(0.0) +
-        0.5 * pred_df["SF_RECENT_30"]
-    ).clip(0.0, 1.0)
+    
+    # Blend con recent ponderado por evidencia (CONF_QTY); satura a partir de 200 confirmados
+    w = np.clip(pred_df["CONF_QTY"] / 200.0, 0.0, 1.0)
+    pred_df["Prob_Fail"] = np.clip((1.0 - w) * vals + w * pred_df["SF_RECENT_30"], 0.0, 1.0)
 
     # --- 9) Riesgos ponderados ---
     pred_df["Rutas"]     = pd.to_numeric(pred_df["Rutas"], errors="coerce").fillna(0)
