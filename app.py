@@ -3633,7 +3633,7 @@ def predict_failure(detalles_df: pd.DataFrame,
         pred_df.loc[miss, "SF_RECENT_30"] = pred_df.loc[miss, ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"]]\
             .merge(pool_recent, on=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"], how="left")["SF_RECENT_30_POOL"].values
 
-    # ✅ Sanitiza la señal reciente
+    # Sanitiza señal reciente
     pred_df["SF_RECENT_30"] = pd.to_numeric(pred_df.get("SF_RECENT_30"), errors="coerce")\
                                    .fillna(0.0).clip(0.0, 1.0)
 
@@ -3665,7 +3665,7 @@ def predict_failure(detalles_df: pd.DataFrame,
     vals = np.clip(vals, 0.0, 1.0)
     pred_df["Prob_Fail"] = pd.Series(vals, index=pred_df.index)
 
-    # 🔧 Mezcla modelo + señal reciente (sin NaN)
+    # Mezcla modelo + señal reciente
     pred_df["Prob_Fail"] = (
         0.5 * pd.to_numeric(pred_df["Prob_Fail"], errors="coerce").fillna(0.0) +
         0.5 * pred_df["SF_RECENT_30"]
@@ -3707,8 +3707,6 @@ def predict_failure(detalles_df: pd.DataFrame,
     cols_det = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
                 "Prob_Fail","Rutas_riesgo","Shipments_riesgo"]
     return resumen[cols_res], pred_df[cols_det]
-
-
 
 
 # -----------------------------------------------------------------------------
