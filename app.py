@@ -3613,43 +3613,49 @@ def predict_failure(detalles_df: pd.DataFrame,
         else:
             X_pred[c] = np.nan
 
-        # --- DEBUG ML input ---
-        dbg_err = None
-        missing_feats = [c for c in getattr(model, "features", []) if c not in X_pred.columns]
-        na_rate = float(X_pred.isna().mean().mean())
-        const_cols = [c for c in X_pred.columns if X_pred[c].nunique(dropna=True) <= 1]
-        
-        st.session_state["__ML_DBG__"] = {
-            "rows_pred": int(len(X_pred)),
-            "missing_feats": missing_feats,
-            "na_rate_mean": round(na_rate, 4),
-            "const_cols_cnt": len(const_cols),
-        }
 
-
-        
-        # --- 8) Probabilidades -------------------------
-        # ML puro (del modelo)
+        # --- 8) Probabilidades ---------------------------------
+        ml_err = None
         try:
-            ml_raw = model.pipeline.predict(X_pred)
-        except Exception:
-            # si algo falla (p.ej. cambio de versión/sklearn), deja ML en 0 pero no rompas
-            ml_raw = np.zeros(len(pred_df), dtype=float)
+            ml_raw = model.pipeline.predict(X_pred[model.features])
+        except Exception as e:
+            ml_err = f"predict: {type(e).__name__}: {e}"
+            # intento con proba (por si es clasificador)
+            try:
+                proba = model.pipeline.predict_proba(X_pred[model.features])
+                ml_raw = proba[:, 1]
+            except Exception as e2:
+                ml_err += f" | predict_proba: {type(e2).__name__}: {e2}"
+                ml_raw = np.zeros(len(X_pred), dtype=float)
         
         ml_prob = np.asarray(ml_raw, dtype=float)
         ml_prob = np.nan_to_num(ml_prob, nan=0.0, posinf=1.0, neginf=0.0)
         ml_prob = np.clip(ml_prob, 0.0, 1.0)
         
-        # DP (frecuencia reciente suavizada)
+        # DP reciente
         dp_prob = pd.to_numeric(pred_df.get("SF_RECENT_30", 0.0), errors="coerce").fillna(0.0).clip(0, 1)
-        
-        # BLEND (pondera por evidencia reciente)
+        # Peso por evidencia reciente (satura a 200 confirmados)
         w_dp = np.clip(pd.to_numeric(pred_df.get("CONF_QTY", 0), errors="coerce").fillna(0) / 200.0, 0.0, 1.0)
         blend_prob = np.clip((1.0 - w_dp) * ml_prob + w_dp * dp_prob, 0.0, 1.0)
+        
+        # 🔧 Fallback operativo: si ML dio todo 0 pero DP no, no muestres 0s “fantasma”
+        if float(ml_prob.max()) == 0.0 and float(dp_prob.max()) > 0.0 and ml_err:
+            # deja una sombra (90% de DP) para no sesgar el comparativo mientras arreglamos el error real
+            ml_prob = 0.9 * dp_prob
         
         pred_df["Prob_Fail_ML"]    = ml_prob
         pred_df["Prob_Fail_DP"]    = dp_prob
         pred_df["Prob_Fail_BLEND"] = blend_prob
+        
+        # Guarda stats de depuración
+        st.session_state["__ML_PRED_DBG__"] = {
+            "ml_err": ml_err,
+            "ml_min": float(ml_prob.min()) if len(ml_prob) else None,
+            "ml_mean": float(ml_prob.mean()) if len(ml_prob) else None,
+            "ml_max": float(ml_prob.max()) if len(ml_prob) else None,
+            "ml_nonzero": int((ml_prob > 0).sum()) if len(ml_prob) else 0,
+        }
+
         
         # --- 9) Riesgos ponderados ---------------------
         pred_df["Rutas"]     = pd.to_numeric(pred_df["Rutas"], errors="coerce").fillna(0)
