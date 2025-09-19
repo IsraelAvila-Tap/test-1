@@ -3613,6 +3613,21 @@ def predict_failure(detalles_df: pd.DataFrame,
         else:
             X_pred[c] = np.nan
 
+        # --- DEBUG ML input ---
+        dbg_err = None
+        missing_feats = [c for c in getattr(model, "features", []) if c not in X_pred.columns]
+        na_rate = float(X_pred.isna().mean().mean())
+        const_cols = [c for c in X_pred.columns if X_pred[c].nunique(dropna=True) <= 1]
+        
+        st.session_state["__ML_DBG__"] = {
+            "rows_pred": int(len(X_pred)),
+            "missing_feats": missing_feats,
+            "na_rate_mean": round(na_rate, 4),
+            "const_cols_cnt": len(const_cols),
+        }
+
+
+        
         # --- 8) Probabilidades -------------------------
         # ML puro (del modelo)
         try:
