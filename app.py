@@ -3612,92 +3612,74 @@ def predict_failure(detalles_df: pd.DataFrame,
             X_pred[c] = pred_df[c]
         else:
             X_pred[c] = np.nan
-    
-        # 8) Predicción ML pura
+
+        # --- 8) Probabilidades -------------------------
+        # ML puro (del modelo)
         try:
-            y_hat = model.pipeline.predict(X_pred)
+            ml_raw = model.pipeline.predict(X_pred)
         except Exception:
-            try:
-                y_hat = model.pipeline.predict_proba(X_pred)[:, 1]
-            except Exception:
-                y_hat = np.zeros(len(pred_df), dtype=float)
-    
-        y_hat = np.asarray(y_hat, dtype=float)
-        y_hat = np.nan_to_num(y_hat, nan=0.0, posinf=1.0, neginf=0.0)
-        y_hat = np.clip(y_hat, 0.0, 1.0)
-    
-        # Señal DP = reciente (ya anexada arriba en SF_RECENT_30)
-        pred_df["Prob_Fail_ML"] = y_hat
-        pred_df["Prob_Fail_DP"] = pred_df["SF_RECENT_30"].clip(0.0, 1.0)
-    
-        # (Opcional) Blend si quieres conservarlo para diagnóstico
-        w = np.clip(pred_df["CONF_QTY"] / 200.0, 0.0, 1.0)
-        pred_df["Prob_Fail_BLEND"] = np.clip(
-            (1.0 - w) * pred_df["Prob_Fail_ML"] + w * pred_df["Prob_Fail_DP"],
-            0.0, 1.0
-        )
-    
-        # --- 9) Riesgos ponderados (para ML y DP por separado) ---
+            # si algo falla (p.ej. cambio de versión/sklearn), deja ML en 0 pero no rompas
+            ml_raw = np.zeros(len(pred_df), dtype=float)
+        
+        ml_prob = np.asarray(ml_raw, dtype=float)
+        ml_prob = np.nan_to_num(ml_prob, nan=0.0, posinf=1.0, neginf=0.0)
+        ml_prob = np.clip(ml_prob, 0.0, 1.0)
+        
+        # DP (frecuencia reciente suavizada)
+        dp_prob = pd.to_numeric(pred_df.get("SF_RECENT_30", 0.0), errors="coerce").fillna(0.0).clip(0, 1)
+        
+        # BLEND (pondera por evidencia reciente)
+        w_dp = np.clip(pd.to_numeric(pred_df.get("CONF_QTY", 0), errors="coerce").fillna(0) / 200.0, 0.0, 1.0)
+        blend_prob = np.clip((1.0 - w_dp) * ml_prob + w_dp * dp_prob, 0.0, 1.0)
+        
+        pred_df["Prob_Fail_ML"]    = ml_prob
+        pred_df["Prob_Fail_DP"]    = dp_prob
+        pred_df["Prob_Fail_BLEND"] = blend_prob
+        
+        # --- 9) Riesgos ponderados ---------------------
         pred_df["Rutas"]     = pd.to_numeric(pred_df["Rutas"], errors="coerce").fillna(0)
         pred_df["Shipments"] = pd.to_numeric(pred_df["Shipments"], errors="coerce").fillna(0)
-    
-        for key in ["ML", "DP", "BLEND"]:
-            p = pred_df[f"Prob_Fail_{key}"]
-            pred_df[f"Rutas_riesgo_{key}"]     = p * pred_df["Rutas"]
-            pred_df[f"Shipments_riesgo_{key}"] = p * pred_df["Shipments"]
-    
-        # --- 10) Resumen por SVC, con ML y DP (y BLEND opcional) ---
+        
+        for k in ["ML","DP","BLEND"]:
+            pred_df[f"Rutas_riesgo_{k}"]     = pred_df[f"Prob_Fail_{k}"] * pred_df["Rutas"]
+            pred_df[f"Shipments_riesgo_{k}"] = pred_df[f"Prob_Fail_{k}"] * pred_df["Shipments"]
+        
+        # --- 10) Resumen por SVC -----------------------
         grp = pred_df.groupby("SVC", dropna=False)
         ship_sum = grp["Shipments"].sum().replace(0, np.nan)
-    
-        resumen = pd.concat([
-            grp["Rutas"].sum().rename("Rutas"),
-            grp["Shipments"].sum().rename("Shipments"),
-    
-            grp["Rutas_riesgo_ML"].sum().rename("Rutas_riesgo_ML"),
-            grp["Shipments_riesgo_ML"].sum().rename("Shipments_riesgo_ML"),
-            (grp.apply(lambda g: (g["Prob_Fail_ML"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_fallar_ML"),
-    
-            grp["Rutas_riesgo_DP"].sum().rename("Rutas_riesgo_DP"),
-            grp["Shipments_riesgo_DP"].sum().rename("Shipments_riesgo_DP"),
-            (grp.apply(lambda g: (g["Prob_Fail_DP"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_fallar_DP"),
-    
-            # Deja BLEND por si lo quieres mostrar/ocultar
-            grp["Rutas_riesgo_BLEND"].sum().rename("Rutas_riesgo_BLEND"),
-            grp["Shipments_riesgo_BLEND"].sum().rename("Shipments_riesgo_BLEND"),
-            (grp.apply(lambda g: (g["Prob_Fail_BLEND"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_fallar_BLEND"),
-        ], axis=1).reset_index()
-    
-        # Orden sugerido por Shipments_riesgo (ML)
-        resumen = resumen.sort_values("Shipments_riesgo_ML", ascending=False).reset_index(drop=True)
-    
-        # --- 11) Orden del detalle (con nuevas columnas) ---
-        try:
-            ord_dm = pd.CategoricalDtype(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
-            pred_df["DELIVERY_MOD"] = pred_df["DELIVERY_MOD"].astype(ord_dm)
-            pred_df = pred_df.sort_values(
-                ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_Fail_ML"],
-                ascending=[True, True, True, True, False]
-            ).reset_index(drop=True)
-        except Exception:
-            pass
-    
-        # Columnas de salida (detalle con ML & DP)
+        
+        resumen = pd.DataFrame({
+            "SVC": grp.size().index,
+            "Rutas": grp["Rutas"].sum().values,
+            "Shipments": grp["Shipments"].sum().values,
+        })
+        
+        for k in ["ML","DP","BLEND"]:
+            resumen[f"Rutas_riesgo_{k}"]     = grp[f"Rutas_riesgo_{k}"].sum().values
+            resumen[f"Shipments_riesgo_{k}"] = grp[f"Shipments_riesgo_{k}"].sum().values
+            prob_k = (grp.apply(lambda g: (g[f"Prob_Fail_{k}"] * g["Shipments"]).sum()) / ship_sum).fillna(0)
+            resumen[f"Prob_fallar_{k}"] = prob_k.values
+        
+        # --- 11) Orden y columnas de salida ------------
         cols_det = [
-            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-            "Rutas","Shipments",
+            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
             "Prob_Fail_ML","Prob_Fail_DP","Prob_Fail_BLEND",
             "Rutas_riesgo_ML","Rutas_riesgo_DP","Rutas_riesgo_BLEND",
-            "Shipments_riesgo_ML","Shipments_riesgo_DP","Shipments_riesgo_BLEND"
+            "Shipments_riesgo_ML","Shipments_riesgo_DP","Shipments_riesgo_BLEND",
         ]
+        for c in cols_det:
+            if c not in pred_df.columns: pred_df[c] = 0
+        
         cols_res = [
             "SVC","Rutas","Shipments",
             "Rutas_riesgo_ML","Shipments_riesgo_ML","Prob_fallar_ML",
             "Rutas_riesgo_DP","Shipments_riesgo_DP","Prob_fallar_DP",
-            "Rutas_riesgo_BLEND","Shipments_riesgo_BLEND","Prob_fallar_BLEND"
+            "Rutas_riesgo_BLEND","Shipments_riesgo_BLEND","Prob_fallar_BLEND",
         ]
+        for c in cols_res:
+            if c not in resumen.columns: resumen[c] = 0
+        
         return resumen[cols_res], pred_df[cols_det]
-
 
 
 # -----------------------------------------------------------------------------
