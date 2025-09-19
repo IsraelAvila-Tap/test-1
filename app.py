@@ -4213,23 +4213,7 @@ try:
                                 "Shipments_riesgo_ML": fmt_num0, "Shipments_riesgo_DP": fmt_num0, "Shipments_riesgo_BLEND": fmt_num0,
                             })
                             st.dataframe(det_style, use_container_width=True, hide_index=True)
-
-                
-                        with st.expander("Ver detalle por día × DM × vehículo × MLP", expanded=False):
-                            det_show = detalle_riesgo.copy()
-                            for c in ["Rutas", "Shipments", "Rutas_riesgo", "Shipments_riesgo", "Prob_Fail"]:
-                                if c in det_show.columns:
-                                    det_show[c] = pd.to_numeric(det_show[c], errors="coerce")
-                
-                            det_style = det_show.style.format({
-                                "Rutas": num0f,
-                                "Shipments": num0f,
-                                "Rutas_riesgo": num0f,
-                                "Shipments_riesgo": num0f,
-                                "Prob_Fail": pct1f,
-                            })
-                            st.dataframe(det_style, use_container_width=True, hide_index=True)
-                
+               
                         # Guarda en session_state por si lo usas en otros módulos
                         st.session_state["riesgo_resumen_svc"] = resumen_svc.copy()
                         st.session_state["riesgo_detalle"] = detalle_riesgo.copy()
