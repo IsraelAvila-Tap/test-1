@@ -4118,7 +4118,7 @@ def _prep_pred_table(detalles_df: pd.DataFrame, tabla3_df: pd.DataFrame) -> pd.D
     t3["Shipments"] = (t3["Rutas"] * t3["SPR_T2"]).round().astype(int)
     return t3
 
-def _predict_one_torch(pred_df: pd.DataFrame, tfm: TorchFailureModel) -> np.ndarray:
+def _predict_one_torch(pred_df: pd.DataFrame, tfm: "TorchFailureModel") -> np.ndarray:
     if pred_df is None or pred_df.empty:
         return np.zeros(0)
     # asegura columnas
