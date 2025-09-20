@@ -3779,18 +3779,34 @@ def _cardinality_from_indexer(idx_val) -> int:
 
 # ---------- Embedding + MLP compartidos ----------
 # ---------- bloques comunes ----------
-from typing import Any, Dict, List, Tuple
+# --- Embeddings compartidos (robusto a indexers=int o dict) ---
+from typing import Any, Dict, List
+
+def _cardinality_from_indexer(ix_val: Any) -> int:
+    if isinstance(ix_val, dict):
+        return len(ix_val)  # ids 1..N (0 reservado)
+    try:
+        return int(ix_val)
+    except Exception:
+        return 0
+
 class EmbeddingBlock(nn.Module):
     """
     Embeddings compartidos: misma dimensión para todas las columnas categóricas.
-    Soporta indexers[col] como dict {token:id} o como entero (n_categorías).
+    Soporta indexers como int (cardinalidad) o dict token->id.
     """
-    def __init__(self, indexers: Dict[str, Any], cat_cols: List[str], emb_dim: int = 16):
+    def __init__(self, indexers: Dict[str, Any], cat_cols: List[str], emb_dim: int | None = 16):
         super().__init__()
         self.cat_cols = list(cat_cols)
-        self.emb_dim = int(emb_dim)
+        # fallback seguro si viene None
+        self.emb_dim = int(emb_dim) if emb_dim is not None else 16
+
         self.embs = nn.ModuleDict({
-            c: nn.Embedding(_vocab_size(indexers, c), self.emb_dim, padding_idx=0)
+            c: nn.Embedding(
+                num_embeddings=_cardinality_from_indexer(indexers.get(c, 0)) + 1,  # +1 por UNK/padding=0
+                embedding_dim=self.emb_dim,
+                padding_idx=0
+            )
             for c in self.cat_cols
         })
         self.out_dim = self.emb_dim * len(self.cat_cols)
@@ -3798,10 +3814,10 @@ class EmbeddingBlock(nn.Module):
     def forward(self, x_cat_list: List[torch.Tensor]) -> torch.Tensor:
         if not self.cat_cols or not x_cat_list:
             B = x_cat_list[0].size(0) if x_cat_list else 1
-            # usa CPU si aún no hay pesos creados
-            dev = next(self.embs.parameters()).device if len(self.embs) else "cpu"
+            # usa el device del primer emb si existe
+            dev = next(iter(self.embs.values())).weight.device if len(self.embs) else "cpu"
             return torch.zeros(B, 0, device=dev)
-        toks = [self.embs[c](x) for c, x in zip(self.cat_cols, x_cat_list)]
+        toks = [self.embs[c](x) for c, x in zip(self.cat_cols, x_cat_list)]  # [B, emb_dim] c/u
         return torch.cat(toks, dim=1)  # [B, emb_dim * |C|]
 
 class MLP(nn.Module):
@@ -4140,23 +4156,25 @@ def build_training_table_for_dl(window_days: int = 730) -> Tuple[pd.DataFrame, L
 
     return ydf, NUM_COLS, CAT_COLS
 
-
-
-
-
 from typing import Optional
 
 def train_torch_failure_model(
     model_kind: str = "mlp",
     epochs: int = 25,
     lr: float = 1e-3,
-    bs: int = 512
+    bs: int = 512,
+    emb_dim: int = 16,        # tamaño de embedding para MLP/Wide&Deep
+    d_model: int = 32,        # tamaño de token para TabTransformer
+    nhead: int = 4,
+    nlayers: int = 2,
+    dropout_p: float = 0.10,
 ) -> Optional["TorchFailureModel"]:
+    # --- datos de entrenamiento ---
     ydf, NUM_COLS, CAT_COLS = build_training_table_for_dl()
     if ydf is None or ydf.empty:
         return None
 
-    indexers = _build_indexers(ydf, CAT_COLS)
+    indexers = _build_indexers(ydf, CAT_COLS)  # {col: dict token->id}
 
     # split temporal 80/20
     n = len(ydf)
@@ -4169,25 +4187,31 @@ def train_torch_failure_model(
     valid_ds = SFDataset(valid_df, NUM_COLS, CAT_COLS, indexers,
                          y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
 
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, drop_last=False)
+    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,  drop_last=False)
     valid_loader = DataLoader(valid_ds, batch_size=bs, shuffle=False, drop_last=False)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # instancia del modelo
+    # --- instancia del modelo (con emb_dim/d_model explícitos) ---
     mk = (model_kind or "mlp").lower()
     if mk == "mlp":
-        net = DL_MLP_Emb(indexers, CAT_COLS, num_dim=len(NUM_COLS))
+        # Deep puro: embeddings + numéricas -> MLP (LOGITS)
+        net = DL_MLP_Emb(indexers, CAT_COLS, num_dim=len(NUM_COLS), emb_dim=int(emb_dim))
     elif mk in ("wide", "wide_deep", "widedeep"):
-        net = DL_WideDeep(indexers, CAT_COLS, num_dim=len(NUM_COLS))
+        # Wide & Deep: wide (lineal por categoría) + deep (embeddings + MLP), suma de LOGITS
+        net = DL_WideDeep(indexers, CAT_COLS, num_dim=len(NUM_COLS), emb_dim=int(emb_dim))
     else:  # "tabtr", "tab", "transformer"
-        net = DL_TabTransformer(indexers, CAT_COLS, num_dim=len(NUM_COLS),
-                                d_model=32, nhead=4, nlayers=2)
+        # TabTransformer-lite: misma dim por token = d_model
+        net = DL_TabTransformer(
+            indexers, CAT_COLS, num_dim=len(NUM_COLS),
+            d_model=int(d_model), nhead=int(nhead), nlayers=int(nlayers), p=float(dropout_p)
+        )
 
+    # --- entrenamiento ---
     net = _train_loop(net, train_loader, valid_loader, device, epochs=epochs, lr=lr)
 
     return TorchFailureModel(
-        name=model_kind,
+        name=mk,
         model=net,
         indexers=indexers,
         num_cols=NUM_COLS,
