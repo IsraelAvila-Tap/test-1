@@ -5085,23 +5085,7 @@ try:
                     )
                 st.dataframe(tabla3, use_container_width=True, hide_index=True)
 
-                
-                 with st.expander("🔎 Debug SRM & Score", expanded=False):
-                    try:
-                        _caps_dbg = load_srm_caps_by_mlp_detailed()
-                        _scor_dbg = load_mlp_score_from_arer()
-                        st.caption("Caps por MLP (primeras 12 filas)")
-                        st.dataframe(_caps_dbg.head(12), use_container_width=True, hide_index=True)
-
-                        raw_srm__dbg = read_sheet(SHEET_ID, SHEET_TABS.get("srm", "SRM"))
-                        st.caption(f"SRM columnas (primeras 30): {list(raw_srm__dbg.columns)[:30]}")
-                        st.caption("Score por MLP (primeras 12 filas)")
-                        st.dataframe(_scor_dbg.head(12), use_container_width=True, hide_index=True)
-                    except Exception as e:
-                        show_exception(e, "Debug SRM/Score")
-
-
-                
+            
                 # === Tabla 4 — Riesgo de fallo (DL, PyTorch) ===
                 
                 st.markdown("### Tabla 4 — Riesgo de fallo (DL, PyTorch)")
