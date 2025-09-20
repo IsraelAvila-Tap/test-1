@@ -4250,64 +4250,93 @@ from typing import Optional
 
 def train_torch_failure_model(
     model_kind: str = "mlp",
-    epochs: int = 25,
-    lr: float = 1e-3,
-    bs: int = 512,
+    epochs: int = 50,
+    lr: float = 5e-3,
+    bs: int = 256,
     emb_dim: int = 16,        # tamaño de embedding para MLP/Wide&Deep
     d_model: int = 32,        # tamaño de token para TabTransformer
     nhead: int = 4,
     nlayers: int = 2,
-    dropout_p: float = 0.10,
+    dropout_p: float = 0.15,
 ) -> Optional["TorchFailureModel"]:
-    # --- datos de entrenamiento ---
-    ydf, NUM_COLS, CAT_COLS = build_training_table_for_dl()
-    if ydf is None or ydf.empty:
-        return None
+    try:
+        print(f"🔍 DEBUG: Iniciando entrenamiento de {model_kind}")
+        
+        # --- datos de entrenamiento ---
+        ydf, NUM_COLS, CAT_COLS = build_training_table_for_dl()
+        if ydf is None or ydf.empty:
+            print(f"❌ ERROR: No hay datos de entrenamiento para {model_kind}")
+            return None
 
-    indexers = _build_indexers(ydf, CAT_COLS)  # {col: dict token->id}
+        # Verificar que hay suficientes datos con shortfall > 0
+        positive_shortfall = (ydf["SHORTFALL_PCT"] > 0).sum()
+        if positive_shortfall < 10:
+            print(f"❌ ERROR: Muy pocos datos con shortfall > 0: {positive_shortfall}")
+            return None
 
-    # split temporal 80/20
-    n = len(ydf)
-    cut = int(n * 0.8)
-    train_df = ydf.iloc[:cut].reset_index(drop=True)
-    valid_df = ydf.iloc[cut:].reset_index(drop=True)
+        print(f"✅ DEBUG: Datos de entrenamiento OK - {len(ydf)} filas, {positive_shortfall} con shortfall > 0")
 
-    train_ds = SFDataset(train_df, NUM_COLS, CAT_COLS, indexers,
-                         y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
-    valid_ds = SFDataset(valid_df, NUM_COLS, CAT_COLS, indexers,
-                         y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
+        indexers = _build_indexers(ydf, CAT_COLS)  # {col: dict token->id}
+        print(f"🔍 DEBUG: Indexers creados para: {list(indexers.keys())}")
 
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,  drop_last=False)
-    valid_loader = DataLoader(valid_ds, batch_size=bs, shuffle=False, drop_last=False)
+        # split temporal 80/20
+        n = len(ydf)
+        cut = int(n * 0.8)
+        train_df = ydf.iloc[:cut].reset_index(drop=True)
+        valid_df = ydf.iloc[cut:].reset_index(drop=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"🔍 DEBUG: Split - Train: {len(train_df)}, Valid: {len(valid_df)}")
 
-    # --- instancia del modelo (con emb_dim/d_model explícitos) ---
-    mk = (model_kind or "mlp").lower()
-    if mk == "mlp":
-        # Deep puro: embeddings + numéricas -> MLP (LOGITS)
-        net = DL_MLP_Emb(indexers, CAT_COLS, num_dim=len(NUM_COLS), emb_dim=int(emb_dim))
-    elif mk in ("wide", "wide_deep", "widedeep"):
-        # Wide & Deep: wide (lineal por categoría) + deep (embeddings + MLP), suma de LOGITS
-        net = DL_WideDeep(indexers, CAT_COLS, num_dim=len(NUM_COLS), emb_dim=int(emb_dim))
-    else:  # "tabtr", "tab", "transformer"
-        # TabTransformer-lite: misma dim por token = d_model
-        net = DL_TabTransformer(
-            indexers, CAT_COLS, num_dim=len(NUM_COLS),
-            d_model=int(d_model), nhead=int(nhead), nlayers=int(nlayers), p=float(dropout_p)
+        train_ds = SFDataset(train_df, NUM_COLS, CAT_COLS, indexers,
+                             y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
+        valid_ds = SFDataset(valid_df, NUM_COLS, CAT_COLS, indexers,
+                             y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
+
+        train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,  drop_last=False)
+        valid_loader = DataLoader(valid_ds, batch_size=bs, shuffle=False, drop_last=False)
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"🔍 DEBUG: Usando device: {device}")
+
+        # --- instancia del modelo (con emb_dim/d_model explícitos) ---
+        mk = (model_kind or "mlp").lower()
+        print(f"🔍 DEBUG: Creando modelo {mk}")
+        
+        if mk == "mlp":
+            # Deep puro: embeddings + numéricas -> MLP (LOGITS)
+            net = DL_MLP_Emb(indexers, CAT_COLS, num_dim=len(NUM_COLS), emb_dim=int(emb_dim))
+        elif mk in ("wide", "wide_deep", "widedeep"):
+            # Wide & Deep: wide (lineal por categoría) + deep (embeddings + MLP), suma de LOGITS
+            net = DL_WideDeep(indexers, CAT_COLS, num_dim=len(NUM_COLS), emb_dim=int(emb_dim))
+        else:  # "tabtr", "tab", "transformer"
+            # TabTransformer-lite: misma dim por token = d_model
+            net = DL_TabTransformer(
+                indexers, CAT_COLS, num_dim=len(NUM_COLS),
+                d_model=int(d_model), nhead=int(nhead), nlayers=int(nlayers), p=float(dropout_p)
+            )
+
+        print(f"✅ DEBUG: Modelo {mk} creado exitosamente")
+
+        # --- entrenamiento ---
+        net = _train_loop(net, train_loader, valid_loader, device, epochs=epochs, lr=lr)
+
+        result = TorchFailureModel(
+            name=mk,
+            model=net,
+            indexers=indexers,
+            num_cols=NUM_COLS,
+            cat_cols=CAT_COLS,
+            device=device
         )
-
-    # --- entrenamiento ---
-    net = _train_loop(net, train_loader, valid_loader, device, epochs=epochs, lr=lr)
-
-    return TorchFailureModel(
-        name=mk,
-        model=net,
-        indexers=indexers,
-        num_cols=NUM_COLS,
-        cat_cols=CAT_COLS,
-        device=device
-    )
+        
+        print(f"✅ DEBUG: Modelo {mk} entrenado y empaquetado exitosamente")
+        return result
+        
+    except Exception as e:
+        print(f"❌ ERROR en entrenamiento de {model_kind}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 
@@ -4438,13 +4467,38 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
         return empty_res, empty_det
 
     # ---------------- DL (3 modelos) ----------------
-    models = {k: _get_torch_model_cached(k) for k in kinds}
+    print(f"🔍 DEBUG: Entrenando modelos DL: {kinds}")
+    models = {}
+    for k in kinds:
+        print(f"🚀 DEBUG: Entrenando modelo {k}...")
+        model = _get_torch_model_cached(k)
+        if model is not None:
+            models[k] = model
+            print(f"✅ DEBUG: Modelo {k} entrenado exitosamente")
+        else:
+            print(f"❌ ERROR: Modelo {k} falló en el entrenamiento")
+    
     out = base.copy()
+    print(f"🔍 DEBUG: Modelos disponibles: {list(models.keys())}")
 
     name_map = {"mlp":"Prob_DL_MLP", "wide_deep":"Prob_DL_WD", "wide":"Prob_DL_WD", "tabtr":"Prob_DL_TT"}
     for k, tfm in models.items():
         col = name_map.get(k, k)
-        out[col] = _predict_one_torch(out, tfm)
+        print(f"🔍 DEBUG: Prediciendo con modelo {k} -> {col}")
+        predictions = _predict_one_torch(out, tfm)
+        
+        # Validar que las predicciones no sean todas 0 o NaN
+        if predictions is not None and len(predictions) > 0:
+            valid_preds = predictions[~np.isnan(predictions)]
+            if len(valid_preds) > 0 and valid_preds.max() > 0:
+                out[col] = predictions
+                print(f"✅ DEBUG: {col} - min: {predictions.min():.4f}, max: {predictions.max():.4f}, >0: {(predictions > 0).sum()}")
+            else:
+                print(f"⚠️ WARNING: {col} - todas las predicciones son 0 o NaN, usando DP como fallback")
+                out[col] = out["Prob_DP"]  # Usar DP como fallback
+        else:
+            print(f"❌ ERROR: {col} - predicciones inválidas, usando DP como fallback")
+            out[col] = out["Prob_DP"]  # Usar DP como fallback
 
     # ---------------- DP reciente (fallback) ----------------
     try:
