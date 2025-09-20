@@ -3740,22 +3740,58 @@ def _cats_to_idx(df: pd.DataFrame, col: str, mapping: Dict[str,int]) -> np.ndarr
 
 # ---------- dataset ----------
 class SFDataset(Dataset):
-    def __init__(self, df, num_cols, cat_cols, indexers, y_col=None, w_col=None):
-        Xn = df[num_cols].astype(float).fillna(0.0).values if num_cols else np.zeros((len(df), 0), dtype=np.float32)
-        self.x_num = torch.tensor(Xn, dtype=torch.float32)
-        self.x_cat = [torch.tensor(_cats_to_idx(df, c, indexers[c]), dtype=torch.long) for c in cat_cols]
-        self.y = torch.tensor(df[y_col].astype(float).values, dtype=torch.float32) if y_col else None
-        if w_col and w_col in df.columns:
-            w = df[w_col].astype(float).fillna(0.0).values
-            # normaliza pesos para estabilidad numérica
-            self.w = torch.tensor(w / (w.mean() + 1e-9), dtype=torch.float32)
+    """
+    Dataset para (x_num, x_cats, y, w) con y/w opcionales.
+    - En entrenamiento: devuelve (x_num, x_cats, y, w)
+    - En inferencia:    devuelve (x_num, x_cats)
+    """
+    def __init__(self,
+                 df: pd.DataFrame,
+                 num_cols: List[str],
+                 cat_cols: List[str],
+                 indexers: Dict[str, Dict[str, int]],
+                 y_col: str | None = "SHORTFALL_PCT",
+                 w_col: str | None = "SF_WEIGHT"):
+        self.num_cols = list(num_cols)
+        self.cat_cols = list(cat_cols)
+        self.indexers = indexers
+
+        # Numéricas
+        self.Xn = df[self.num_cols].to_numpy(dtype=np.float32) if self.num_cols else np.zeros((len(df), 0), np.float32)
+
+        # Categóricas -> ids (0=UNK)
+        self.Xc = []
+        for c in self.cat_cols:
+            vals = df[c].astype(str).fillna("")
+            ix = self.indexers.get(c, {})
+            codes = np.array([ix.get(v, 0) for v in vals], dtype=np.int64)
+            self.Xc.append(codes)
+
+        # Etiquetas/pesos (opcionales)
+        self.has_y = (y_col is not None) and (y_col in df.columns)
+        self.has_w = (w_col is not None) and (w_col in df.columns)
+
+        self.y = df[y_col].to_numpy(dtype=np.float32) if self.has_y else None
+        # Normaliza pesos para estabilidad si existen; si no, se usa 1.0 en __getitem__
+        if self.has_w:
+            w = df[w_col].to_numpy(dtype=np.float32)
+            self.w = (w / (w.mean() + 1e-9)).astype(np.float32)
         else:
             self.w = None
-    def __len__(self): return len(self.x_num)
-    def __getitem__(self, i):
-        cats = [xc[i] for xc in self.x_cat]
-        if self.y is None: return self.x_num[i], cats
-        return self.x_num[i], cats, self.y[i], (self.w[i] if self.w is not None else torch.tensor(1.0))
+
+    def __len__(self):
+        return len(self.Xn)
+
+    def __getitem__(self, i: int):
+        xn = torch.tensor(self.Xn[i], dtype=torch.float32)
+        xc = [torch.tensor(arr[i], dtype=torch.long) for arr in self.Xc]
+        if not self.has_y:
+            # Inferencia
+            return xn, xc
+        # Entrenamiento / validación
+        y  = torch.tensor(self.y[i], dtype=torch.float32)
+        w  = torch.tensor(self.w[i], dtype=torch.float32) if self.w is not None else torch.tensor(1.0, dtype=torch.float32)
+        return xn, xc, y, w
 # --- helpers de cardinalidad / embs ---
 def _emb_dim(n: int) -> int:
     # regla estándar para embeddings tabulares
