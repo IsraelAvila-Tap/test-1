@@ -4111,46 +4111,6 @@ def _build_indexers(df: pd.DataFrame, cat_cols: List[str]) -> Dict[str, Dict[str
         indexers[c] = {tok: i + 1 for i, tok in enumerate(cats)}  # 1..N
     return indexers
 
-class SFDataset(Dataset):
-    """
-    Dataset para (x_num, x_cats, y, w)
-    - x_num: float32 [B, n_num]
-    - x_cats: lista de long [B] (una por columna categórica)
-    - y: float32 [B]  (SHORTFALL_PCT)
-    - w: float32 [B]  (SF_WEIGHT)
-    """
-    def __init__(self,
-                 df: pd.DataFrame,
-                 num_cols: List[str],
-                 cat_cols: List[str],
-                 indexers: Dict[str, Dict[str, int]],
-                 y_col: str = "SHORTFALL_PCT",
-                 w_col: str = "SF_WEIGHT"):
-        self.num_cols = list(num_cols)
-        self.cat_cols = list(cat_cols)
-        self.indexers = indexers
-
-        self.Xn = df[self.num_cols].to_numpy(dtype=np.float32) if self.num_cols else np.zeros((len(df), 0), np.float32)
-
-        self.Xc = []
-        for c in self.cat_cols:
-            vals = df[c].astype(str).fillna("")
-            ix = self.indexers.get(c, {})
-            codes = np.array([ix.get(v, 0) for v in vals], dtype=np.int64)  # 0 = UNK
-            self.Xc.append(codes)
-
-        self.y = df[y_col].to_numpy(dtype=np.float32)
-        self.w = df[w_col].to_numpy(dtype=np.float32)
-
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, i: int):
-        xn = torch.tensor(self.Xn[i], dtype=torch.float32)
-        xc = [torch.tensor(arr[i], dtype=torch.long) for arr in self.Xc]
-        y  = torch.tensor(self.y[i], dtype=torch.float32)
-        w  = torch.tensor(self.w[i], dtype=torch.float32)
-        return xn, xc, y, w
 
 def build_training_table_for_dl(window_days: int = 730) -> Tuple[pd.DataFrame, List[str], List[str]]:
     """
