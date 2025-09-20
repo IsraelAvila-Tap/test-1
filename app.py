@@ -4156,6 +4156,64 @@ def build_training_table_for_dl(window_days: int = 730) -> Tuple[pd.DataFrame, L
 
     return ydf, NUM_COLS, CAT_COLS
 
+def _train_loop(model, train_loader, valid_loader, device, epochs=25, lr=1e-3):
+    """
+    Entrena modelos que devuelven LOGITS (no probabilidades).
+    Usa BCEWithLogitsLoss con reducción 'none' y ponderación por w.
+    """
+    model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    loss_fn = torch.nn.BCEWithLogitsLoss(reduction='none')
+
+    best = float('inf')
+    best_state = None
+
+    for ep in range(1, epochs + 1):
+        # -------- train --------
+        model.train()
+        for x_num, x_cats, y, w in train_loader:
+            x_num = x_num.to(device)
+            x_cats = [t.to(device) for t in x_cats]
+            y = y.to(device).float().view(-1)
+            w = w.to(device).float().view(-1)
+
+            logits = model(x_num, x_cats).view(-1)      # modelos devuelven LOGITS
+            loss = (loss_fn(logits, y) * w).mean()
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        # -------- valid --------
+        model.eval()
+        val_sum, val_n = 0.0, 0
+        with torch.no_grad():
+            for x_num, x_cats, y, w in valid_loader:
+                x_num = x_num.to(device)
+                x_cats = [t.to(device) for t in x_cats]
+                y = y.to(device).float().view(-1)
+                w = w.to(device).float().view(-1)
+
+                logits = model(x_num, x_cats).view(-1)
+                vloss = (loss_fn(logits, y) * w).mean()
+
+                bs = y.size(0)
+                val_sum += float(vloss.item()) * bs
+                val_n   += bs
+
+        val_avg = val_sum / max(val_n, 1)
+        if val_avg < best:
+            best = val_avg
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model
+
+
+
+
+
 from typing import Optional
 
 def train_torch_failure_model(
