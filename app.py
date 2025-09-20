@@ -5139,27 +5139,6 @@ try:
                     except Exception as e:
                         show_exception(e, "Debug SRM/Score")
 
-                # 9) Tabla 4 — Riesgo de fallo (usa Tabla 2 + Tabla 3)
-                st.markdown("### Tabla 4 — Riesgo de fallo (MLPs)")
-                try:
-                    # Usa la función global ya definida arriba
-                    model = _get_trained_model()
-                
-                    resumen_svc, detalle_riesgo = predict_failure(detalles, tabla3, model)
-                
-                    if resumen_svc is None or resumen_svc.empty:
-                        st.info("Sin datos para evaluar riesgo aún.")
-                    else:
-                        # --- Formato: miles sin decimales y % con 1 decimal ---
-                        num0f = "{:,.0f}".format   # 12,345
-                        pct1f = "{:.1%}".format    # 12.3%
-                
-                        # Tabla eliminada por solicitud del usuario
-                
-                except Exception as e:
-                    st.error("No se pudo calcular la Tabla 4 (riesgo de fallo).")
-                    show_exception(e, "Tabla 4 (riesgo)")
-
 except Exception as e:
     st.error("Ocurrió un error durante el cálculo.")
     show_exception(e, "Traceback completo")
