@@ -4381,74 +4381,122 @@ def _predict_one_torch(pred_df: pd.DataFrame, tfm: "TorchFailureModel") -> np.nd
             preds.append(p)
     return np.concatenate(preds) if preds else np.zeros(len(pred_df))
 
-def predict_failure_dl(detalles_df: pd.DataFrame,
-                       tabla3_df: pd.DataFrame,
-                       kinds: List[str] = ("mlp","wide_deep","tabtr"),
-                       blend: str = "mean") -> Tuple[pd.DataFrame, pd.DataFrame]:
+def predict_failure_dl(
+    detalles_df: pd.DataFrame,
+    tabla3_df: pd.DataFrame,
+    kinds: List[str] = ("mlp","wide_deep","tabtr"),
+    blend: str = "mean"
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Devuelve (resumen_svc, detalle) agregando columnas:
-      Prob_DL_MLP, Prob_DL_WD, Prob_DL_TT, Prob_DL_BLEND
+    ÚNICA Tabla 4 (DL): devuelve
+      - resumen por SVC con Prob_DL_MLP, Prob_DL_WD, Prob_DL_TT y Prob_DL_BLEND
+      - detalle día×SVC×DM×Veh×MLP con las mismas columnas + riesgos ponderados.
+    Usa como base la preparación con Tabla 3 (rutas por MLP) + SPR diario desde Tabla 2.
     """
     base = _prep_pred_table(detalles_df, tabla3_df)
     if base is None or base.empty:
-        empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_DL_BLEND"])
-        empty_det = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
-                                          "Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT","Prob_DL_BLEND",
-                                          "Rutas_riesgo","Shipments_riesgo"])
+        empty_res = pd.DataFrame(columns=[
+            "SVC","Rutas","Shipments",
+            "Rutas_riesgo_MLP","Shipments_riesgo_MLP","Prob_DL_MLP",
+            "Rutas_riesgo_WD","Shipments_riesgo_WD","Prob_DL_WD",
+            "Rutas_riesgo_TT","Shipments_riesgo_TT","Prob_DL_TT",
+            "Rutas_riesgo_BLEND","Shipments_riesgo_BLEND","Prob_DL_BLEND"
+        ])
+        empty_det = pd.DataFrame(columns=[
+            "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
+            "Rutas","Shipments",
+            "Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT","Prob_DL_BLEND",
+            "Rutas_riesgo_MLP","Shipments_riesgo_MLP",
+            "Rutas_riesgo_WD","Shipments_riesgo_WD",
+            "Rutas_riesgo_TT","Shipments_riesgo_TT",
+            "Rutas_riesgo_BLEND","Shipments_riesgo_BLEND",
+        ])
         return empty_res, empty_det
 
-    # carga/entrena modelos
-    models = {}
-    for k in kinds:
-        models[k] = _get_torch_model_cached(k)
+    # Carga/entrena modelos (cacheados)
+    models = {k: _get_torch_model_cached(k) for k in kinds}
 
-    # predicciones
     out = base.copy()
+
+    # Predicciones por modelo (sobre el dataset de features preparado, no sobre el acumulado)
     name_map = {"mlp":"Prob_DL_MLP","wide_deep":"Prob_DL_WD","wide":"Prob_DL_WD","tabtr":"Prob_DL_TT"}
     for k, tfm in models.items():
-        out[name_map.get(k,k)] = _predict_one_torch(out, tfm)
+        col = name_map.get(k, k)
+        try:
+            out[col] = _predict_one_torch(out, tfm)
+        except Exception:
+            # Fallback duro si algún modelo falla
+            out[col] = 0.0
 
+    # BLEND
     cols_pred = [c for c in ["Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT"] if c in out.columns]
-    if not cols_pred:
-        out["Prob_DL_BLEND"] = 0.0
-    else:
-        if blend == "mean":
-            out["Prob_DL_BLEND"] = out[cols_pred].mean(axis=1)
-        elif blend == "max":
+    if cols_pred:
+        if blend == "max":
             out["Prob_DL_BLEND"] = out[cols_pred].max(axis=1)
         else:
             out["Prob_DL_BLEND"] = out[cols_pred].mean(axis=1)
+    else:
+        out["Prob_DL_BLEND"] = 0.0
 
-    # riesgos ponderados
-    out["Rutas_riesgo"] = out["Prob_DL_BLEND"] * out["Rutas"]
-    out["Shipments_riesgo"] = out["Prob_DL_BLEND"] * out["Shipments"]
+    # Riesgos ponderados por rutas/shipments (también por modelo)
+    out["Rutas"] = pd.to_numeric(out["Rutas"], errors="coerce").fillna(0)
+    out["Shipments"] = pd.to_numeric(out["Shipments"], errors="coerce").fillna(0)
 
-    # resumen SVC
+    for k, src in [("MLP","Prob_DL_MLP"), ("WD","Prob_DL_WD"), ("TT","Prob_DL_TT"), ("BLEND","Prob_DL_BLEND")]:
+        if src not in out.columns: 
+            out[src] = 0.0
+        out[f"Rutas_riesgo_{k}"]     = out[src] * out["Rutas"]
+        out[f"Shipments_riesgo_{k}"] = out[src] * out["Shipments"]
+
+    # Resumen por SVC con promedio ponderado por shipments para cada prob
     grp = out.groupby("SVC", dropna=False)
     ship_sum = grp["Shipments"].sum().replace(0, np.nan)
-    prob_w = (grp.apply(lambda g: (g["Prob_DL_BLEND"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_DL_BLEND")
-    resumen = pd.concat([
-        grp["Rutas"].sum().rename("Rutas"),
-        grp["Rutas_riesgo"].sum().rename("Rutas_riesgo"),
-        grp["Shipments"].sum().rename("Shipments"),
-        grp["Shipments_riesgo"].sum().rename("Shipments_riesgo"),
-        prob_w
-    ], axis=1).reset_index()
-    # orden
+
+    def _pw(col):  # promedio ponderado por shipments
+        return (grp.apply(lambda g: (g[col] * g["Shipments"]).sum()) / ship_sum).fillna(0)
+
+    resumen = pd.DataFrame({
+        "SVC": grp.size().index,
+        "Rutas": grp["Rutas"].sum().values,
+        "Shipments": grp["Shipments"].sum().values,
+        "Rutas_riesgo_MLP": grp["Rutas_riesgo_MLP"].sum().values,
+        "Shipments_riesgo_MLP": grp["Shipments_riesgo_MLP"].sum().values,
+        "Prob_DL_MLP": _pw("Prob_DL_MLP").values,
+        "Rutas_riesgo_WD": grp["Rutas_riesgo_WD"].sum().values,
+        "Shipments_riesgo_WD": grp["Shipments_riesgo_WD"].sum().values,
+        "Prob_DL_WD": _pw("Prob_DL_WD").values,
+        "Rutas_riesgo_TT": grp["Rutas_riesgo_TT"].sum().values,
+        "Shipments_riesgo_TT": grp["Shipments_riesgo_TT"].sum().values,
+        "Prob_DL_TT": _pw("Prob_DL_TT").values,
+        "Rutas_riesgo_BLEND": grp["Rutas_riesgo_BLEND"].sum().values,
+        "Shipments_riesgo_BLEND": grp["Shipments_riesgo_BLEND"].sum().values,
+        "Prob_DL_BLEND": _pw("Prob_DL_BLEND").values,
+    })
+
+    # Orden visual del DETALLE
     try:
         ord_dm = pd.CategoricalDtype(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
         out["DELIVERY_MOD"] = out["DELIVERY_MOD"].astype(ord_dm)
-        out = out.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_DL_BLEND"],
-                              ascending=[True, True, True, True, False]).reset_index(drop=True)
+        out = out.sort_values(
+            ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_DL_BLEND"],
+            ascending=[True, True, True, True, False]
+        ).reset_index(drop=True)
     except Exception:
         pass
 
-    det_cols = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
-                "Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT","Prob_DL_BLEND","Rutas_riesgo","Shipments_riesgo"]
+    det_cols = [
+        "FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
+        "Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT","Prob_DL_BLEND",
+        "Rutas_riesgo_MLP","Shipments_riesgo_MLP",
+        "Rutas_riesgo_WD","Shipments_riesgo_WD",
+        "Rutas_riesgo_TT","Shipments_riesgo_TT",
+        "Rutas_riesgo_BLEND","Shipments_riesgo_BLEND",
+    ]
     for c in det_cols:
         if c not in out.columns:
             out[c] = np.nan
-    return resumen[["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_DL_BLEND"]], out[det_cols]
+
+    return resumen, out[det_cols]
 
 
 
@@ -4903,25 +4951,26 @@ try:
                 st.dataframe(tabla3, use_container_width=True, hide_index=True)
 
                 # === Tabla 4 — Riesgo de fallo (DL, PyTorch) ===
+                
                 st.markdown("### Tabla 4 — Riesgo de fallo (DL, PyTorch)")
                 
                 res_svc_dl, det_dl = predict_failure_dl(
                     detalles, tabla3,
-                    kinds=("mlp","wide_deep","tabtr"),  # 3 modelos DL
-                    blend="mean"                        # promedio de los 3
+                    kinds=("mlp","wide_deep","tabtr"),
+                    blend="mean"
                 )
                 
                 if res_svc_dl is None or res_svc_dl.empty:
                     st.info("Sin datos para evaluar riesgo (DL).")
                 else:
-                    st.subheader("Resumen por SVC (DL Blend)")
+                    st.subheader("Resumen por SVC (3 modelos + Blend)")
                     st.dataframe(
                         res_svc_dl.style.format({
-                            "Rutas":"{:,.0f}",
-                            "Rutas_riesgo":"{:,.0f}",
-                            "Shipments":"{:,.0f}",
-                            "Shipments_riesgo":"{:,.0f}",
-                            "Prob_DL_BLEND":"{:.1%}",
+                            "Rutas":"{:,.0f}", "Shipments":"{:,.0f}",
+                            "Rutas_riesgo_MLP":"{:,.0f}", "Shipments_riesgo_MLP":"{:,.0f}", "Prob_DL_MLP":"{:.1%}",
+                            "Rutas_riesgo_WD":"{:,.0f}",  "Shipments_riesgo_WD":"{:,.0f}",  "Prob_DL_WD":"{:.1%}",
+                            "Rutas_riesgo_TT":"{:,.0f}",  "Shipments_riesgo_TT":"{:,.0f}",  "Prob_DL_TT":"{:.1%}",
+                            "Rutas_riesgo_BLEND":"{:,.0f}", "Shipments_riesgo_BLEND":"{:,.0f}", "Prob_DL_BLEND":"{:.1%}",
                         }),
                         use_container_width=True, hide_index=True
                     )
@@ -4930,12 +4979,15 @@ try:
                         st.dataframe(
                             det_dl.style.format({
                                 "Rutas":"{:,.0f}", "Shipments":"{:,.0f}",
-                                "Rutas_riesgo":"{:,.0f}", "Shipments_riesgo":"{:,.0f}",
-                                "Prob_DL_MLP":"{:.1%}", "Prob_DL_WD":"{:.1%}",
-                                "Prob_DL_TT":"{:.1%}", "Prob_DL_BLEND":"{:.1%}",
+                                "Rutas_riesgo_MLP":"{:,.0f}", "Shipments_riesgo_MLP":"{:,.0f}",
+                                "Rutas_riesgo_WD":"{:,.0f}",  "Shipments_riesgo_WD":"{:,.0f}",
+                                "Rutas_riesgo_TT":"{:,.0f}",  "Shipments_riesgo_TT":"{:,.0f}",
+                                "Rutas_riesgo_BLEND":"{:,.0f}", "Shipments_riesgo_BLEND":"{:,.0f}",
+                                "Prob_DL_MLP":"{:.1%}", "Prob_DL_WD":"{:.1%}", "Prob_DL_TT":"{:.1%}", "Prob_DL_BLEND":"{:.1%}",
                             }),
                             use_container_width=True, hide_index=True
                         )
+
 
 
                 with st.expander("🔎 Debug SRM & Score", expanded=False):
