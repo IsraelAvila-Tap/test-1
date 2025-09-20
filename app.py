@@ -4398,11 +4398,11 @@ def train_torch_failure_model(
     try:
         print(f"🔍 DEBUG: Iniciando entrenamiento de {model_kind}")
         
-    # --- datos de entrenamiento ---
-    ydf, NUM_COLS, CAT_COLS = build_training_table_for_dl()
-    if ydf is None or ydf.empty:
+        # --- datos de entrenamiento ---
+        ydf, NUM_COLS, CAT_COLS = build_training_table_for_dl()
+        if ydf is None or ydf.empty:
             print(f"❌ ERROR: No hay datos de entrenamiento para {model_kind}")
-        return None
+            return None
 
         # Verificar que hay suficientes datos con shortfall > 0
         positive_shortfall = (ydf["SHORTFALL_PCT"] > 0).sum()
@@ -4412,58 +4412,58 @@ def train_torch_failure_model(
 
         print(f"✅ DEBUG: Datos de entrenamiento OK - {len(ydf)} filas, {positive_shortfall} con shortfall > 0")
 
-    indexers = _build_indexers(ydf, CAT_COLS)  # {col: dict token->id}
+        indexers = _build_indexers(ydf, CAT_COLS)  # {col: dict token->id}
         print(f"🔍 DEBUG: Indexers creados para: {list(indexers.keys())}")
 
-    # split temporal 80/20
-    n = len(ydf)
-    cut = int(n * 0.8)
-    train_df = ydf.iloc[:cut].reset_index(drop=True)
-    valid_df = ydf.iloc[cut:].reset_index(drop=True)
+        # split temporal 80/20
+        n = len(ydf)
+        cut = int(n * 0.8)
+        train_df = ydf.iloc[:cut].reset_index(drop=True)
+        valid_df = ydf.iloc[cut:].reset_index(drop=True)
 
         print(f"🔍 DEBUG: Split - Train: {len(train_df)}, Valid: {len(valid_df)}")
 
-    train_ds = SFDataset(train_df, NUM_COLS, CAT_COLS, indexers,
-                         y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
-    valid_ds = SFDataset(valid_df, NUM_COLS, CAT_COLS, indexers,
-                         y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
+        train_ds = SFDataset(train_df, NUM_COLS, CAT_COLS, indexers,
+                             y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
+        valid_ds = SFDataset(valid_df, NUM_COLS, CAT_COLS, indexers,
+                             y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
 
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,  drop_last=False)
-    valid_loader = DataLoader(valid_ds, batch_size=bs, shuffle=False, drop_last=False)
+        train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,  drop_last=False)
+        valid_loader = DataLoader(valid_ds, batch_size=bs, shuffle=False, drop_last=False)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"🔍 DEBUG: Usando device: {device}")
 
-    # --- instancia del modelo (con emb_dim/d_model explícitos) ---
-    mk = (model_kind or "mlp").lower()
+        # --- instancia del modelo (con emb_dim/d_model explícitos) ---
+        mk = (model_kind or "mlp").lower()
         print(f"🔍 DEBUG: Creando modelo {mk}")
-        
-    if mk == "mlp":
-        # Deep puro: embeddings + numéricas -> MLP (LOGITS)
-        net = DL_MLP_Emb(indexers, CAT_COLS, num_dim=len(NUM_COLS), emb_dim=int(emb_dim))
-    elif mk in ("wide", "wide_deep", "widedeep"):
-        # Wide & Deep: wide (lineal por categoría) + deep (embeddings + MLP), suma de LOGITS
-        net = DL_WideDeep(indexers, CAT_COLS, num_dim=len(NUM_COLS), emb_dim=int(emb_dim))
-    else:  # "tabtr", "tab", "transformer"
-        # TabTransformer-lite: misma dim por token = d_model
-        net = DL_TabTransformer(
-            indexers, CAT_COLS, num_dim=len(NUM_COLS),
-            d_model=int(d_model), nhead=int(nhead), nlayers=int(nlayers), p=float(dropout_p)
-        )
+            
+        if mk == "mlp":
+            # Deep puro: embeddings + numéricas -> MLP (LOGITS)
+            net = DL_MLP_Emb(indexers, CAT_COLS, num_dim=len(NUM_COLS), emb_dim=int(emb_dim))
+        elif mk in ("wide", "wide_deep", "widedeep"):
+            # Wide & Deep: wide (lineal por categoría) + deep (embeddings + MLP), suma de LOGITS
+            net = DL_WideDeep(indexers, CAT_COLS, num_dim=len(NUM_COLS), emb_dim=int(emb_dim))
+        else:  # "tabtr", "tab", "transformer"
+            # TabTransformer-lite: misma dim por token = d_model
+            net = DL_TabTransformer(
+                indexers, CAT_COLS, num_dim=len(NUM_COLS),
+                d_model=int(d_model), nhead=int(nhead), nlayers=int(nlayers), p=float(dropout_p)
+            )
 
         print(f"✅ DEBUG: Modelo {mk} creado exitosamente")
 
-    # --- entrenamiento ---
-    net = _train_loop(net, train_loader, valid_loader, device, epochs=epochs, lr=lr)
+        # --- entrenamiento ---
+        net = _train_loop(net, train_loader, valid_loader, device, epochs=epochs, lr=lr)
 
         result = TorchFailureModel(
-        name=mk,
-        model=net,
-        indexers=indexers,
-        num_cols=NUM_COLS,
-        cat_cols=CAT_COLS,
-        device=device
-    )
+            name=mk,
+            model=net,
+            indexers=indexers,
+            num_cols=NUM_COLS,
+            cat_cols=CAT_COLS,
+            device=device
+        )
 
         print(f"✅ DEBUG: Modelo {mk} entrenado y empaquetado exitosamente")
         return result
