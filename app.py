@@ -29,6 +29,10 @@ from sklearn.impute import SimpleImputer
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import HistGradientBoostingRegressor
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+import torch
+import torch.nn as nn
 
 
 
@@ -3746,17 +3750,6 @@ class SFDataset(Dataset):
         cats = [xc[i] for xc in self.x_cat]
         if self.y is None: return self.x_num[i], cats
         return self.x_num[i], cats, self.y[i], (self.w[i] if self.w is not None else torch.tensor(1.0))
-
-# ---------- BLOQUES COMUNES (DL) ----------
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-import math
-import torch
-import torch.nn as nn
-import pandas as pd
-import numpy as np
-
 # --- helpers de cardinalidad / embs ---
 def _emb_dim(n: int) -> int:
     # regla estándar para embeddings tabulares
