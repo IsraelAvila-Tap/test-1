@@ -5154,41 +5154,7 @@ try:
                         num0f = "{:,.0f}".format   # 12,345
                         pct1f = "{:.1%}".format    # 12.3%
                 
-                        st.subheader("Resumen por SVC — Comparativo ML vs DP")
-
-                        res_show = resumen_svc.copy()
-                        fmt_num0 = "{:,.0f}".format
-                        fmt_pct1 = "{:.1%}".format
-                        
-                        res_style = res_show.style.format({
-                            "Rutas": fmt_num0,
-                            "Shipments": fmt_num0,
-                            "Rutas_riesgo_ML": fmt_num0,
-                            "Shipments_riesgo_ML": fmt_num0,
-                            "Prob_fallar_ML": fmt_pct1,
-                            "Rutas_riesgo_DP": fmt_num0,
-                            "Shipments_riesgo_DP": fmt_num0,
-                            "Prob_fallar_DP": fmt_pct1,
-                            # Muestra u oculta BLEND según prefieras
-                            "Rutas_riesgo_BLEND": fmt_num0,
-                            "Shipments_riesgo_BLEND": fmt_num0,
-                            "Prob_fallar_BLEND": fmt_pct1,
-                        })
-                        st.dataframe(res_style, use_container_width=True, hide_index=True)
-                        
-                        with st.expander("Ver detalle por día × DM × vehículo × MLP (ML vs DP)", expanded=False):
-                            det_show = detalle_riesgo.copy()
-                            det_style = det_show.style.format({
-                                "Rutas": fmt_num0, "Shipments": fmt_num0,
-                                "Prob_Fail_ML": fmt_pct1, "Prob_Fail_DP": fmt_pct1, "Prob_Fail_BLEND": fmt_pct1,
-                                "Rutas_riesgo_ML": fmt_num0, "Rutas_riesgo_DP": fmt_num0, "Rutas_riesgo_BLEND": fmt_num0,
-                                "Shipments_riesgo_ML": fmt_num0, "Shipments_riesgo_DP": fmt_num0, "Shipments_riesgo_BLEND": fmt_num0,
-                            })
-                            st.dataframe(det_style, use_container_width=True, hide_index=True)
-               
-                        # Guarda en session_state por si lo usas en otros módulos
-                        st.session_state["riesgo_resumen_svc"] = resumen_svc.copy()
-                        st.session_state["riesgo_detalle"] = detalle_riesgo.copy()
+                        # Tabla eliminada por solicitud del usuario
                 
                 except Exception as e:
                     st.error("No se pudo calcular la Tabla 4 (riesgo de fallo).")
