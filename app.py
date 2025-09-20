@@ -4105,23 +4105,34 @@ def build_training_table_for_dl(window_days: int = 730) -> Tuple[pd.DataFrame, L
     try:
         tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
         arer = read_sheet(SHEET_ID, tab_arer)
-    except Exception:
+        print(f"🔍 DEBUG: Datos AR-ER cargados: {len(arer)} filas")
+    except Exception as e:
+        print(f"❌ ERROR: No se pudieron cargar datos AR-ER: {e}")
         arer = pd.DataFrame()
 
     ydf = _label_from_arer_shortfall(arer)
     if ydf is None or ydf.empty:
+        print("❌ ERROR: No hay datos de shortfall para entrenamiento")
         return pd.DataFrame(), [], []
+
+    print(f"🔍 DEBUG: Datos de shortfall: {len(ydf)} filas")
+    print(f"🔍 DEBUG: SHORTFALL_PCT no nulos: {ydf['SHORTFALL_PCT'].notna().sum()}")
+    print(f"🔍 DEBUG: SHORTFALL_PCT > 0: {(ydf['SHORTFALL_PCT'] > 0).sum()}")
+    print(f"🔍 DEBUG: SHORTFALL_PCT estadísticas: {ydf['SHORTFALL_PCT'].describe()}")
 
     # Enriquecimiento (reusa tus helpers ya definidos en tu proyecto)
     ydf = _attach_tabla2_spr(ydf)             # añade SPR_T2
     ydf = _add_calendar_feats(ydf, "FECHA")   # DOW, IS_WE, MES, SEM
     ydf = _rolling_shortfall(ydf)             # SF_MEAN_*d, CONF_*d si los usas
 
-    # Features numéricas “core” (usa las que existan)
+    # Features numéricas "core" (usa las que existan)
     NUM_COLS = [c for c in ["SPR_T2", "CONF_EFECTIVO", "DOW", "IS_WE", "MES", "SEM"] if c in ydf.columns]
 
     # Categóricas disponibles
     CAT_COLS = [c for c in ["SVC", "DELIVERY_MOD", "SHP_LG_VEHICLE_TYPE", "MLP"] if c in ydf.columns]
+
+    print(f"🔍 DEBUG: Features numéricas: {NUM_COLS}")
+    print(f"🔍 DEBUG: Features categóricas: {CAT_COLS}")
 
     # Target y peso
     ydf["SHORTFALL_PCT"] = pd.to_numeric(ydf["SHORTFALL_PCT"], errors="coerce").clip(0, 1).fillna(0.0)
@@ -4131,23 +4142,35 @@ def build_training_table_for_dl(window_days: int = 730) -> Tuple[pd.DataFrame, L
     if "FECHA" in ydf.columns:
         ydf = ydf.sort_values("FECHA").reset_index(drop=True)
 
+    print(f"🔍 DEBUG: Datos finales para entrenamiento: {len(ydf)} filas")
+    print(f"🔍 DEBUG: SHORTFALL_PCT final - no nulos: {ydf['SHORTFALL_PCT'].notna().sum()}")
+    print(f"🔍 DEBUG: SHORTFALL_PCT final - > 0: {(ydf['SHORTFALL_PCT'] > 0).sum()}")
+
     return ydf, NUM_COLS, CAT_COLS
 
-def _train_loop(model, train_loader, valid_loader, device, epochs=25, lr=1e-3):
+def _train_loop(model, train_loader, valid_loader, device, epochs=50, lr=5e-3):
     """
     Entrena modelos que devuelven LOGITS (no probabilidades).
     Usa BCEWithLogitsLoss con reducción 'none' y ponderación por w.
+    Incluye early stopping y mejor logging.
     """
     model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     loss_fn = torch.nn.BCEWithLogitsLoss(reduction='none')
-
+    
+    # Early stopping
     best = float('inf')
-    best_state = None
+    patience = 10
+    patience_counter = 0
+    best_model_state = None
+    
+    print(f"🚀 DEBUG: Iniciando entrenamiento - {epochs} épocas, lr={lr}")
 
     for ep in range(1, epochs + 1):
         # -------- train --------
         model.train()
+        train_loss = 0.0
+        train_batches = 0
         for x_num, x_cats, y, w in train_loader:
             x_num = x_num.to(device)
             x_cats = [t.to(device) for t in x_cats]
@@ -4160,6 +4183,9 @@ def _train_loop(model, train_loader, valid_loader, device, epochs=25, lr=1e-3):
             opt.zero_grad()
             loss.backward()
             opt.step()
+            
+            train_loss += loss.item()
+            train_batches += 1
 
         # -------- valid --------
         model.eval()
@@ -4179,12 +4205,31 @@ def _train_loop(model, train_loader, valid_loader, device, epochs=25, lr=1e-3):
                 val_n   += bs
 
         val_avg = val_sum / max(val_n, 1)
+        train_avg = train_loss / max(train_batches, 1)
+        
+        # Early stopping logic
         if val_avg < best:
             best = val_avg
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        # Log cada 5 épocas
+        if ep % 5 == 0 or ep == 1:
+            print(f"🔍 DEBUG: Época {ep}/{epochs} - Train Loss: {train_avg:.4f}, Val Loss: {val_avg:.4f}, Best: {best:.4f}")
+        
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"🛑 DEBUG: Early stopping en época {ep} (patience={patience})")
+            break
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"✅ DEBUG: Modelo entrenado - mejor val_loss: {best:.4f}")
+    else:
+        print("⚠️ WARNING: No se guardó ningún estado del modelo")
+    
     return model
 
 from dataclasses import dataclass
@@ -4272,10 +4317,34 @@ try:
     import streamlit as st
     @st.cache_resource(show_spinner=False)
     def _get_torch_model_cached(kind: str):
-        return train_torch_failure_model(model_kind=kind, epochs=25, lr=1e-3, bs=512)
+        print(f"🚀 DEBUG: Entrenando modelo {kind} con parámetros mejorados...")
+        model = train_torch_failure_model(
+            model_kind=kind, 
+            epochs=50,      # Aumentado de 25 a 50
+            lr=5e-3,        # Aumentado de 1e-3 a 5e-3
+            bs=256,         # Reducido de 512 a 256 para mejor convergencia
+            dropout_p=0.15  # Aumentado para mejor regularización
+        )
+        if model is None:
+            print(f"❌ ERROR: Modelo {kind} no se pudo entrenar")
+        else:
+            print(f"✅ DEBUG: Modelo {kind} entrenado exitosamente")
+        return model
 except Exception:
     def _get_torch_model_cached(kind: str):
-        return train_torch_failure_model(model_kind=kind, epochs=25, lr=1e-3, bs=512)
+        print(f"🚀 DEBUG: Entrenando modelo {kind} con parámetros mejorados...")
+        model = train_torch_failure_model(
+            model_kind=kind, 
+            epochs=50,      # Aumentado de 25 a 50
+            lr=5e-3,        # Aumentado de 1e-3 a 5e-3
+            bs=256,         # Reducido de 512 a 256 para mejor convergencia
+            dropout_p=0.15  # Aumentado para mejor regularización
+        )
+        if model is None:
+            print(f"❌ ERROR: Modelo {kind} no se pudo entrenar")
+        else:
+            print(f"✅ DEBUG: Modelo {kind} entrenado exitosamente")
+        return model
 
 # ---------- predicción con los 3 DL + blend ----------
 def _prep_pred_table(detalles_df: pd.DataFrame, tabla3_df: pd.DataFrame) -> pd.DataFrame:
@@ -4313,10 +4382,14 @@ def _predict_one_torch(pred_df: pd.DataFrame, tfm: "TorchFailureModel") -> np.nd
     """
     try:
         if tfm is None or getattr(tfm, "model", None) is None or pred_df is None or pred_df.empty:
+            print(f"❌ DEBUG: Modelo o datos inválidos para predicción")
             return np.full(len(pred_df) if pred_df is not None else 0, np.nan, dtype=float)
 
         use_num = [c for c in tfm.num_cols if c in pred_df.columns]
         use_cat = [c for c in tfm.cat_cols if c in pred_df.columns]
+        
+        print(f"🔍 DEBUG: Features numéricas disponibles: {use_num}")
+        print(f"🔍 DEBUG: Features categóricas disponibles: {use_cat}")
 
         ds = SFDataset(pred_df, use_num, use_cat, tfm.indexers, y_col=None, w_col=None)
         loader = DataLoader(ds, batch_size=1024, shuffle=False)
@@ -4330,8 +4403,13 @@ def _predict_one_torch(pred_df: pd.DataFrame, tfm: "TorchFailureModel") -> np.nd
                 logits = model(x_num, x_cats).view(-1)                 # LOGITS
                 prob = torch.sigmoid(logits).clamp(0, 1).cpu().numpy() # PROB
                 preds.append(prob)
-        return np.concatenate(preds) if preds else np.full(len(pred_df), np.nan, dtype=float)
-    except Exception:
+        
+        result = np.concatenate(preds) if preds else np.full(len(pred_df), np.nan, dtype=float)
+        print(f"🔍 DEBUG: Predicciones generadas - min: {result.min():.4f}, max: {result.max():.4f}, mean: {result.mean():.4f}")
+        print(f"🔍 DEBUG: Predicciones > 0: {(result > 0).sum()}/{len(result)}")
+        return result
+    except Exception as e:
+        print(f"❌ ERROR en predicción PyTorch: {e}")
         # Si algo truena, devolvemos NaN para activar el fallback en el blend
         return np.full(len(pred_df) if pred_df is not None else 0, np.nan, dtype=float)
 def predict_failure_dl(detalles_df: pd.DataFrame,
@@ -4401,14 +4479,31 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
 
     # ---------------- Blend robusto ----------------
     dl_cols = [c for c in ["Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT"] if c in out.columns]
+    print(f"🔍 DEBUG: Columnas DL disponibles: {dl_cols}")
+    
     if not dl_cols:
+        print("⚠️ WARNING: No hay modelos DL disponibles, usando solo DP")
         out["Prob_DL_BLEND"] = out["Prob_DP"]
     else:
+        # Debug de cada modelo DL
+        for col in dl_cols:
+            if col in out.columns:
+                valid_preds = out[col].notna() & (out[col] > 0)
+                print(f"🔍 DEBUG: {col} - válidas: {valid_preds.sum()}/{len(out)}, min: {out[col].min():.4f}, max: {out[col].max():.4f}")
+        
         # media de los DL disponibles
         out["Prob_DL_BLEND"] = out[dl_cols].mean(axis=1, skipna=True)
+        print(f"🔍 DEBUG: Blend DL - min: {out['Prob_DL_BLEND'].min():.4f}, max: {out['Prob_DL_BLEND'].max():.4f}")
+        
         # si todos NaN o 0 en una fila → usa DP
         all_zero_or_nan = out[dl_cols].fillna(0).sum(axis=1) == 0
-        out.loc[all_zero_or_nan, "Prob_DL_BLEND"] = out.loc[all_zero_or_nan, "Prob_DP"]
+        fallback_count = all_zero_or_nan.sum()
+        if fallback_count > 0:
+            print(f"⚠️ WARNING: {fallback_count} filas usando fallback DP (todos DL = 0 o NaN)")
+            out.loc[all_zero_or_nan, "Prob_DL_BLEND"] = out.loc[all_zero_or_nan, "Prob_DP"]
+        
+        print(f"🔍 DEBUG: Blend final - min: {out['Prob_DL_BLEND'].min():.4f}, max: {out['Prob_DL_BLEND'].max():.4f}")
+        print(f"🔍 DEBUG: Blend final > 0: {(out['Prob_DL_BLEND'] > 0).sum()}/{len(out)}")
 
     # ---------------- Riesgos ponderados ----------------
     for c in ["Rutas","Shipments"]:
