@@ -3772,37 +3772,30 @@ def _cardinality_from_indexer(idx_val) -> int:
         return 0
 
 # ---------- Embedding + MLP compartidos ----------
+# ---------- bloques comunes ----------
 class EmbeddingBlock(nn.Module):
     """
-    Embeddings con misma dimensión por columna (puede variar entre columnas).
-    indexers: dict {col: (int cardinalidad) ó dict mapeo categoria->id}
+    Embeddings compartidos: misma dimensión para todas las columnas categóricas.
+    Soporta indexers[col] como dict {token:id} o como entero (n_categorías).
     """
-    def __init__(self, indexers: Dict[str, object], cat_cols: List[str], emb_dim: int | None = None):
+    def __init__(self, indexers: Dict[str, Any], cat_cols: List[str], emb_dim: int = 16):
         super().__init__()
         self.cat_cols = list(cat_cols)
-        self.embs = nn.ModuleDict()
-        out_dims = []
-        for c in self.cat_cols:
-            n = _cardinality_from_indexer(indexers.get(c, 0))
-            # +1 para UNK/0
-            n_embed = n + 1
-            d = emb_dim if emb_dim is not None else _emb_dim(n_embed)
-            self.embs[c] = nn.Embedding(num_embeddings=int(n_embed), embedding_dim=int(d), padding_idx=0)
-            out_dims.append(int(d))
-        self._per_col_dims = out_dims
-        self.out_dim = int(sum(out_dims))
+        self.emb_dim = int(emb_dim)
+        self.embs = nn.ModuleDict({
+            c: nn.Embedding(_vocab_size(indexers, c), self.emb_dim, padding_idx=0)
+            for c in self.cat_cols
+        })
+        self.out_dim = self.emb_dim * len(self.cat_cols)
 
     def forward(self, x_cat_list: List[torch.Tensor]) -> torch.Tensor:
         if not self.cat_cols or not x_cat_list:
-            # devuelve tensor vacío coherente (B x 0)
-            B = x_cat_list[0].shape[0] if x_cat_list else 1
-            device = next(self.parameters()).device
-            return torch.zeros((B, 0), device=device, dtype=torch.float32)
-        toks = []
-        for c, x in zip(self.cat_cols, x_cat_list):
-            toks.append(self.embs[c](x))  # [B, d_c]
-        return torch.cat(toks, dim=1)  # [B, sum(d_c)]
-
+            B = x_cat_list[0].size(0) if x_cat_list else 1
+            # usa CPU si aún no hay pesos creados
+            dev = next(self.embs.parameters()).device if len(self.embs) else "cpu"
+            return torch.zeros(B, 0, device=dev)
+        toks = [self.embs[c](x) for c, x in zip(self.cat_cols, x_cat_list)]
+        return torch.cat(toks, dim=1)  # [B, emb_dim * |C|]
 
 class MLP(nn.Module):
     """
@@ -3843,6 +3836,13 @@ class CatEmbShared(nn.Module):
         # x_cat_list: lista de LongTensor [B], respetando el orden de self.cols
         toks = [self.embs[c](x) for c, x in zip(self.cols, x_cat_list)]  # cada uno [B, emb_dim]
         return torch.stack(toks, dim=1)  # [B, n_cat, emb_dim]
+
+
+# --- helper robusto para tamaño de vocabulario ---
+def _vocab_size(indexers, col) -> int:
+    n = indexers[col]
+    return (len(n) if isinstance(n, dict) else int(n)) + 1  # +1 para UNK/padding
+
 
 
 # ---------- Modelo 1: MLP + Embeddings ----------
