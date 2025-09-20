@@ -4025,6 +4025,125 @@ class DL_TabTransformer(nn.Module):
         logits = self.head(h).squeeze(-1)   # [B]
         return torch.sigmoid(logits)        # [B] en 0..1
 
+
+# ===== Preparación de datos para DL (tabla de entrenamiento + indexers + dataset) =====
+from typing import List, Tuple, Dict, Any
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+def _cardinality_from_indexer(ix_val: Any) -> int:
+    """
+    Soporta indexers como:
+      - int (cardinalidad)
+      - dict token->id (ids comienzan en 1, 0 reservado a UNK/padding)
+    """
+    if isinstance(ix_val, dict):
+        return len(ix_val) + 1  # +1 por id=0 (UNK/padding)
+    try:
+        return int(ix_val)
+    except Exception:
+        return 0
+
+def _build_indexers(df: pd.DataFrame, cat_cols: List[str]) -> Dict[str, Dict[str, int]]:
+    """
+    Crea diccionarios {col: {token: id}} con ids desde 1.
+    El id 0 queda reservado para UNK/padding.
+    """
+    indexers: Dict[str, Dict[str, int]] = {}
+    for c in cat_cols:
+        # normaliza a string; NaN -> ""
+        vals = df[c].astype(str).fillna("")
+        cats = pd.Categorical(vals).categories.astype(str).tolist()
+        indexers[c] = {tok: i + 1 for i, tok in enumerate(cats)}  # 1..N
+    return indexers
+
+class SFDataset(Dataset):
+    """
+    Dataset para (x_num, x_cats, y, w)
+    - x_num: float32 [B, n_num]
+    - x_cats: lista de long [B] (una por columna categórica)
+    - y: float32 [B]  (SHORTFALL_PCT)
+    - w: float32 [B]  (SF_WEIGHT)
+    """
+    def __init__(self,
+                 df: pd.DataFrame,
+                 num_cols: List[str],
+                 cat_cols: List[str],
+                 indexers: Dict[str, Dict[str, int]],
+                 y_col: str = "SHORTFALL_PCT",
+                 w_col: str = "SF_WEIGHT"):
+        self.num_cols = list(num_cols)
+        self.cat_cols = list(cat_cols)
+        self.indexers = indexers
+
+        self.Xn = df[self.num_cols].to_numpy(dtype=np.float32) if self.num_cols else np.zeros((len(df), 0), np.float32)
+
+        self.Xc = []
+        for c in self.cat_cols:
+            vals = df[c].astype(str).fillna("")
+            ix = self.indexers.get(c, {})
+            codes = np.array([ix.get(v, 0) for v in vals], dtype=np.int64)  # 0 = UNK
+            self.Xc.append(codes)
+
+        self.y = df[y_col].to_numpy(dtype=np.float32)
+        self.w = df[w_col].to_numpy(dtype=np.float32)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, i: int):
+        xn = torch.tensor(self.Xn[i], dtype=torch.float32)
+        xc = [torch.tensor(arr[i], dtype=torch.long) for arr in self.Xc]
+        y  = torch.tensor(self.y[i], dtype=torch.float32)
+        w  = torch.tensor(self.w[i], dtype=torch.float32)
+        return xn, xc, y, w
+
+def build_training_table_for_dl(window_days: int = 730) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """
+    Crea el dataframe de entrenamiento para DL:
+      - y = SHORTFALL_PCT (0..1)
+      - w = SF_WEIGHT
+      - NUM_COLS = ['SPR_T2','CONF_EFECTIVO','DOW','IS_WE','MES','SEM'] si existen
+      - CAT_COLS = ['SVC','DELIVERY_MOD','SHP_LG_VEHICLE_TYPE','MLP'] si existen
+    Reusa tus loaders/normalizadores existentes.
+    """
+    try:
+        tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
+        arer = read_sheet(SHEET_ID, tab_arer)
+    except Exception:
+        arer = pd.DataFrame()
+
+    ydf = _label_from_arer_shortfall(arer)
+    if ydf is None or ydf.empty:
+        return pd.DataFrame(), [], []
+
+    # Enriquecimiento (reusa tus helpers ya definidos en tu proyecto)
+    ydf = _attach_tabla2_spr(ydf)             # añade SPR_T2
+    ydf = _add_calendar_feats(ydf, "FECHA")   # DOW, IS_WE, MES, SEM
+    ydf = _rolling_shortfall(ydf)             # SF_MEAN_*d, CONF_*d si los usas
+
+    # Features numéricas “core” (usa las que existan)
+    NUM_COLS = [c for c in ["SPR_T2", "CONF_EFECTIVO", "DOW", "IS_WE", "MES", "SEM"] if c in ydf.columns]
+
+    # Categóricas disponibles
+    CAT_COLS = [c for c in ["SVC", "DELIVERY_MOD", "SHP_LG_VEHICLE_TYPE", "MLP"] if c in ydf.columns]
+
+    # Target y peso
+    ydf["SHORTFALL_PCT"] = pd.to_numeric(ydf["SHORTFALL_PCT"], errors="coerce").clip(0, 1).fillna(0.0)
+    ydf["SF_WEIGHT"]     = pd.to_numeric(ydf.get("SF_WEIGHT", 1.0), errors="coerce").fillna(1.0)
+
+    # Orden temporal para split 80/20
+    if "FECHA" in ydf.columns:
+        ydf = ydf.sort_values("FECHA").reset_index(drop=True)
+
+    return ydf, NUM_COLS, CAT_COLS
+
+
+
+
+
 from typing import Optional
 
 def train_torch_failure_model(
