@@ -4494,11 +4494,11 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
                 out[col] = predictions
                 print(f"✅ DEBUG: {col} - min: {predictions.min():.4f}, max: {predictions.max():.4f}, >0: {(predictions > 0).sum()}")
             else:
-                print(f"⚠️ WARNING: {col} - todas las predicciones son 0 o NaN, usando DP como fallback")
-                out[col] = out["Prob_DP"]  # Usar DP como fallback
+                print(f"⚠️ WARNING: {col} - todas las predicciones son 0 o NaN, usando 0 como fallback")
+                out[col] = 0.0  # Usar 0 como fallback temporal
         else:
-            print(f"❌ ERROR: {col} - predicciones inválidas, usando DP como fallback")
-            out[col] = out["Prob_DP"]  # Usar DP como fallback
+            print(f"❌ ERROR: {col} - predicciones inválidas, usando 0 como fallback")
+            out[col] = 0.0  # Usar 0 como fallback temporal
 
     # ---------------- DP reciente (fallback) ----------------
     try:
@@ -4531,6 +4531,15 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
     out.drop(columns=["MLP_KEY"], inplace=True, errors="ignore")
     out["Prob_DP"] = pd.to_numeric(out["SF_RECENT_30"], errors="coerce").fillna(0.0).clip(0, 1)
 
+    # ---------------- Reemplazar modelos DL que fallaron con DP ----------------
+    for col in ["Prob_DL_MLP", "Prob_DL_WD", "Prob_DL_TT"]:
+        if col in out.columns:
+            # Si todas las predicciones son 0, reemplazar con DP
+            all_zero = (out[col] == 0).all()
+            if all_zero:
+                print(f"⚠️ WARNING: {col} - todas las predicciones son 0, reemplazando con DP")
+                out[col] = out["Prob_DP"]
+
     # ---------------- Blend robusto ----------------
     dl_cols = [c for c in ["Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT"] if c in out.columns]
     print(f"🔍 DEBUG: Columnas DL disponibles: {dl_cols}")
@@ -4549,7 +4558,7 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
         out["Prob_DL_BLEND"] = out[dl_cols].mean(axis=1, skipna=True)
         print(f"🔍 DEBUG: Blend DL - min: {out['Prob_DL_BLEND'].min():.4f}, max: {out['Prob_DL_BLEND'].max():.4f}")
         
-        # si todos NaN o 0 en una fila → usa DP
+        # si todos NaN o 0 en una fila → usa DP (después de que Prob_DP se calcule)
         all_zero_or_nan = out[dl_cols].fillna(0).sum(axis=1) == 0
         fallback_count = all_zero_or_nan.sum()
         if fallback_count > 0:
