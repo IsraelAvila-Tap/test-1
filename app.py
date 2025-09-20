@@ -4475,11 +4475,18 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
         if model is not None:
             models[k] = model
             print(f"✅ DEBUG: Modelo {k} entrenado exitosamente")
+            # Verificar que el modelo tiene parámetros entrenados
+            total_params = sum(p.numel() for p in model.model.parameters())
+            print(f"🔍 DEBUG: Modelo {k} - parámetros totales: {total_params}")
         else:
             print(f"❌ ERROR: Modelo {k} falló en el entrenamiento")
     
     out = base.copy()
     print(f"🔍 DEBUG: Modelos disponibles: {list(models.keys())}")
+    
+    # Verificar que tenemos datos para predicción
+    print(f"🔍 DEBUG: Datos para predicción: {len(out)} filas")
+    print(f"🔍 DEBUG: Columnas disponibles: {list(out.columns)}")
 
     name_map = {"mlp":"Prob_DL_MLP", "wide_deep":"Prob_DL_WD", "wide":"Prob_DL_WD", "tabtr":"Prob_DL_TT"}
     for k, tfm in models.items():
@@ -4494,10 +4501,12 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
                 out[col] = predictions
                 print(f"✅ DEBUG: {col} - min: {predictions.min():.4f}, max: {predictions.max():.4f}, >0: {(predictions > 0).sum()}")
             else:
-                print(f"⚠️ WARNING: {col} - todas las predicciones son 0 o NaN, usando 0 como fallback")
+                print(f"⚠️ WARNING: {col} - todas las predicciones son 0 o NaN")
+                print(f"🔍 DEBUG: {col} - predicciones raw: {predictions[:5]}...")
                 out[col] = 0.0  # Usar 0 como fallback temporal
         else:
-            print(f"❌ ERROR: {col} - predicciones inválidas, usando 0 como fallback")
+            print(f"❌ ERROR: {col} - predicciones inválidas")
+            print(f"🔍 DEBUG: {col} - predictions is None: {predictions is None}, len: {len(predictions) if predictions is not None else 'N/A'}")
             out[col] = 0.0  # Usar 0 como fallback temporal
 
     # ---------------- DP reciente (fallback) ----------------
@@ -4531,6 +4540,27 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
     out.drop(columns=["MLP_KEY"], inplace=True, errors="ignore")
     out["Prob_DP"] = pd.to_numeric(out["SF_RECENT_30"], errors="coerce").fillna(0.0).clip(0, 1)
 
+    # ---------------- Verificar si todos los modelos dan los mismos valores ----------------
+    dl_cols = ["Prob_DL_MLP", "Prob_DL_WD", "Prob_DL_TT"]
+    existing_cols = [col for col in dl_cols if col in out.columns]
+    
+    if len(existing_cols) > 1:
+        # Verificar si todos los valores son idénticos
+        first_col = existing_cols[0]
+        all_identical = True
+        for col in existing_cols[1:]:
+            if not out[first_col].equals(out[col]):
+                all_identical = False
+                break
+        
+        if all_identical:
+            print(f"⚠️ WARNING: Todos los modelos DL dan valores idénticos - probablemente usando DP como fallback")
+            print(f"🔍 DEBUG: Valores de {first_col}: {out[first_col].head().tolist()}")
+        else:
+            print(f"✅ DEBUG: Los modelos DL producen valores diferentes")
+            for col in existing_cols:
+                print(f"🔍 DEBUG: {col} - min: {out[col].min():.4f}, max: {out[col].max():.4f}")
+
     # ---------------- Reemplazar modelos DL que fallaron con DP ----------------
     for col in ["Prob_DL_MLP", "Prob_DL_WD", "Prob_DL_TT"]:
         if col in out.columns:
@@ -4539,6 +4569,9 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
             if all_zero:
                 print(f"⚠️ WARNING: {col} - todas las predicciones son 0, reemplazando con DP")
                 out[col] = out["Prob_DP"]
+            else:
+                # Si hay algunas predicciones válidas, mantener las originales
+                print(f"✅ DEBUG: {col} - manteniendo predicciones originales del modelo")
 
     # ---------------- Blend robusto ----------------
     dl_cols = [c for c in ["Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT"] if c in out.columns]
