@@ -36,6 +36,7 @@ import math, numpy as np, pandas as pd
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
 from torch.utils.data import Dataset, DataLoader
+from typing import Optional
 
 
 
@@ -4024,32 +4025,59 @@ class DL_TabTransformer(nn.Module):
         logits = self.head(h).squeeze(-1)   # [B]
         return torch.sigmoid(logits)        # [B] en 0..1
 
+from typing import Optional
 
-def train_torch_failure_model(model_kind: str = "mlp", epochs: int = 25, lr: float = 1e-3, bs: int = 512) -> TorchFailureModel | None:
+def train_torch_failure_model(
+    model_kind: str = "mlp",
+    epochs: int = 25,
+    lr: float = 1e-3,
+    bs: int = 512
+) -> Optional["TorchFailureModel"]:
     ydf, NUM_COLS, CAT_COLS = build_training_table_for_dl()
     if ydf is None or ydf.empty:
         return None
+
     indexers = _build_indexers(ydf, CAT_COLS)
+
     # split temporal 80/20
     n = len(ydf)
-    cut = int(n*0.8)
+    cut = int(n * 0.8)
     train_df = ydf.iloc[:cut].reset_index(drop=True)
     valid_df = ydf.iloc[cut:].reset_index(drop=True)
-    train_ds = SFDataset(train_df, NUM_COLS, CAT_COLS, indexers, y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
-    valid_ds = SFDataset(valid_df, NUM_COLS, CAT_COLS, indexers, y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
+
+    train_ds = SFDataset(train_df, NUM_COLS, CAT_COLS, indexers,
+                         y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
+    valid_ds = SFDataset(valid_df, NUM_COLS, CAT_COLS, indexers,
+                         y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
+
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, drop_last=False)
     valid_loader = DataLoader(valid_ds, batch_size=bs, shuffle=False, drop_last=False)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # instancia
-    if model_kind.lower() == "mlp":
+
+    # instancia del modelo
+    mk = (model_kind or "mlp").lower()
+    if mk == "mlp":
         net = DL_MLP_Emb(indexers, CAT_COLS, num_dim=len(NUM_COLS))
-    elif model_kind.lower() in ("wide", "wide_deep"):
+    elif mk in ("wide", "wide_deep", "widedeep"):
         net = DL_WideDeep(indexers, CAT_COLS, num_dim=len(NUM_COLS))
-    else:  # "tabtr"
-        # para TabTransformer-lite, fuerza misma dim por categoría (opcional)
-        net = DL_TabTransformer(indexers, CAT_COLS, num_dim=len(NUM_COLS), d_model=32, nhead=4, nlayers=2)
+    else:  # "tabtr", "tab", "transformer"
+        net = DL_TabTransformer(indexers, CAT_COLS, num_dim=len(NUM_COLS),
+                                d_model=32, nhead=4, nlayers=2)
+
     net = _train_loop(net, train_loader, valid_loader, device, epochs=epochs, lr=lr)
-    return TorchFailureModel(name=model_kind, model=net, indexers=indexers, num_cols=NUM_COLS, cat_cols=CAT_COLS, device=device)
+
+    return TorchFailureModel(
+        name=model_kind,
+        model=net,
+        indexers=indexers,
+        num_cols=NUM_COLS,
+        cat_cols=CAT_COLS,
+        device=device
+    )
+
+
+
 
 # Cachea en Streamlit si está disponible
 try:
