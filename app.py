@@ -3499,7 +3499,7 @@ def predict_failure(detalles_df: pd.DataFrame,
     """
     Predice shortfall proporcional esperado (0..1) por (día×SVC×DM×Veh×MLP/Rentals).
     Devuelve:
-      - resumen por SVC (arriba)
+    
       - detalle con Prob_Fail (=shortfall esperado), rutas/shipments en riesgo.
     """
     # Vacíos
@@ -4179,8 +4179,6 @@ try:
                         # --- Formato: miles sin decimales y % con 1 decimal ---
                         num0f = "{:,.0f}".format   # 12,345
                         pct1f = "{:.1%}".format    # 12.3%
-                
-                        st.subheader("Resumen por SVC")
                 
                         st.subheader("Resumen por SVC — Comparativo ML vs DP")
 
