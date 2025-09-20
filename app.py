@@ -3859,46 +3859,44 @@ class DL_MLP_Emb(nn.Module):
 
 # ---------- Modelo 2: Wide & Deep ----------
 # ---------- Wide & Deep (ajustado a indexers={col: {token:id}}) ----------
+# ---------- Modelo 2: Wide & Deep (FIX para indexers=dict de dicts) ----------
 class DL_WideDeep(nn.Module):
-    """
-    'Wide' = sesgos por categoría (emb 1-D por columna, sumados).
-    'Deep' = MLP sobre [numéricas + embeddings categóricos] + el escalar del wide.
-    Devuelve probabilidad en [0,1].
-    """
-    def __init__(self, indexers: Dict[str, Dict[str,int]], cat_cols: List[str], num_dim: int,
-                 emb_dim: int = 16, hidden=(256, 128), p: float = 0.2):
+    def __init__(self,
+                 indexers: Dict[str, Dict[str,int]],
+                 cat_cols: List[str],
+                 num_dim: int,
+                 emb_dim: int = 16):
         super().__init__()
         self.cat_cols = list(cat_cols)
 
-        # Embedding 1-D por columna para la parte WIDE (con +1 para UNK/PAD)
+        # WIDE: un “peso” por categoría (emb_dim=1). OJO: len(indexers[c]) + 1
         self.wide_embs = nn.ModuleDict({
-            c: nn.Embedding(len(indexers[c]) + 1, 1, padding_idx=0)
+            c: nn.Embedding(num_embeddings=len(indexers[c]) + 1, embedding_dim=1, padding_idx=0)
             for c in self.cat_cols
         })
 
-        # Parte DEEP: embeddings compartidos + MLP
-        self.deep_emb = EmbeddingBlock(indexers, self.cat_cols, emb_dim=emb_dim)
-        # +1 porque concatenamos el escalar del wide a la entrada del MLP
-        in_dim = (num_dim if num_dim else 0) + self.deep_emb.out_dim + 1
-        # Esta MLP debe **salir con Sigmoid** (probabilidad) si estás usando MSE en el loop
-        self.deep_mlp = MLP(in_dim, hidden=hidden, p=p)  # tu MLP actual ya termina en Sigmoid
+        # DEEP: embeddings compartidos + MLP (tu MLP devuelve LOGITS)
+        self.deep_emb = EmbeddingBlock(indexers, self.cat_cols, emb_dim=emb_dim)  # usa len(indexers[c])
+        deep_in = int(num_dim) + self.deep_emb.out_dim
+        self.deep_mlp = MLP(deep_in, hidden=(256, 128), p=0.2, out_dim=1)  # logits
 
     def forward(self, x_num: torch.Tensor, x_cat_list: List[torch.Tensor]) -> torch.Tensor:
-        # Wide: suma de biases por columna (escala [B,1])
-        if self.cat_cols and x_cat_list:
-            wide_terms = [self.wide_embs[c](x) for c, x in zip(self.cat_cols, x_cat_list)]  # lista de [B,1]
-            wide_scalar = torch.stack([t.squeeze(1) for t in wide_terms], dim=1).sum(dim=1, keepdim=True)  # [B,1]
-        else:
-            wide_scalar = torch.zeros((x_num.size(0), 1), device=x_num.device)
+        # --- Wide (logits lineales por categoría)
+        # cada wide_embs[c](x) -> [B, 1]; concatenamos y sumamos por columna => [B]
+        wide_terms = [self.wide_embs[c](x) for c, x in zip(self.cat_cols, x_cat_list)]
+        wide_logit = torch.cat(wide_terms, dim=1).sum(dim=1).squeeze(1)  # [B]
 
-        # Deep: concat de numéricas + embeddings + wide_scalar -> MLP(sigmoid)
-        parts = [wide_scalar]
-        if x_num is not None and x_num.numel() > 0:
-            parts.insert(0, x_num)
-        if self.cat_cols and x_cat_list:
-            parts.append(self.deep_emb(x_cat_list))
-        z = torch.cat(parts, dim=1)
-        return self.deep_mlp(z)  # [B] probabilidad
+        # --- Deep (logits del MLP)
+        if x_num is None:
+            deep_feats = self.deep_emb(x_cat_list)
+        else:
+            deep_feats = torch.cat([x_num, self.deep_emb(x_cat_list)], dim=1)
+        deep_logit = self.deep_mlp(deep_feats).squeeze(-1)  # [B] (logits)
+
+        # --- Combinar en espacio de logits y pasar a probabilidad
+        logit = deep_logit + wide_logit
+        prob = torch.sigmoid(logit)  # [B] en 0..1
+        return prob
 
 
 # ---------- Modelo 3: TabTransformer-lite ----------
