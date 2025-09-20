@@ -3739,59 +3739,95 @@ def _cats_to_idx(df: pd.DataFrame, col: str, mapping: Dict[str,int]) -> np.ndarr
     return np.array([mapping.get(_canon_token(v), 0) for v in df[col].astype(str)], dtype=np.int64)
 
 # ---------- dataset ----------
+
+from typing import List, Dict, Optional
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
 class SFDataset(Dataset):
     """
     Dataset para (x_num, x_cats, y, w) con y/w opcionales.
-    - En entrenamiento: devuelve (x_num, x_cats, y, w)
-    - En inferencia:    devuelve (x_num, x_cats)
+
+    - En ENTRENAMIENTO: __getitem__ -> (x_num, x_cats, y, w)
+    - En INFERENCIA:    __getitem__ -> (x_num, x_cats)
+
+    Garantiza:
+      • Orden y longitud EXACTOS de `num_cols` y `cat_cols` (como en entrenamiento).
+      • Si falta una columna numérica en df -> rellena con 0.0.
+      • Si falta una columna categórica en df -> usa "" (se mapea a UNK=0).
+      • Mapea categorías con `indexers[col]` (dict token->id con ids 1..N; 0=UNK).
+      • Normaliza pesos si existen para estabilidad numérica.
     """
     def __init__(self,
                  df: pd.DataFrame,
                  num_cols: List[str],
                  cat_cols: List[str],
                  indexers: Dict[str, Dict[str, int]],
-                 y_col: str | None = "SHORTFALL_PCT",
-                 w_col: str | None = "SF_WEIGHT"):
-        self.num_cols = list(num_cols)
-        self.cat_cols = list(cat_cols)
+                 y_col: Optional[str] = "SHORTFALL_PCT",
+                 w_col: Optional[str] = "SF_WEIGHT"):
+        self.num_cols = list(num_cols)   # orden fijo
+        self.cat_cols = list(cat_cols)   # orden fijo
         self.indexers = indexers
 
-        # Numéricas
-        self.Xn = df[self.num_cols].to_numpy(dtype=np.float32) if self.num_cols else np.zeros((len(df), 0), np.float32)
+        n = len(df)
 
-        # Categóricas -> ids (0=UNK)
+        # -------- Numéricas: construir columna a columna (faltantes -> 0.0) --------
+        if self.num_cols:
+            Xn_list = []
+            for c in self.num_cols:
+                if c in df.columns:
+                    col = pd.to_numeric(df[c], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+                else:
+                    col = np.zeros(n, dtype=np.float32)
+                Xn_list.append(col)
+            self.Xn = np.stack(Xn_list, axis=1)  # [n, len(num_cols)]
+        else:
+            self.Xn = np.zeros((n, 0), dtype=np.float32)
+
+        # -------- Categóricas: faltantes -> "" (UNK=0) --------
         self.Xc = []
         for c in self.cat_cols:
-            vals = df[c].astype(str).fillna("")
-            ix = self.indexers.get(c, {})
-            codes = np.array([ix.get(v, 0) for v in vals], dtype=np.int64)
+            if c in df.columns:
+                vals = df[c].astype(str).fillna("")
+            else:
+                vals = pd.Series([""] * n, index=df.index, dtype=str)
+            ix = self.indexers.get(c, {})  # dict token->id con ids 1..N; 0=UNK
+            codes = np.array([ix.get(str(v), 0) for v in vals], dtype=np.int64)
             self.Xc.append(codes)
 
-        # Etiquetas/pesos (opcionales)
+        # -------- Etiquetas/pesos (opcionales) --------
         self.has_y = (y_col is not None) and (y_col in df.columns)
         self.has_w = (w_col is not None) and (w_col in df.columns)
 
         self.y = df[y_col].to_numpy(dtype=np.float32) if self.has_y else None
-        # Normaliza pesos para estabilidad si existen; si no, se usa 1.0 en __getitem__
+
         if self.has_w:
             w = df[w_col].to_numpy(dtype=np.float32)
             self.w = (w / (w.mean() + 1e-9)).astype(np.float32)
         else:
             self.w = None
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.Xn)
 
     def __getitem__(self, i: int):
         xn = torch.tensor(self.Xn[i], dtype=torch.float32)
         xc = [torch.tensor(arr[i], dtype=torch.long) for arr in self.Xc]
+
         if not self.has_y:
             # Inferencia
             return xn, xc
+
         # Entrenamiento / validación
-        y  = torch.tensor(self.y[i], dtype=torch.float32)
-        w  = torch.tensor(self.w[i], dtype=torch.float32) if self.w is not None else torch.tensor(1.0, dtype=torch.float32)
+        y = torch.tensor(self.y[i], dtype=torch.float32)
+        w = torch.tensor(self.w[i], dtype=torch.float32) if self.w is not None else torch.tensor(1.0, dtype=torch.float32)
         return xn, xc, y, w
+
+
+
+
 # --- helpers de cardinalidad / embs ---
 def _emb_dim(n: int) -> int:
     # regla estándar para embeddings tabulares
@@ -4329,9 +4365,10 @@ def _predict_one_torch(pred_df: pd.DataFrame, tfm: "TorchFailureModel") -> np.nd
     if pred_df is None or pred_df.empty:
         return np.zeros(0)
     # asegura columnas
-    use_num = [c for c in tfm.num_cols if c in pred_df.columns]
-    use_cat = [c for c in tfm.cat_cols if c in pred_df.columns]
+    use_num = list(tfm.num_cols)   # orden y longitud EXACTOS del entrenamiento
+    use_cat = list(tfm.cat_cols)
     ds = SFDataset(pred_df, use_num, use_cat, tfm.indexers, y_col=None, w_col=None)
+
     loader = DataLoader(ds, batch_size=1024, shuffle=False)
     model = tfm.model.to(tfm.device).eval()
     preds = []
