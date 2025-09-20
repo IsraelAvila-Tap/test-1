@@ -3788,77 +3788,92 @@ class DL_MLP_Emb(nn.Module):
         return self.mlp(z)
 
 # ---------- Modelo 2: Wide & Deep ----------
-class DL_WideDeep(nn.Module):
-    def __init__(self, indexers, cat_cols, num_dim):
+class CatEmbShared(nn.Module):
+    """
+    Embeddings con dimensión compartida para todas las columnas categóricas.
+    Devuelve tokens [B, n_cat, emb_dim].
+    """
+    def __init__(self, indexers: dict, cat_cols: list[str], emb_dim: int):
         super().__init__()
-        self.emb = EmbeddingBlock(indexers, cat_cols)
-        self.deep = MLP(self.emb.out_dim + num_dim, hidden=(128,64,32))
-        # parte wide: lineal simple sobre numéricas + “embeddings de 1d” por cada cat
-        self.wide_num = nn.Linear(num_dim, 1, bias=True) if num_dim > 0 else None
-        self.wide_cats = nn.ModuleDict()
-        for c in cat_cols:
-            n = len(indexers[c]) + 1
-            self.wide_cats[c] = nn.Embedding(num_embeddings=n, embedding_dim=1, padding_idx=0)
-        self.fin = nn.Sequential(nn.Linear(2, 1), nn.Sigmoid())
-        self.cat_cols = cat_cols
-    def forward(self, x_num, x_cat_list):
-        deep_p = self.deep(torch.cat([x_num, self.emb(x_cat_list)], dim=1))  # [B]
-        # wide = b0 + w_num*x + sum(embed1(cat_i))
-        wide = torch.zeros_like(deep_p).unsqueeze(1)
-        if self.wide_num is not None:
-            wide = wide + self.wide_num(x_num)
-        for c, x in zip(self.cat_cols, x_cat_list):
-            wide = wide + self.wide_cats[c](x)
-        wide = torch.sigmoid(wide).squeeze(1)
-        return self.fin(torch.stack([deep_p, wide], dim=1)).squeeze(1)
+        self.cols = list(cat_cols)
+        self.emb_dim = int(emb_dim)
+        self.embs = nn.ModuleDict({
+            c: nn.Embedding(int(indexers[c]) + 1, self.emb_dim)
+            for c in self.cols
+        })
+
+    def forward(self, x_cat: torch.Tensor) -> torch.Tensor:
+        # x_cat: [B, n_cat] (torch.long)
+        toks = [self.embs[c](x_cat[:, i]) for i, c in enumerate(self.cols)]
+        return torch.stack(toks, dim=1)  # [B, n_cat, emb_dim]
 
 # ---------- Modelo 3: TabTransformer-lite ----------
 class DL_TabTransformer(nn.Module):
     def __init__(self, indexers, cat_cols, num_dim, d_model=32, nhead=4, nlayers=2, p=0.1):
         super().__init__()
-        # proyecta cada emb a d_model y aplica atención multi-cabeza sobre tokens categóricos
-        self.cat_cols = cat_cols
-        self.emb = EmbeddingBlock(indexers, cat_cols)
-        self.proj = nn.Linear(self.emb.out_dim // len(cat_cols), d_model) if cat_cols else None
-        self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=4*d_model, dropout=p, batch_first=True)
-            for _ in range(nlayers)
-        ])
-        # token CLS aprendido
-        self.cls = nn.Parameter(torch.randn(1, 1, d_model))
-        self.num_proj = nn.Linear(num_dim, d_model) if num_dim > 0 else None
-        self.head = MLP(d_model*2 if num_dim > 0 else d_model, hidden=(128,64), p=0.2)
-        self.per_token_dim = None
-        if cat_cols:
-            # dividimos el gran vector de embs en tokens por col
-            self.per_token_dim = self.emb.embs[cat_cols[0]].embedding_dim
-            assert all(self.emb.embs[c].embedding_dim == self.per_token_dim for c in cat_cols), \
-                "Usa misma dimensión de embedding por categoría para TabTransformer-lite."
+        assert d_model % nhead == 0, "d_model debe ser divisible entre nhead"
+
+        self.cat_cols = list(cat_cols)
+        self.per_token_dim = int(d_model)
+
+        # Embeddings con dimensión COMPARTIDA (= d_model) para TODAS las categorías
+        self.embs = nn.ModuleDict({
+            c: nn.Embedding(int(indexers[c]) + 1, self.per_token_dim)
+            for c in self.cat_cols
+        })
+
+        # Token CLS aprendido
+        self.cls = nn.Parameter(torch.randn(1, 1, self.per_token_dim))
+
+        # Proyección de numéricas al mismo espacio de token
+        self.num_proj = nn.Linear(int(num_dim), self.per_token_dim) if num_dim and num_dim > 0 else None
+
+        # Encoder Transformer sobre la secuencia de tokens (categorías + CLS)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=self.per_token_dim,
+            nhead=nhead,
+            dim_feedforward=4 * self.per_token_dim,
+            dropout=p,
+            batch_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(enc_layer, num_layers=nlayers)
+
+        # Cabeza: concatena [CLS, num_token] si hay numéricas
+        in_dim = self.per_token_dim * (2 if self.num_proj is not None else 1)
+        self.head = MLP(in_dim, hidden=(128, 64), p=0.2)
+
     def forward(self, x_num, x_cat_list):
-        if not self.cat_cols:
-            # sin categorías: cae a numéricas
-            h_cls = torch.tanh(self.num_proj(x_num)) if self.num_proj else torch.zeros((x_num.size(0), 32), device=x_num.device)
-        else:
-            # construye tokens por columna
-            token_list = []
-            for c, x in zip(self.cat_cols, x_cat_list):
-                token_list.append(self.emb.embs[c](x))  # [B, d_c]
-            T = torch.stack(token_list, dim=1)  # [B, C, d]
-            # proyecta a d_model si hace falta
-            if self.proj is not None and T.size(-1) != self.proj.out_features:
-                T = self.proj(T)
-            # añade CLS delante
+        # x_cat_list: list[LongTensor] con shape [B], una por columna categórica
+        # x_num: FloatTensor [B, num_dim] o None si no hay numéricas
+        device = self.cls.device
+
+        # Construye tokens categóricos [B, C, d]
+        if self.cat_cols and x_cat_list:
+            toks = [self.embs[c](x.to(device)) for c, x in zip(self.cat_cols, x_cat_list)]  # cada uno [B, d_model]
+            T = torch.stack(toks, dim=1)  # [B, C, d_model]
             B = T.size(0)
-            cls = self.cls.expand(B, -1, -1)      # [B,1,D]
-            X = torch.cat([cls, T], dim=1)        # [B,1+C,D]
-            for blk in self.blocks:
-                X = blk(X)
-            h_cls = X[:, 0, :]                    # [B,D]
-        if self.num_proj is not None:
-            h = torch.cat([h_cls, torch.tanh(self.num_proj(x_num))], dim=1)
         else:
-            h = h_cls
+            # Sin categorías: solo CLS
+            B = x_num.size(0) if x_num is not None else 1
+            T = torch.zeros((B, 0, self.per_token_dim), device=device)
+
+        # Añade CLS delante y pasa por el encoder
+        cls_tok = self.cls.expand(B, 1, self.per_token_dim)  # [B,1,d_model]
+        X = torch.cat([cls_tok, T], dim=1)                   # [B,1+C,d_model]
+        X = self.blocks(X)                                   # [B,1+C,d_model]
+        h_cls = X[:, 0, :]                                   # [B,d_model]
+
+        # Token numérico (si existe) y concatenación
+        if self.num_proj is not None and x_num is not None:
+            num_tok = torch.tanh(self.num_proj(x_num.to(device)))  # [B,d_model]
+            h = torch.cat([h_cls, num_tok], dim=1)                 # [B,2*d_model]
+        else:
+            h = h_cls                                              # [B,d_model]
+
+        # Probabilidad (sigmoid dentro de MLP si así lo definiste)
         return self.head(h)
+
+
 
 # ---------- entrenamiento genérico ----------
 @dataclass
