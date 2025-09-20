@@ -3694,6 +3694,400 @@ def predict_failure(detalles_df: pd.DataFrame,
         
         return resumen[cols_res], pred_df[cols_det]
 
+        # =========================
+        # 🔥 Deep Learning (PyTorch) para riesgo de shortfall
+        # Modelos: (1) MLP+Emb, (2) Wide&Deep, (3) TabTransformer-lite
+        # =========================
+        import math, numpy as np, pandas as pd
+        from dataclasses import dataclass
+        from typing import List, Dict, Tuple
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import Dataset, DataLoader
+        
+        # ---------- utilidades compartidas ----------
+        def _emb_dim(n: int) -> int:
+            # misma heurística comentada: cap=50
+            return int(min(50, round(1.6 * (max(n, 1) ** 0.56))))
+        
+        def _canon_token(x):
+            # key robusta para categorías
+            return str(x).strip().upper()
+        
+        def _build_indexers(df: pd.DataFrame, cat_cols: List[str]) -> Dict[str, Dict[str, int]]:
+            """
+            Crea diccionario por columna -> {token: idx}. idx=0 reservado para UNK.
+            """
+            indexers = {}
+            for c in cat_cols:
+                uniq = sorted({_canon_token(v) for v in df[c].astype(str).fillna("")})
+                mapping = {tok: i+1 for i, tok in enumerate(uniq)}  # 0 = UNK
+                indexers[c] = mapping
+            return indexers
+        
+        def _cats_to_idx(df: pd.DataFrame, col: str, mapping: Dict[str,int]) -> np.ndarray:
+            return np.array([mapping.get(_canon_token(v), 0) for v in df[col].astype(str)], dtype=np.int64)
+        
+        # ---------- dataset ----------
+        class SFDataset(Dataset):
+            def __init__(self, df, num_cols, cat_cols, indexers, y_col=None, w_col=None):
+                Xn = df[num_cols].astype(float).fillna(0.0).values if num_cols else np.zeros((len(df), 0), dtype=np.float32)
+                self.x_num = torch.tensor(Xn, dtype=torch.float32)
+                self.x_cat = [torch.tensor(_cats_to_idx(df, c, indexers[c]), dtype=torch.long) for c in cat_cols]
+                self.y = torch.tensor(df[y_col].astype(float).values, dtype=torch.float32) if y_col else None
+                if w_col and w_col in df.columns:
+                    w = df[w_col].astype(float).fillna(0.0).values
+                    # normaliza pesos para estabilidad numérica
+                    self.w = torch.tensor(w / (w.mean() + 1e-9), dtype=torch.float32)
+                else:
+                    self.w = None
+            def __len__(self): return len(self.x_num)
+            def __getitem__(self, i):
+                cats = [xc[i] for xc in self.x_cat]
+                if self.y is None: return self.x_num[i], cats
+                return self.x_num[i], cats, self.y[i], (self.w[i] if self.w is not None else torch.tensor(1.0))
+        
+        # ---------- bloques comunes ----------
+        class EmbeddingBlock(nn.Module):
+            def __init__(self, indexers: Dict[str, Dict[str,int]], cat_cols: List[str]):
+                super().__init__()
+                self.cat_cols = cat_cols
+                self.embs = nn.ModuleDict()
+                for c in cat_cols:
+                    n = len(indexers[c]) + 1  # +UNK
+                    d = _emb_dim(n)
+                    self.embs[c] = nn.Embedding(num_embeddings=n, embedding_dim=d, padding_idx=0)
+                self.out_dim = sum(self.embs[c].embedding_dim for c in cat_cols)
+            def forward(self, x_cat_list: List[torch.Tensor]) -> torch.Tensor:
+                # preserva el orden de cat_cols
+                embs = []
+                for c, x in zip(self.cat_cols, x_cat_list):
+                    embs.append(self.embs[c](x))
+                return torch.cat(embs, dim=1) if embs else torch.zeros((x_cat_list[0].shape[0], 0), device=x_cat_list[0].device)
+        
+        class MLP(nn.Module):
+            def __init__(self, in_dim, hidden=(128,64,32), p=0.2):
+                super().__init__()
+                layers = []
+                d = in_dim
+                for h in hidden:
+                    layers += [nn.Linear(d, h), nn.ReLU(), nn.BatchNorm1d(h), nn.Dropout(p)]
+                    d = h
+                layers += [nn.Linear(d, 1), nn.Sigmoid()]
+                self.net = nn.Sequential(*layers)
+            def forward(self, x): return self.net(x).squeeze(1)
+        
+        # ---------- Modelo 1: MLP+Emb ----------
+        class DL_MLP_Emb(nn.Module):
+            def __init__(self, indexers, cat_cols, num_dim):
+                super().__init__()
+                self.emb = EmbeddingBlock(indexers, cat_cols)
+                self.mlp = MLP(self.emb.out_dim + num_dim)
+            def forward(self, x_num, x_cat_list):
+                z = torch.cat([x_num, self.emb(x_cat_list)], dim=1)
+                return self.mlp(z)
+        
+        # ---------- Modelo 2: Wide & Deep ----------
+        class DL_WideDeep(nn.Module):
+            def __init__(self, indexers, cat_cols, num_dim):
+                super().__init__()
+                self.emb = EmbeddingBlock(indexers, cat_cols)
+                self.deep = MLP(self.emb.out_dim + num_dim, hidden=(128,64,32))
+                # parte wide: lineal simple sobre numéricas + “embeddings de 1d” por cada cat
+                self.wide_num = nn.Linear(num_dim, 1, bias=True) if num_dim > 0 else None
+                self.wide_cats = nn.ModuleDict()
+                for c in cat_cols:
+                    n = len(indexers[c]) + 1
+                    self.wide_cats[c] = nn.Embedding(num_embeddings=n, embedding_dim=1, padding_idx=0)
+                self.fin = nn.Sequential(nn.Linear(2, 1), nn.Sigmoid())
+                self.cat_cols = cat_cols
+            def forward(self, x_num, x_cat_list):
+                deep_p = self.deep(torch.cat([x_num, self.emb(x_cat_list)], dim=1))  # [B]
+                # wide = b0 + w_num*x + sum(embed1(cat_i))
+                wide = torch.zeros_like(deep_p).unsqueeze(1)
+                if self.wide_num is not None:
+                    wide = wide + self.wide_num(x_num)
+                for c, x in zip(self.cat_cols, x_cat_list):
+                    wide = wide + self.wide_cats[c](x)
+                wide = torch.sigmoid(wide).squeeze(1)
+                return self.fin(torch.stack([deep_p, wide], dim=1)).squeeze(1)
+        
+        # ---------- Modelo 3: TabTransformer-lite ----------
+        class DL_TabTransformer(nn.Module):
+            def __init__(self, indexers, cat_cols, num_dim, d_model=32, nhead=4, nlayers=2, p=0.1):
+                super().__init__()
+                # proyecta cada emb a d_model y aplica atención multi-cabeza sobre tokens categóricos
+                self.cat_cols = cat_cols
+                self.emb = EmbeddingBlock(indexers, cat_cols)
+                self.proj = nn.Linear(self.emb.out_dim // len(cat_cols), d_model) if cat_cols else None
+                self.blocks = nn.ModuleList([
+                    nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=4*d_model, dropout=p, batch_first=True)
+                    for _ in range(nlayers)
+                ])
+                # token CLS aprendido
+                self.cls = nn.Parameter(torch.randn(1, 1, d_model))
+                self.num_proj = nn.Linear(num_dim, d_model) if num_dim > 0 else None
+                self.head = MLP(d_model*2 if num_dim > 0 else d_model, hidden=(128,64), p=0.2)
+                self.per_token_dim = None
+                if cat_cols:
+                    # dividimos el gran vector de embs en tokens por col
+                    self.per_token_dim = self.emb.embs[cat_cols[0]].embedding_dim
+                    assert all(self.emb.embs[c].embedding_dim == self.per_token_dim for c in cat_cols), \
+                        "Usa misma dimensión de embedding por categoría para TabTransformer-lite."
+            def forward(self, x_num, x_cat_list):
+                if not self.cat_cols:
+                    # sin categorías: cae a numéricas
+                    h_cls = torch.tanh(self.num_proj(x_num)) if self.num_proj else torch.zeros((x_num.size(0), 32), device=x_num.device)
+                else:
+                    # construye tokens por columna
+                    token_list = []
+                    for c, x in zip(self.cat_cols, x_cat_list):
+                        token_list.append(self.emb.embs[c](x))  # [B, d_c]
+                    T = torch.stack(token_list, dim=1)  # [B, C, d]
+                    # proyecta a d_model si hace falta
+                    if self.proj is not None and T.size(-1) != self.proj.out_features:
+                        T = self.proj(T)
+                    # añade CLS delante
+                    B = T.size(0)
+                    cls = self.cls.expand(B, -1, -1)      # [B,1,D]
+                    X = torch.cat([cls, T], dim=1)        # [B,1+C,D]
+                    for blk in self.blocks:
+                        X = blk(X)
+                    h_cls = X[:, 0, :]                    # [B,D]
+                if self.num_proj is not None:
+                    h = torch.cat([h_cls, torch.tanh(self.num_proj(x_num))], dim=1)
+                else:
+                    h = h_cls
+                return self.head(h)
+        
+        # ---------- entrenamiento genérico ----------
+        @dataclass
+        class TorchFailureModel:
+            name: str
+            model: nn.Module
+            indexers: Dict[str, Dict[str,int]]
+            num_cols: List[str]
+            cat_cols: List[str]
+            device: str
+        
+        def _train_loop(model, train_loader, valid_loader, device, epochs=25, lr=1e-3):
+            model.to(device)
+            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+            best = math.inf
+            best_state = None
+            loss_fn = nn.MSELoss(reduction='none')
+            for ep in range(1, epochs+1):
+                model.train()
+                tot = 0.0; n = 0
+                for batch in train_loader:
+                    x_num, x_cats, y, w = batch
+                    x_num = x_num.to(device); y = y.to(device); w = w.to(device)
+                    x_cats = [t.to(device) for t in x_cats]
+                    pred = model(x_num, x_cats).clamp(0,1)
+                    loss = (loss_fn(pred, y) * w).mean()
+                    opt.zero_grad(); loss.backward(); opt.step()
+                    tot += loss.item() * len(y); n += len(y)
+                # valid
+                model.eval()
+                with torch.no_grad():
+                    vt = 0.0; vn = 0
+                    for batch in valid_loader:
+                        x_num, x_cats, y, w = batch
+                        x_num = x_num.to(device); y = y.to(device); w = w.to(device)
+                        x_cats = [t.to(device) for t in x_cats]
+                        pred = model(x_num, x_cats).clamp(0,1)
+                        vloss = (loss_fn(pred, y) * w).mean()
+                        vt += vloss.item() * len(y); vn += len(y)
+                if vt/vn < best:
+                    best = vt/vn
+                    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                # (opcional) print(f"ep{ep}: train={tot/n:.4f} val={vt/vn:.4f}")
+            if best_state is not None:
+                model.load_state_dict(best_state)
+            return model
+        
+        # ---------- preparación de datos (reusa tus helpers) ----------
+        def build_training_table_for_dl(window_days: int = 730) -> Tuple[pd.DataFrame, List[str], List[str]]:
+            """
+            Arma ydf con y=SHORTFALL_PCT y w=SF_WEIGHT.
+            Reusa las mismas funciones que tu modelo ML para consistencia.
+            """
+            try:
+                tab_arer = get_tab_name("ar_er", ["AR-ER", "AR ER", "AR_ER", "ARER"])
+                arer = read_sheet(SHEET_ID, tab_arer)
+            except Exception:
+                arer = pd.DataFrame()
+            ydf = _label_from_arer_shortfall(arer)
+            if ydf is None or ydf.empty:
+                return pd.DataFrame(), [], []
+            ydf = _attach_tabla2_spr(ydf)
+            ydf = _add_calendar_feats(ydf, "FECHA")
+            ydf = _rolling_shortfall(ydf)  # crea SF_MEAN_* y CONF_* si quieres usarlas
+            # features numéricas “core”
+            NUM_COLS = [c for c in ["SPR_T2","CONF_EFECTIVO","DOW","IS_WE","MES","SEM"] if c in ydf.columns]
+            # categorías
+            CAT_COLS = [c for c in ["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"] if c in ydf.columns]
+            # target/weight
+            ydf["SHORTFALL_PCT"] = pd.to_numeric(ydf["SHORTFALL_PCT"], errors="coerce").clip(0,1).fillna(0.0)
+            ydf["SF_WEIGHT"] = pd.to_numeric(ydf.get("SF_WEIGHT", 1.0), errors="coerce").fillna(1.0)
+            # split simple: por fecha (80/20)
+            if "FECHA" in ydf.columns:
+                ydf = ydf.sort_values("FECHA")
+            return ydf, NUM_COLS, CAT_COLS
+        
+        def train_torch_failure_model(model_kind: str = "mlp", epochs: int = 25, lr: float = 1e-3, bs: int = 512) -> TorchFailureModel | None:
+            ydf, NUM_COLS, CAT_COLS = build_training_table_for_dl()
+            if ydf is None or ydf.empty:
+                return None
+            indexers = _build_indexers(ydf, CAT_COLS)
+            # split temporal 80/20
+            n = len(ydf)
+            cut = int(n*0.8)
+            train_df = ydf.iloc[:cut].reset_index(drop=True)
+            valid_df = ydf.iloc[cut:].reset_index(drop=True)
+            train_ds = SFDataset(train_df, NUM_COLS, CAT_COLS, indexers, y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
+            valid_ds = SFDataset(valid_df, NUM_COLS, CAT_COLS, indexers, y_col="SHORTFALL_PCT", w_col="SF_WEIGHT")
+            train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, drop_last=False)
+            valid_loader = DataLoader(valid_ds, batch_size=bs, shuffle=False, drop_last=False)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            # instancia
+            if model_kind.lower() == "mlp":
+                net = DL_MLP_Emb(indexers, CAT_COLS, num_dim=len(NUM_COLS))
+            elif model_kind.lower() in ("wide", "wide_deep"):
+                net = DL_WideDeep(indexers, CAT_COLS, num_dim=len(NUM_COLS))
+            else:  # "tabtr"
+                # para TabTransformer-lite, fuerza misma dim por categoría (opcional)
+                net = DL_TabTransformer(indexers, CAT_COLS, num_dim=len(NUM_COLS), d_model=32, nhead=4, nlayers=2)
+            net = _train_loop(net, train_loader, valid_loader, device, epochs=epochs, lr=lr)
+            return TorchFailureModel(name=model_kind, model=net, indexers=indexers, num_cols=NUM_COLS, cat_cols=CAT_COLS, device=device)
+        
+        # Cachea en Streamlit si está disponible
+        try:
+            import streamlit as st
+            @st.cache_resource(show_spinner=False)
+            def _get_torch_model_cached(kind: str):
+                return train_torch_failure_model(model_kind=kind, epochs=25, lr=1e-3, bs=512)
+        except Exception:
+            def _get_torch_model_cached(kind: str):
+                return train_torch_failure_model(model_kind=kind, epochs=25, lr=1e-3, bs=512)
+        
+        # ---------- predicción con los 3 DL + blend ----------
+        def _prep_pred_table(detalles_df: pd.DataFrame, tabla3_df: pd.DataFrame) -> pd.DataFrame:
+            """
+            Replica tu preparación de features para predicción (solo MLPs):
+            usa Tabla 3 (rutas por MLP) + SPR diario desde Tabla 2 (detalles).
+            """
+            if tabla3_df is None or tabla3_df.empty:
+                return pd.DataFrame()
+            det = detalles_df.copy()
+            det["FECHA"] = pd.to_datetime(det["FECHA"], errors="coerce")
+            det["SPR"] = pd.to_numeric(det["SPR"], errors="coerce")
+            spr_map = (
+                det.groupby(["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], dropna=False)["SPR"]
+                   .mean().rename("SPR_T2").reset_index()
+            )
+            t3 = tabla3_df.copy()
+            t3["FECHA"] = pd.to_datetime(t3["FECHA"], errors="coerce")
+            t3["Rutas"] = pd.to_numeric(t3["Rutas"], errors="coerce").fillna(0).astype(int)
+            t3 = t3.merge(spr_map, on=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"], how="left")
+            t3["SPR_T2"] = pd.to_numeric(t3["SPR_T2"], errors="coerce").fillna(25.0)
+            # calendarios
+            t3["DOW"] = t3["FECHA"].dt.weekday
+            t3["IS_WE"] = t3["DOW"].isin([5,6]).astype(int)
+            t3["MES"] = t3["FECHA"].dt.month
+            t3["SEM"] = t3["FECHA"].dt.isocalendar().week.astype(int)
+            # shipments estimados para ponderar riesgo
+            t3["Shipments"] = (t3["Rutas"] * t3["SPR_T2"]).round().astype(int)
+            return t3
+        
+        def _predict_one_torch(pred_df: pd.DataFrame, tfm: TorchFailureModel) -> np.ndarray:
+            if pred_df is None or pred_df.empty:
+                return np.zeros(0)
+            # asegura columnas
+            use_num = [c for c in tfm.num_cols if c in pred_df.columns]
+            use_cat = [c for c in tfm.cat_cols if c in pred_df.columns]
+            ds = SFDataset(pred_df, use_num, use_cat, tfm.indexers, y_col=None, w_col=None)
+            loader = DataLoader(ds, batch_size=1024, shuffle=False)
+            model = tfm.model.to(tfm.device).eval()
+            preds = []
+            with torch.no_grad():
+                for batch in loader:
+                    x_num, x_cats = batch
+                    x_num = x_num.to(tfm.device)
+                    x_cats = [t.to(tfm.device) for t in x_cats]
+                    p = model(x_num, x_cats).clamp(0,1).detach().cpu().numpy()
+                    preds.append(p)
+            return np.concatenate(preds) if preds else np.zeros(len(pred_df))
+        
+        def predict_failure_dl(detalles_df: pd.DataFrame,
+                               tabla3_df: pd.DataFrame,
+                               kinds: List[str] = ("mlp","wide_deep","tabtr"),
+                               blend: str = "mean") -> Tuple[pd.DataFrame, pd.DataFrame]:
+            """
+            Devuelve (resumen_svc, detalle) agregando columnas:
+              Prob_DL_MLP, Prob_DL_WD, Prob_DL_TT, Prob_DL_BLEND
+            """
+            base = _prep_pred_table(detalles_df, tabla3_df)
+            if base is None or base.empty:
+                empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_DL_BLEND"])
+                empty_det = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
+                                                  "Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT","Prob_DL_BLEND",
+                                                  "Rutas_riesgo","Shipments_riesgo"])
+                return empty_res, empty_det
+        
+            # carga/entrena modelos
+            models = {}
+            for k in kinds:
+                models[k] = _get_torch_model_cached(k)
+        
+            # predicciones
+            out = base.copy()
+            name_map = {"mlp":"Prob_DL_MLP","wide_deep":"Prob_DL_WD","wide":"Prob_DL_WD","tabtr":"Prob_DL_TT"}
+            for k, tfm in models.items():
+                out[name_map.get(k,k)] = _predict_one_torch(out, tfm)
+        
+            cols_pred = [c for c in ["Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT"] if c in out.columns]
+            if not cols_pred:
+                out["Prob_DL_BLEND"] = 0.0
+            else:
+                if blend == "mean":
+                    out["Prob_DL_BLEND"] = out[cols_pred].mean(axis=1)
+                elif blend == "max":
+                    out["Prob_DL_BLEND"] = out[cols_pred].max(axis=1)
+                else:
+                    out["Prob_DL_BLEND"] = out[cols_pred].mean(axis=1)
+        
+            # riesgos ponderados
+            out["Rutas_riesgo"] = out["Prob_DL_BLEND"] * out["Rutas"]
+            out["Shipments_riesgo"] = out["Prob_DL_BLEND"] * out["Shipments"]
+        
+            # resumen SVC
+            grp = out.groupby("SVC", dropna=False)
+            ship_sum = grp["Shipments"].sum().replace(0, np.nan)
+            prob_w = (grp.apply(lambda g: (g["Prob_DL_BLEND"] * g["Shipments"]).sum()) / ship_sum).fillna(0).rename("Prob_DL_BLEND")
+            resumen = pd.concat([
+                grp["Rutas"].sum().rename("Rutas"),
+                grp["Rutas_riesgo"].sum().rename("Rutas_riesgo"),
+                grp["Shipments"].sum().rename("Shipments"),
+                grp["Shipments_riesgo"].sum().rename("Shipments_riesgo"),
+                prob_w
+            ], axis=1).reset_index()
+            # orden
+            try:
+                ord_dm = pd.CategoricalDtype(["Rentals","MLP SDD","MLP SPOT","MLP BACKLOG"], ordered=True)
+                out["DELIVERY_MOD"] = out["DELIVERY_MOD"].astype(ord_dm)
+                out = out.sort_values(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Prob_DL_BLEND"],
+                                      ascending=[True, True, True, True, False]).reset_index(drop=True)
+            except Exception:
+                pass
+        
+            det_cols = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Shipments",
+                        "Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT","Prob_DL_BLEND","Rutas_riesgo","Shipments_riesgo"]
+            for c in det_cols:
+                if c not in out.columns:
+                    out[c] = np.nan
+            return resumen[["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Prob_DL_BLEND"]], out[det_cols]
+
 
 # -----------------------------------------------------------------------------
 # 6) UI
@@ -4142,6 +4536,42 @@ try:
                         columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP","Rutas","Score"]
                     )
                 st.dataframe(tabla3, use_container_width=True, hide_index=True)
+
+                # === Tabla 4 — Riesgo de fallo (DL, PyTorch) ===
+                st.markdown("### Tabla 4 — Riesgo de fallo (DL, PyTorch)")
+                
+                res_svc_dl, det_dl = predict_failure_dl(
+                    detalles, tabla3,
+                    kinds=("mlp","wide_deep","tabtr"),  # 3 modelos DL
+                    blend="mean"                        # promedio de los 3
+                )
+                
+                if res_svc_dl is None or res_svc_dl.empty:
+                    st.info("Sin datos para evaluar riesgo (DL).")
+                else:
+                    st.subheader("Resumen por SVC (DL Blend)")
+                    st.dataframe(
+                        res_svc_dl.style.format({
+                            "Rutas":"{:,.0f}",
+                            "Rutas_riesgo":"{:,.0f}",
+                            "Shipments":"{:,.0f}",
+                            "Shipments_riesgo":"{:,.0f}",
+                            "Prob_DL_BLEND":"{:.1%}",
+                        }),
+                        use_container_width=True, hide_index=True
+                    )
+                
+                    with st.expander("Detalle por día × DM × vehículo × MLP (DL)", expanded=False):
+                        st.dataframe(
+                            det_dl.style.format({
+                                "Rutas":"{:,.0f}", "Shipments":"{:,.0f}",
+                                "Rutas_riesgo":"{:,.0f}", "Shipments_riesgo":"{:,.0f}",
+                                "Prob_DL_MLP":"{:.1%}", "Prob_DL_WD":"{:.1%}",
+                                "Prob_DL_TT":"{:.1%}", "Prob_DL_BLEND":"{:.1%}",
+                            }),
+                            use_container_width=True, hide_index=True
+                        )
+
 
                 with st.expander("🔎 Debug SRM & Score", expanded=False):
                     try:
