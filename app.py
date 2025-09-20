@@ -3894,15 +3894,25 @@ class EmbeddingBlock(nn.Module):
 
 # ===== MLP base: devuelve LOGITS (sin Sigmoid) =====
 class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: Tuple[int, ...] = (128, 64), p: float = 0.2, out_dim: int = 1):
+    def __init__(self, in_dim: int, hidden: Tuple[int, ...] = (512, 256, 128, 64), p: float = 0.2, out_dim: int = 1):
         super().__init__()
         layers = []
         d = int(in_dim)
-        for h in hidden:
-            layers += [nn.Linear(d, int(h)), nn.ReLU(), nn.Dropout(p)]
+        
+        # Capas más profundas con BatchNorm y mejor regularización
+        for i, h in enumerate(hidden):
+            layers += [
+                nn.Linear(d, int(h)),
+                nn.BatchNorm1d(int(h)),  # BatchNorm para estabilidad
+                nn.ReLU(),
+                nn.Dropout(p * (0.5 + 0.5 * i / len(hidden)))  # Dropout progresivo
+            ]
             d = int(h)
-        layers += [nn.Linear(d, int(out_dim))]  # <- LOGITS
+        
+        # Capa final con residual connection si es posible
+        layers += [nn.Linear(d, int(out_dim))]
         self.net = nn.Sequential(*layers)
+        self.out_dim = out_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)  # [B] logits
@@ -3990,7 +4000,7 @@ class DL_WideDeep(nn.Module):
 
         self.deep_emb = EmbeddingBlock(indexers, self.cat_cols, emb_dim=emb_dim)
         deep_in = self.deep_emb.out_dim + int(num_dim)
-        self.deep_mlp = MLP(deep_in, hidden=(256, 128), p=0.2, out_dim=1)  # logits
+        self.deep_mlp = MLP(deep_in, hidden=(512, 256, 128, 64), p=0.2, out_dim=1)  # logits más profundo
 
     def forward(self, x_num: torch.Tensor, x_cat_list: List[torch.Tensor]) -> torch.Tensor:
         B = x_cat_list[0].size(0) if (x_cat_list and len(x_cat_list) > 0) else (x_num.size(0) if x_num is not None else 1)
@@ -4036,7 +4046,7 @@ class DL_TabTransformer(nn.Module):
         )
         self.blocks = nn.TransformerEncoder(enc, num_layers=nlayers)
         in_dim = self.per_token_dim * (2 if self.has_num else 1)
-        self.head = MLP(in_dim, hidden=(128, 64), p=0.2, out_dim=1)  # logits
+        self.head = MLP(in_dim, hidden=(256, 128, 64), p=0.2, out_dim=1)  # logits más profundo
 
     def forward(self, x_num: torch.Tensor, x_cat_list: List[torch.Tensor]) -> torch.Tensor:
         device = self.cls.device
@@ -4148,23 +4158,25 @@ def build_training_table_for_dl(window_days: int = 730) -> Tuple[pd.DataFrame, L
 
     return ydf, NUM_COLS, CAT_COLS
 
-def _train_loop(model, train_loader, valid_loader, device, epochs=50, lr=5e-3):
+def _train_loop(model, train_loader, valid_loader, device, epochs=100, lr=1e-3):
     """
     Entrena modelos que devuelven LOGITS (no probabilidades).
     Usa BCEWithLogitsLoss con reducción 'none' y ponderación por w.
-    Incluye early stopping y mejor logging.
+    Incluye early stopping, learning rate scheduling y mejor logging.
     """
     model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5, verbose=True)
     loss_fn = torch.nn.BCEWithLogitsLoss(reduction='none')
     
-    # Early stopping
+    # Early stopping mejorado
     best = float('inf')
-    patience = 10
+    patience = 15  # Más paciencia para modelos más complejos
     patience_counter = 0
     best_model_state = None
     
     print(f"🚀 DEBUG: Iniciando entrenamiento - {epochs} épocas, lr={lr}")
+    print(f"🔍 DEBUG: Parámetros del modelo: {sum(p.numel() for p in model.parameters()):,}")
 
     for ep in range(1, epochs + 1):
         # -------- train --------
@@ -4207,6 +4219,10 @@ def _train_loop(model, train_loader, valid_loader, device, epochs=50, lr=5e-3):
         val_avg = val_sum / max(val_n, 1)
         train_avg = train_loss / max(train_batches, 1)
         
+        # Learning rate scheduling
+        scheduler.step(val_avg)
+        current_lr = opt.param_groups[0]['lr']
+        
         # Early stopping logic
         if val_avg < best:
             best = val_avg
@@ -4217,7 +4233,7 @@ def _train_loop(model, train_loader, valid_loader, device, epochs=50, lr=5e-3):
             
         # Log cada 5 épocas
         if ep % 5 == 0 or ep == 1:
-            print(f"🔍 DEBUG: Época {ep}/{epochs} - Train Loss: {train_avg:.4f}, Val Loss: {val_avg:.4f}, Best: {best:.4f}")
+            print(f"🔍 DEBUG: Época {ep}/{epochs} - Train Loss: {train_avg:.4f}, Val Loss: {val_avg:.4f}, Best: {best:.4f}, LR: {current_lr:.2e}")
         
         # Early stopping
         if patience_counter >= patience:
@@ -4250,14 +4266,14 @@ from typing import Optional
 
 def train_torch_failure_model(
     model_kind: str = "mlp",
-    epochs: int = 50,
-    lr: float = 5e-3,
-    bs: int = 256,
-    emb_dim: int = 16,        # tamaño de embedding para MLP/Wide&Deep
-    d_model: int = 32,        # tamaño de token para TabTransformer
-    nhead: int = 4,
-    nlayers: int = 2,
-    dropout_p: float = 0.15,
+    epochs: int = 100,        # Aumentado para mejor convergencia
+    lr: float = 1e-3,         # Learning rate más conservador
+    bs: int = 128,            # Batch size más pequeño para mejor gradientes
+    emb_dim: int = 64,        # Embeddings más grandes para mejor representación
+    d_model: int = 128,       # TabTransformer más grande
+    nhead: int = 8,           # Más atención heads
+    nlayers: int = 4,         # Más capas de transformer
+    dropout_p: float = 0.2,   # Más dropout para regularización
 ) -> Optional["TorchFailureModel"]:
     try:
         print(f"🔍 DEBUG: Iniciando entrenamiento de {model_kind}")
@@ -4346,13 +4362,17 @@ try:
     import streamlit as st
     @st.cache_resource(show_spinner=False)
     def _get_torch_model_cached(kind: str):
-        print(f"🚀 DEBUG: Entrenando modelo {kind} con parámetros mejorados...")
+        print(f"🚀 DEBUG: Entrenando modelo {kind} con arquitectura mejorada...")
         model = train_torch_failure_model(
             model_kind=kind, 
-            epochs=50,      # Aumentado de 25 a 50
-            lr=5e-3,        # Aumentado de 1e-3 a 5e-3
-            bs=256,         # Reducido de 512 a 256 para mejor convergencia
-            dropout_p=0.15  # Aumentado para mejor regularización
+            epochs=100,     # Más épocas para convergencia
+            lr=1e-3,        # Learning rate más conservador
+            bs=128,         # Batch size más pequeño
+            emb_dim=64,     # Embeddings más grandes
+            d_model=128,    # TabTransformer más grande
+            nhead=8,        # Más atención heads
+            nlayers=4,      # Más capas
+            dropout_p=0.2   # Más regularización
         )
         if model is None:
             print(f"❌ ERROR: Modelo {kind} no se pudo entrenar")
@@ -4361,13 +4381,17 @@ try:
         return model
 except Exception:
     def _get_torch_model_cached(kind: str):
-        print(f"🚀 DEBUG: Entrenando modelo {kind} con parámetros mejorados...")
+        print(f"🚀 DEBUG: Entrenando modelo {kind} con arquitectura mejorada...")
         model = train_torch_failure_model(
             model_kind=kind, 
-            epochs=50,      # Aumentado de 25 a 50
-            lr=5e-3,        # Aumentado de 1e-3 a 5e-3
-            bs=256,         # Reducido de 512 a 256 para mejor convergencia
-            dropout_p=0.15  # Aumentado para mejor regularización
+            epochs=100,     # Más épocas para convergencia
+            lr=1e-3,        # Learning rate más conservador
+            bs=128,         # Batch size más pequeño
+            emb_dim=64,     # Embeddings más grandes
+            d_model=128,    # TabTransformer más grande
+            nhead=8,        # Más atención heads
+            nlayers=4,      # Más capas
+            dropout_p=0.2   # Más regularización
         )
         if model is None:
             print(f"❌ ERROR: Modelo {kind} no se pudo entrenar")
