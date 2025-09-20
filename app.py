@@ -3360,14 +3360,6 @@ def train_shortfall_model(window_days: int = 730) -> FailureModel | None:
     sample_weight = None if float(w.sum()) == 0 else w.values
     pipe.fit(X, y, **({"reg__sample_weight": sample_weight} if sample_weight is not None else {}))
 
-    # Monitoreo rápido
-    try:
-        y_hat = np.clip(pipe.predict(X), 0, 1)
-        mae = np.mean(np.abs(y - y_hat))
-        st.caption(f"Train: n={len(y)} · shortfall_mean={y.mean():.3f} · MAE(in-sample)={mae:.3f}")
-    except Exception:
-        pass
-
     return FailureModel(pipeline=pipe, features=num_feats + cat_feats)
 
 def _rolling_shortfall(df: pd.DataFrame) -> pd.DataFrame:
