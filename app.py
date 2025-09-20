@@ -3773,6 +3773,7 @@ def _cardinality_from_indexer(idx_val) -> int:
 
 # ---------- Embedding + MLP compartidos ----------
 # ---------- bloques comunes ----------
+from typing import Any, Dict, List, Tuple
 class EmbeddingBlock(nn.Module):
     """
     Embeddings compartidos: misma dimensión para todas las columnas categóricas.
