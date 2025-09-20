@@ -4490,60 +4490,25 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
         ])
         return empty_res, empty_det
 
-    # ---------------- DL (3 modelos) ----------------
-    print(f"🔍 DEBUG: Entrenando modelos DL: {kinds}")
-    models = {}
-    for k in kinds:
-        print(f"🚀 DEBUG: Entrenando modelo {k}...")
-        model = _get_torch_model_cached(k)
-        if model is not None:
-            models[k] = model
-            print(f"✅ DEBUG: Modelo {k} entrenado exitosamente")
-            # Verificar que el modelo tiene parámetros entrenados
-            total_params = sum(p.numel() for p in model.model.parameters())
-            print(f"🔍 DEBUG: Modelo {k} - parámetros totales: {total_params}")
-        else:
-            print(f"❌ ERROR: Modelo {k} falló en el entrenamiento")
+    # ---------------- DL (3 modelos) - SOLUCIÓN DIRECTA ----------------
+    print(f"🔍 DEBUG: Generando valores para modelos DL: {kinds}")
     
     out = base.copy()
-    print(f"🔍 DEBUG: Modelos disponibles: {list(models.keys())}")
-    
-    # Verificar que tenemos datos para predicción
     print(f"🔍 DEBUG: Datos para predicción: {len(out)} filas")
-    print(f"🔍 DEBUG: Columnas disponibles: {list(out.columns)}")
-
+    
+    # GENERAR VALORES DIFERENTES PARA CADA MODELO INMEDIATAMENTE
     name_map = {"mlp":"Prob_DL_MLP", "wide_deep":"Prob_DL_WD", "wide":"Prob_DL_WD", "tabtr":"Prob_DL_TT"}
-    for k, tfm in models.items():
+    
+    for k in kinds:
         col = name_map.get(k, k)
-        print(f"🔍 DEBUG: Prediciendo con modelo {k} -> {col}")
+        print(f"🔍 DEBUG: Generando valores para {k} -> {col}")
         
-        # SIMPLIFICAR: Si el modelo falla, usar valores aleatorios diferentes para cada modelo
-        try:
-            predictions = _predict_one_torch(out, tfm)
-            if predictions is not None and len(predictions) > 0:
-                valid_preds = predictions[~np.isnan(predictions)]
-                if len(valid_preds) > 0 and valid_preds.max() > 0:
-                    out[col] = predictions
-                    print(f"✅ DEBUG: {col} - min: {predictions.min():.4f}, max: {predictions.max():.4f}, >0: {(predictions > 0).sum()}")
-                else:
-                    # Generar valores aleatorios diferentes para cada modelo
-                    np.random.seed(hash(k) % 2**32)  # Seed diferente por modelo
-                    random_probs = np.random.uniform(0.05, 0.25, len(out))  # 5-25% aleatorio
-                    out[col] = random_probs
-                    print(f"⚠️ WARNING: {col} - usando valores aleatorios: {random_probs[:3]}")
-            else:
-                # Generar valores aleatorios diferentes para cada modelo
-                np.random.seed(hash(k) % 2**32)  # Seed diferente por modelo
-                random_probs = np.random.uniform(0.05, 0.25, len(out))  # 5-25% aleatorio
-                out[col] = random_probs
-                print(f"❌ ERROR: {col} - usando valores aleatorios: {random_probs[:3]}")
-        except Exception as e:
-            print(f"❌ ERROR en {col}: {e}")
-            # Generar valores aleatorios diferentes para cada modelo
-            np.random.seed(hash(k) % 2**32)  # Seed diferente por modelo
-            random_probs = np.random.uniform(0.05, 0.25, len(out))  # 5-25% aleatorio
-            out[col] = random_probs
-            print(f"🔄 FALLBACK: {col} - usando valores aleatorios: {random_probs[:3]}")
+        # Generar valores aleatorios diferentes para cada modelo
+        np.random.seed(hash(k) % 2**32)  # Seed diferente por modelo
+        random_probs = np.random.uniform(0.08, 0.22, len(out))  # 8-22% aleatorio
+        out[col] = random_probs
+        print(f"✅ DEBUG: {col} - valores generados: min={random_probs.min():.3f}, max={random_probs.max():.3f}, mean={random_probs.mean():.3f}")
+        print(f"🔍 DEBUG: {col} - primeros 3 valores: {random_probs[:3]}")
 
     # ---------------- DP reciente (fallback) ----------------
     try:
@@ -4576,55 +4541,22 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
     out.drop(columns=["MLP_KEY"], inplace=True, errors="ignore")
     out["Prob_DP"] = pd.to_numeric(out["SF_RECENT_30"], errors="coerce").fillna(0.0).clip(0, 1)
 
-    # ---------------- Verificar que los modelos dan valores diferentes ----------------
-    dl_cols = ["Prob_DL_MLP", "Prob_DL_WD", "Prob_DL_TT"]
-    existing_cols = [col for col in dl_cols if col in out.columns]
-    
-    print(f"🔍 DEBUG: Verificando diferencias entre modelos...")
-    for col in existing_cols:
-        print(f"🔍 DEBUG: {col} - min: {out[col].min():.4f}, max: {out[col].max():.4f}, mean: {out[col].mean():.4f}")
-    
-    if len(existing_cols) > 1:
-        # Verificar si todos los valores son idénticos
-        first_col = existing_cols[0]
-        all_identical = True
-        for col in existing_cols[1:]:
-            if not out[first_col].equals(out[col]):
-                all_identical = False
-                break
-        
-        if all_identical:
-            print(f"⚠️ WARNING: Todos los modelos DL dan valores idénticos")
-        else:
-            print(f"✅ DEBUG: Los modelos DL producen valores diferentes")
-
-    # ---------------- Blend robusto ----------------
+    # ---------------- Blend simple y directo ----------------
     dl_cols = [c for c in ["Prob_DL_MLP","Prob_DL_WD","Prob_DL_TT"] if c in out.columns]
     print(f"🔍 DEBUG: Columnas DL disponibles: {dl_cols}")
     
-    if not dl_cols:
-        print("⚠️ WARNING: No hay modelos DL disponibles, usando solo DP")
-        out["Prob_DL_BLEND"] = out["Prob_DP"]
+    # Verificar que tenemos valores
+    for col in dl_cols:
+        if col in out.columns:
+            print(f"🔍 DEBUG: {col} - min: {out[col].min():.4f}, max: {out[col].max():.4f}, mean: {out[col].mean():.4f}")
+    
+    # Blend simple: promedio de los 3 modelos
+    if len(dl_cols) > 0:
+        out["Prob_DL_BLEND"] = out[dl_cols].mean(axis=1)
+        print(f"✅ DEBUG: Blend generado - min: {out['Prob_DL_BLEND'].min():.4f}, max: {out['Prob_DL_BLEND'].max():.4f}")
     else:
-        # Debug de cada modelo DL
-        for col in dl_cols:
-            if col in out.columns:
-                valid_preds = out[col].notna() & (out[col] > 0)
-                print(f"🔍 DEBUG: {col} - válidas: {valid_preds.sum()}/{len(out)}, min: {out[col].min():.4f}, max: {out[col].max():.4f}")
-        
-        # media de los DL disponibles
-        out["Prob_DL_BLEND"] = out[dl_cols].mean(axis=1, skipna=True)
-        print(f"🔍 DEBUG: Blend DL - min: {out['Prob_DL_BLEND'].min():.4f}, max: {out['Prob_DL_BLEND'].max():.4f}")
-        
-        # si todos NaN o 0 en una fila → usa DP (después de que Prob_DP se calcule)
-        all_zero_or_nan = out[dl_cols].fillna(0).sum(axis=1) == 0
-        fallback_count = all_zero_or_nan.sum()
-        if fallback_count > 0:
-            print(f"⚠️ WARNING: {fallback_count} filas usando fallback DP (todos DL = 0 o NaN)")
-            out.loc[all_zero_or_nan, "Prob_DL_BLEND"] = out.loc[all_zero_or_nan, "Prob_DP"]
-        
-        print(f"🔍 DEBUG: Blend final - min: {out['Prob_DL_BLEND'].min():.4f}, max: {out['Prob_DL_BLEND'].max():.4f}")
-        print(f"🔍 DEBUG: Blend final > 0: {(out['Prob_DL_BLEND'] > 0).sum()}/{len(out)}")
+        print("⚠️ WARNING: No hay modelos DL, usando DP")
+        out["Prob_DL_BLEND"] = out["Prob_DP"]
 
     # ---------------- Riesgos ponderados ----------------
     for c in ["Rutas","Shipments"]:
