@@ -3950,6 +3950,114 @@ def build_training_table_for_dl(window_days: int = 730) -> Tuple[pd.DataFrame, L
         ydf = ydf.sort_values("FECHA")
     return ydf, NUM_COLS, CAT_COLS
 
+# ===== Bloques base (compartidos) ===========================================
+class EmbeddingBlock(nn.Module):
+    """
+    Embeddings compartidos: misma dimensión para todas las columnas categóricas.
+    indexers: dict {col: n_categorias}
+    """
+    def __init__(self, indexers: dict[str, int], cat_cols: list[str], emb_dim: int = 16):
+        super().__init__()
+        self.cat_cols = list(cat_cols)
+        self.emb_dim = int(emb_dim)
+        self.embs = nn.ModuleDict({
+            c: nn.Embedding(int(indexers[c]) + 1, self.emb_dim) for c in self.cat_cols
+        })
+        self.out_dim = self.emb_dim * len(self.cat_cols)
+
+    def forward(self, x_cat_list: list[torch.Tensor]) -> torch.Tensor:
+        # x_cat_list: lista de tensores long [B], uno por columna
+        if not self.cat_cols or not x_cat_list:
+            # devuelve tensor vacío con out_dim=0 (evita ifs aguas abajo)
+            B = x_cat_list[0].size(0) if x_cat_list else 1
+            return torch.zeros(B, 0, device=self.embs[self.cat_cols[0]].weight.device)
+        toks = [self.embs[c](x) for c, x in zip(self.cat_cols, x_cat_list)]  # cada uno [B, emb_dim]
+        return torch.cat(toks, dim=1)  # [B, emb_dim*|C|]
+
+
+class MLP(nn.Module):
+    """
+    Multi-Layer Perceptron que devuelve LOGITS (sin sigmoid).
+    Usa ReLU + Dropout. out_dim=1 para binario.
+    """
+    def __init__(self, in_dim: int, hidden=(256, 128), p: float = 0.2, out_dim: int = 1):
+        super().__init__()
+        layers = []
+        last = int(in_dim)
+        for h in hidden:
+            layers += [nn.Linear(last, int(h)), nn.ReLU(), nn.Dropout(p)]
+            last = int(h)
+        layers += [nn.Linear(last, int(out_dim))]  # logits
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)  # [B]
+
+
+# ===== Modelo 1: MLP + Embeddings (deep puro) ===============================
+class DL_MLPEmb(nn.Module):
+    """
+    Concatena embeddings categóricos + features numéricas y pasa por un MLP.
+    Devuelve LOGITS.
+    """
+    def __init__(self, indexers: dict[str, int], cat_cols: list[str], num_dim: int, emb_dim: int = 16):
+        super().__init__()
+        self.cat_cols = list(cat_cols)
+        self.emb = EmbeddingBlock(indexers, self.cat_cols, emb_dim=emb_dim)
+        in_dim = self.emb.out_dim + int(num_dim)
+        self.head = MLP(in_dim, hidden=(256, 128), p=0.2, out_dim=1)
+
+    def forward(self, x_num: torch.Tensor, x_cat_list: list[torch.Tensor]) -> torch.Tensor:
+        z_cat = self.emb(x_cat_list)                          # [B, emb*|C|]
+        z = torch.cat([z_cat, x_num], dim=1) if x_num is not None and x_num.numel() > 0 else z_cat
+        return self.head(z)                                   # logits [B]
+
+
+# ===== Modelo 2: Wide & Deep ===============================================
+class DL_WideDeep(nn.Module):
+    """
+    Componente 'wide' linear (como regresión con one-hots) +
+    componente 'deep' (Embeddings + MLP). Suma de LOGITS.
+    """
+    def __init__(self, indexers: dict[str, int], cat_cols: list[str], num_dim: int,
+                 emb_dim: int = 16):
+        super().__init__()
+        self.cat_cols = list(cat_cols)
+
+        # --- Wide: peso por categoría (logits)
+        self.wide_embs = nn.ModuleDict({
+            c: nn.Embedding(int(indexers[c]) + 1, 1) for c in self.cat_cols
+        })
+        self.wide_num = nn.Linear(int(num_dim), 1) if num_dim and num_dim > 0 else None
+        self.wide_bias = nn.Parameter(torch.zeros(1))
+
+        # --- Deep
+        self.deep_emb = EmbeddingBlock(indexers, self.cat_cols, emb_dim=emb_dim)
+        deep_in = self.deep_emb.out_dim + int(num_dim)
+        self.deep_head = MLP(deep_in, hidden=(256, 128), p=0.2, out_dim=1)
+
+    def forward(self, x_num: torch.Tensor, x_cat_list: list[torch.Tensor]) -> torch.Tensor:
+        # Wide logit
+        wide_logit = self.wide_bias.expand(x_cat_list[0].size(0)) if self.cat_cols else 0.0
+        for c, x in zip(self.cat_cols, x_cat_list):
+            wide_logit = wide_logit + self.wide_embs[c](x).squeeze(-1)  # suma pesos por categoría
+        if self.wide_num is not None and x_num is not None and x_num.numel() > 0:
+            wide_logit = wide_logit + self.wide_num(x_num).squeeze(-1)
+
+        # Deep logit
+        z_cat = self.deep_emb(x_cat_list)                         # [B, emb*|C|]
+        z = torch.cat([z_cat, x_num], dim=1) if x_num is not None and x_num.numel() > 0 else z_cat
+        deep_logit = self.deep_head(z)                            # [B]
+
+        return wide_logit + deep_logit                            # LOGITS [B]
+
+
+
+
+
+
+
+
 def train_torch_failure_model(model_kind: str = "mlp", epochs: int = 25, lr: float = 1e-3, bs: int = 512) -> TorchFailureModel | None:
     ydf, NUM_COLS, CAT_COLS = build_training_table_for_dl()
     if ydf is None or ydf.empty:
