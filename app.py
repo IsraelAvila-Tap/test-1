@@ -3822,6 +3822,29 @@ class MLP(nn.Module):
         # devuelve [B] si out_dim=1
         return self.net(x).squeeze(-1)
 
+
+# ===== Bloques comunes (pegar arriba, antes de los modelos) =====
+
+class CatEmbShared(nn.Module):
+    """
+    Embeddings con dimensión compartida (emb_dim) para TODAS las columnas categóricas.
+    Espera indexers={col: {token:id}}. Devuelve tokens [B, n_cat, emb_dim].
+    """
+    def __init__(self, indexers: Dict[str, Dict[str,int]], cat_cols: List[str], emb_dim: int):
+        super().__init__()
+        self.cols = list(cat_cols)
+        self.emb_dim = int(emb_dim)
+        self.embs = nn.ModuleDict({
+            c: nn.Embedding(len(indexers[c]) + 1, self.emb_dim, padding_idx=0)
+            for c in self.cols
+        })
+
+    def forward(self, x_cat_list: List[torch.Tensor]) -> torch.Tensor:
+        # x_cat_list: lista de LongTensor [B], respetando el orden de self.cols
+        toks = [self.embs[c](x) for c, x in zip(self.cols, x_cat_list)]  # cada uno [B, emb_dim]
+        return torch.stack(toks, dim=1)  # [B, n_cat, emb_dim]
+
+
 # ---------- Modelo 1: MLP + Embeddings ----------
 class DL_MLP_Emb(nn.Module):
     def __init__(self, indexers: Dict[str, object], cat_cols: List[str], num_dim: int, emb_dim: int | None = None):
@@ -3835,31 +3858,48 @@ class DL_MLP_Emb(nn.Module):
         return self.mlp(z)
 
 # ---------- Modelo 2: Wide & Deep ----------
+# ---------- Wide & Deep (ajustado a indexers={col: {token:id}}) ----------
 class DL_WideDeep(nn.Module):
     """
-    'Wide' = capa lineal sobre numéricas.
-    'Deep' = MLP sobre [embeddings || numéricas].
-    Output = promedio de probabilidades wide y deep (si existen ambas).
+    'Wide' = sesgos por categoría (emb 1-D por columna, sumados).
+    'Deep' = MLP sobre [numéricas + embeddings categóricos] + el escalar del wide.
+    Devuelve probabilidad en [0,1].
     """
-    def __init__(self, indexers: Dict[str, object], cat_cols: List[str], num_dim: int, emb_dim: int | None = None):
+    def __init__(self, indexers: Dict[str, Dict[str,int]], cat_cols: List[str], num_dim: int,
+                 emb_dim: int = 16, hidden=(256, 128), p: float = 0.2):
         super().__init__()
-        self.has_num = int(num_dim) > 0
-        self.deep_emb = EmbeddingBlock(indexers, cat_cols, emb_dim=emb_dim)
-        self.deep = MLP(self.deep_emb.out_dim + int(num_dim))
-        self.wide = nn.Linear(int(num_dim), 1) if self.has_num else None
+        self.cat_cols = list(cat_cols)
+
+        # Embedding 1-D por columna para la parte WIDE (con +1 para UNK/PAD)
+        self.wide_embs = nn.ModuleDict({
+            c: nn.Embedding(len(indexers[c]) + 1, 1, padding_idx=0)
+            for c in self.cat_cols
+        })
+
+        # Parte DEEP: embeddings compartidos + MLP
+        self.deep_emb = EmbeddingBlock(indexers, self.cat_cols, emb_dim=emb_dim)
+        # +1 porque concatenamos el escalar del wide a la entrada del MLP
+        in_dim = (num_dim if num_dim else 0) + self.deep_emb.out_dim + 1
+        # Esta MLP debe **salir con Sigmoid** (probabilidad) si estás usando MSE en el loop
+        self.deep_mlp = MLP(in_dim, hidden=hidden, p=p)  # tu MLP actual ya termina en Sigmoid
 
     def forward(self, x_num: torch.Tensor, x_cat_list: List[torch.Tensor]) -> torch.Tensor:
-        # Deep prob
-        z_cat = self.deep_emb(x_cat_list)
-        z = torch.cat([x_num, z_cat], dim=1) if self.has_num else z_cat
-        p_deep = self.deep(z)  # [B] en [0,1]
+        # Wide: suma de biases por columna (escala [B,1])
+        if self.cat_cols and x_cat_list:
+            wide_terms = [self.wide_embs[c](x) for c, x in zip(self.cat_cols, x_cat_list)]  # lista de [B,1]
+            wide_scalar = torch.stack([t.squeeze(1) for t in wide_terms], dim=1).sum(dim=1, keepdim=True)  # [B,1]
+        else:
+            wide_scalar = torch.zeros((x_num.size(0), 1), device=x_num.device)
 
-        if self.wide is None:
-            return p_deep
-        # Wide prob
-        logits_wide = self.wide(x_num).squeeze(-1)
-        p_wide = torch.sigmoid(logits_wide)
-        return 0.5 * (p_deep + p_wide)
+        # Deep: concat de numéricas + embeddings + wide_scalar -> MLP(sigmoid)
+        parts = [wide_scalar]
+        if x_num is not None and x_num.numel() > 0:
+            parts.insert(0, x_num)
+        if self.cat_cols and x_cat_list:
+            parts.append(self.deep_emb(x_cat_list))
+        z = torch.cat(parts, dim=1)
+        return self.deep_mlp(z)  # [B] probabilidad
+
 
 # ---------- Modelo 3: TabTransformer-lite ----------
 class DL_TabTransformer(nn.Module):
