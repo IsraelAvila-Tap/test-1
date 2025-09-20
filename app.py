@@ -5366,9 +5366,9 @@ try:
                     
                     # Gráfica 1: Pérdidas (todos los modelos)
                     for model, data in model_data.items():
-                        ax1.plot(epochs, data['train_loss'], f"{data['color']}-", 
+                        ax1.plot(epochs, data['train_loss'], color=data['color'], linestyle='-', 
                                 label=f'{model} Train', linewidth=2, alpha=0.8)
-                        ax1.plot(epochs, data['val_loss'], f"{data['color']}--", 
+                        ax1.plot(epochs, data['val_loss'], color=data['color'], linestyle='--', 
                                 label=f'{model} Val', linewidth=2, alpha=0.8)
                     ax1.set_title('Training & Validation Loss - All Models', fontsize=14, fontweight='bold')
                     ax1.set_xlabel('Epoch')
@@ -5378,7 +5378,7 @@ try:
                     
                     # Gráfica 2: Accuracy (todos los modelos)
                     for model, data in model_data.items():
-                        ax2.plot(epochs, data['accuracy'], f"{data['color']}-", 
+                        ax2.plot(epochs, data['accuracy'], color=data['color'], linestyle='-', 
                                 label=f'{model}', linewidth=2, alpha=0.8)
                     ax2.set_title('Validation Accuracy - All Models', fontsize=14, fontweight='bold')
                     ax2.set_xlabel('Epoch')
@@ -5388,7 +5388,7 @@ try:
                     
                     # Gráfica 3: Learning Rate (todos los modelos)
                     for model, data in model_data.items():
-                        ax3.plot(epochs, data['lr'], f"{data['color']}-", 
+                        ax3.plot(epochs, data['lr'], color=data['color'], linestyle='-', 
                                 label=f'{model}', linewidth=2, alpha=0.8)
                     ax3.set_title('Learning Rate Schedule - All Models', fontsize=14, fontweight='bold')
                     ax3.set_xlabel('Epoch')
