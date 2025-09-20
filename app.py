@@ -37,6 +37,9 @@ from dataclasses import dataclass
 from typing import List, Dict, Tuple
 from torch.utils.data import Dataset, DataLoader
 from typing import Optional
+import matplotlib
+matplotlib.use("Agg")  # antes de importar pyplot
+import matplotlib.pyplot as plt
 
 
 
