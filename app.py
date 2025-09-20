@@ -4210,7 +4210,17 @@ def _train_loop(model, train_loader, valid_loader, device, epochs=25, lr=1e-3):
         model.load_state_dict(best_state)
     return model
 
+from dataclasses import dataclass
+from typing import List, Dict, Any
 
+@dataclass
+class TorchFailureModel:
+    name: str
+    model: Any          # o nn.Module si ya tienes `import torch.nn as nn`
+    indexers: Dict[str, Any]
+    num_cols: List[str]
+    cat_cols: List[str]
+    device: str
 
 
 
