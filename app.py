@@ -2061,7 +2061,10 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     out["CAP_TOTAL"]    = base_otros.fillna(0) + out["SHIP_RENTALS"].fillna(0) + out["SHIP_CROWD"].fillna(0) + cap_mlp.fillna(0)
     
     # Rutas faltantes = demanda - capacidad total (solo valores positivos = faltante real)
-    out["RUTAS_FALTANTES"] = (out["FCST"] - out["CAP_TOTAL"]).clip(lower=0).astype(int)
+    # Asegurar que FCST sea numérico y manejar NaN e infinitos
+    fcst_numeric = pd.to_numeric(out["FCST"], errors="coerce").fillna(0)
+    rutas_falt_calc = (fcst_numeric - out["CAP_TOTAL"]).clip(lower=0)
+    out["RUTAS_FALTANTES"] = rutas_falt_calc.fillna(0).replace([np.inf, -np.inf], 0).astype(int)
     out["CAP_VS_FCST"]  = (out["CAP_TOTAL"] / out["FCST"].replace(0, np.nan)).fillna(0).round(2)
     out["CAP_DIFF_ABS"] = (pd.to_numeric(out["FCST"], errors="coerce").fillna(0) - out["CAP_TOTAL"]).abs().round(2)
     out["RIESGO"]       = np.where(out["CAP_TOTAL"] + 1e-9 >= pd.to_numeric(out["FCST"], errors="coerce").fillna(0), "OK", "RIESGO")
