@@ -5826,11 +5826,21 @@ def procesar_analisis_completo(plan_df, detalles_df, dl_risk_df):
     if plan_df is None or plan_df.empty:
         return "No hay datos del plan disponibles. Ejecuta 'Calcular plan' primero."
     
-    # Análisis del plan
-    total_fcst = plan_df['FCST'].sum()
-    total_cap = plan_df['CAP_TOTAL'].sum()
-    total_deficit = max(0, total_fcst - total_cap)
-    cobertura = (total_cap / total_fcst * 100) if total_fcst > 0 else 0
+    # Análisis del plan con manejo robusto de datos
+    try:
+        # Convertir a numérico y manejar errores
+        fcst_numeric = pd.to_numeric(plan_df['FCST'], errors='coerce').fillna(0)
+        cap_numeric = pd.to_numeric(plan_df['CAP_TOTAL'], errors='coerce').fillna(0)
+        
+        total_fcst = fcst_numeric.sum()
+        total_cap = cap_numeric.sum()
+        total_deficit = max(0, total_fcst - total_cap)
+        cobertura = (total_cap / total_fcst * 100) if total_fcst > 0 else 0
+        
+        print(f"🔍 DEBUG: FCST total: {total_fcst}, CAP total: {total_cap}, Déficit: {total_deficit}")
+    except Exception as e:
+        print(f"❌ ERROR en análisis del plan: {e}")
+        return f"Error procesando datos del plan: {e}"
     
     # Análisis de riesgo si está disponible
     riesgo_info = ""
@@ -5848,16 +5858,27 @@ def procesar_analisis_completo(plan_df, detalles_df, dl_risk_df):
     else:
         riesgo_info = "**📊 Análisis de Riesgo:** No disponible (ejecuta 'Calcular plan' primero)"
     
-    # Análisis por SVC
+    # Análisis por SVC con manejo robusto
     svc_analysis = "**🔍 Análisis por SVC:**\n"
-    for _, row in plan_df.iterrows():
-        svc_name = row['SVC']
-        fcst = row.get('FCST', 0)
-        cap = row.get('CAP_TOTAL', 0)
-        deficit = max(0, fcst - cap)
-        cobertura_svc = (cap / fcst * 100) if fcst > 0 else 0
-        
-        svc_analysis += f"- **{svc_name}**: {deficit:.0f} faltantes ({cobertura_svc:.1f}% cobertura)\n"
+    try:
+        for _, row in plan_df.iterrows():
+            svc_name = row['SVC']
+            fcst = pd.to_numeric(row.get('FCST', 0), errors='coerce')
+            cap = pd.to_numeric(row.get('CAP_TOTAL', 0), errors='coerce')
+            
+            # Manejar NaN
+            if pd.isna(fcst):
+                fcst = 0
+            if pd.isna(cap):
+                cap = 0
+                
+            deficit = max(0, fcst - cap)
+            cobertura_svc = (cap / fcst * 100) if fcst > 0 else 0
+            
+            svc_analysis += f"- **{svc_name}**: {deficit:.0f} faltantes ({cobertura_svc:.1f}% cobertura)\n"
+    except Exception as e:
+        print(f"❌ ERROR en análisis por SVC: {e}")
+        svc_analysis += f"Error en análisis por SVC: {e}\n"
     
     respuesta = f"""
 **📋 Análisis Completo del Plan**
