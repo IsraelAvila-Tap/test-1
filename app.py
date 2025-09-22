@@ -5588,108 +5588,103 @@ def analizar_riesgos_dl(dl_risk_df):
     return "\n".join(insights)
 
 
+
 def procesar_ajuste_plan(instruction, plan_df):
     """Procesa instrucciones de ajuste del plan"""
     import re
     
     print(f"🔧 DEBUG: Procesando ajuste: '{instruction}'")
     
-    # Obtener datos confiables
-    if plan_df is None or plan_df.empty:
-        plan_df = get_mel_ia_plan_data()
-    
-    if plan_df is None or plan_df.empty:
-        return "❌ No hay datos del plan. Ejecuta 'Calcular plan' primero."
-    
-    # Detectar SVC
-    svc = None
-    for svc_name in plan_df['SVC'].unique():
-        if svc_name.lower() in instruction.lower():
-            svc = svc_name
-            break
-    
-    if not svc:
-        return f"❌ No se detectó SVC válido. SVCs disponibles: {list(plan_df['SVC'].unique())}"
-    
-    # Detectar parámetro
-    parametro = None
-    if "spr" in instruction.lower():
-        parametro = "SPR_RENTALS"
-    elif "crowd" in instruction.lower():
-        parametro = "CROWD_PCT"
-    elif "rutas" in instruction.lower():
-        parametro = "RUTAS_RENTALS"
-    
-    if not parametro:
-        return "❌ No se detectó parámetro válido (spr, crowd, rutas)"
-    
-    # Detectar valor y tipo de ajuste
-    numeros = re.findall(r'\d+\.?\d*', instruction)
-    if not numeros:
-        return "❌ No se detectó valor numérico en la instrucción"
-    
-    valor = float(numeros[0])
-    
-    # Obtener datos actuales del SVC
-    svc_data = plan_df[plan_df['SVC'] == svc]
-    if svc_data.empty:
-        return f"❌ No se encontró el SVC {svc} en el plan"
-    
-    svc_row = svc_data.iloc[0]
-    valor_actual = svc_row.get(parametro, 0)
-    
-    # Determinar tipo de ajuste
-    if any(word in instruction.lower() for word in ["arriba", "aumenta", "sube", "+"]):
-        nuevo_valor = valor_actual + valor
-        tipo_ajuste = f"aumentar {valor}"
-    elif any(word in instruction.lower() for word in ["abajo", "reduce", "baja", "-"]):
-        nuevo_valor = valor_actual - valor
-        tipo_ajuste = f"reducir {valor}"
-    else:
-        nuevo_valor = valor
-        tipo_ajuste = f"establecer en {valor}"
-    
-    # Calcular impacto
-    if parametro == "SPR_RENTALS":
-        rutas_actuales = svc_row.get('RUTAS_RENTALS', 0)
-        shipments_actuales = rutas_actuales * valor_actual
-        shipments_nuevos = rutas_actuales * nuevo_valor
-        cambio_shipments = shipments_nuevos - shipments_actuales
+    try:
+        # Obtener datos confiables
+        if plan_df is None or plan_df.empty:
+            plan_df = get_mel_ia_plan_data()
+        
+        if plan_df is None or plan_df.empty:
+            return "❌ No hay datos del plan. Ejecuta 'Calcular plan' primero."
+        
+        print(f"🔧 DEBUG: Plan shape: {plan_df.shape}")
+        
+        # Detectar SVC
+        svc = None
+        for svc_name in plan_df['SVC'].unique():
+            if svc_name.lower() in instruction.lower():
+                svc = svc_name
+                break
+        
+        if not svc:
+            return f"❌ No se detectó SVC válido. SVCs disponibles: {list(plan_df['SVC'].unique())}"
+        
+        # Detectar parámetro
+        parametro = None
+        if "spr" in instruction.lower():
+            parametro = "SPR_RENTALS"
+        elif "crowd" in instruction.lower():
+            parametro = "CROWD_PCT"
+        elif "rutas" in instruction.lower():
+            parametro = "RUTAS_RENTALS"
+        
+        if not parametro:
+            return "❌ No se detectó parámetro válido (spr, crowd, rutas)"
+        
+        # Detectar valor
+        numeros = re.findall(r'\d+\.?\d*', instruction)
+        if not numeros:
+            return "❌ No se detectó valor numérico"
+        
+        valor = float(numeros[0])
+        
+        # Obtener datos del SVC
+        svc_data = plan_df[plan_df['SVC'] == svc]
+        if svc_data.empty:
+            return f"❌ No se encontró el SVC {svc}"
+        
+        svc_row = svc_data.iloc[0]
+        valor_actual_raw = svc_row.get(parametro, 0)
+        
+        # Convertir a numérico
+        try:
+            valor_actual = float(pd.to_numeric(valor_actual_raw, errors='coerce'))
+            if pd.isna(valor_actual):
+                valor_actual = 0.0
+        except:
+            valor_actual = 0.0
+        
+        # Calcular nuevo valor
+        if "aumenta" in instruction.lower() or "sube" in instruction.lower():
+            nuevo_valor = valor_actual + valor
+            accion = f"aumentar {valor}"
+        elif "reduce" in instruction.lower() or "baja" in instruction.lower():
+            nuevo_valor = valor_actual - valor
+            accion = f"reducir {valor}"
+        else:
+            nuevo_valor = valor
+            accion = f"establecer en {valor}"
+        
+        # Calcular impacto
+        cambio = nuevo_valor - valor_actual
         
         respuesta = f"""
 **🔧 Ajuste Procesado: {svc}**
 
 **📝 Instrucción:** {instruction}
-**🎯 Acción:** {tipo_ajuste} {parametro}
+**🎯 Acción:** {accion} en {parametro}
 
 **📊 Cambios:**
 - **Valor actual**: {valor_actual:.1f}
 - **Nuevo valor**: {nuevo_valor:.1f}
-- **Cambio**: {nuevo_valor - valor_actual:+.1f}
+- **Cambio**: {cambio:+.1f}
 
-**📈 Impacto en Shipments:**
-- **Shipments actuales**: {shipments_actuales:.0f}
-- **Shipments nuevos**: {shipments_nuevos:.0f}
-- **Cambio**: {cambio_shipments:+.0f} shipments
-
-**⚠️ NOTA:** Este es un cálculo de impacto. Para aplicar el cambio realmente, necesitas modificar los datos fuente y recalcular el plan.
+**⚠️ NOTA:** Cálculo de impacto. Para aplicar, modifica datos fuente y recalcula.
         """
-    else:
-        respuesta = f"""
-**🔧 Ajuste Procesado: {svc}**
+        
+        return respuesta
+        
+    except Exception as e:
+        error_msg = f"❌ Error: {str(e)}"
+        print(f"🔧 ERROR: {error_msg}")
+        return error_msg
 
-**📝 Instrucción:** {instruction}
-**🎯 Acción:** {tipo_ajuste} {parametro}
-
-**📊 Cambios:**
-- **Valor actual**: {valor_actual:.1f}
-- **Nuevo valor**: {nuevo_valor:.1f}
-- **Cambio**: {nuevo_valor - valor_actual:+.1f}
-
-**⚠️ NOTA:** Este es un cálculo de impacto. Para aplicar el cambio realmente, necesitas modificar los datos fuente y recalcular el plan.
-        """
-    
-    return respuesta
 
 def procesar_pregunta_inteligente(user_q, plan_df, detalles_df, dl_risk_df):
     """Procesa preguntas inteligentes y genera respuestas con acciones"""
@@ -5804,7 +5799,7 @@ def procesar_what_if(user_q, plan_df):
             deficit_actual = max(0, fcst - cap_actual)
             deficit_nuevo = max(0, fcst - cap_nueva)
             
-            respuesta = f"""
+                respuesta = f"""
 **🔍 Escenario: Aumentar SPR_RENTALS de {valor_actual} a {valor} en {svc}**
 
 **📊 Impacto Calculado:**
@@ -5830,7 +5825,7 @@ def procesar_what_if(user_q, plan_df):
             # Estimar impacto en capacidad (simplificado)
             impacto_estimado = cambio_crowd * svc_row.get('CAP_TOTAL', 0) * 0.1  # 10% del impacto
             
-            respuesta = f"""
+                respuesta = f"""
 **🔍 Escenario: Cambiar CROWD_PCT de {crowd_actual:.1%} a {valor:.1%} en {svc}**
 
 **📊 Impacto Estimado:**
@@ -5843,7 +5838,7 @@ def procesar_what_if(user_q, plan_df):
             """
             
         else:
-            respuesta = f"""
+                respuesta = f"""
 **🔍 Escenario: {parametro} = {valor} en {svc}**
 
 **📊 Datos Actuales:**
@@ -5908,7 +5903,7 @@ def procesar_analisis_riesgo(dl_risk_df):
         svc_mas_riesgo = dl_risk_df.loc[dl_risk_df['Prob_DL_BLEND'].idxmax(), 'SVC']
         riesgo_max = dl_risk_df['Prob_DL_BLEND'].max()
         
-        respuesta = f"""
+            respuesta = f"""
 **📊 Análisis de Riesgo de Deep Learning**
 
 {analisis}
@@ -5919,7 +5914,7 @@ def procesar_analisis_riesgo(dl_risk_df):
 - Total de SVCs analizados: {len(dl_risk_df['SVC'].unique())}
         """
     else:
-        respuesta = f"""
+            respuesta = f"""
 **📊 Análisis de Riesgo de Deep Learning**
 
 {analisis}
@@ -5977,7 +5972,7 @@ def procesar_shipments_faltantes(user_q, plan_df):
             cap_total = svc_row.get('CAP_TOTAL', 0)
             deficit = max(0, fcst - cap_total)
             
-            respuesta = f"""
+                respuesta = f"""
 **📦 Análisis de Shipments Faltantes - {svc}**
 
 **📊 Datos Actuales:**
