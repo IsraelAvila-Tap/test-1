@@ -2060,7 +2060,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     cap_mlp = (out["RUTAS_MLP_SDD_USADAS"] + out["RUTAS_MLP_SPOT_USADAS"] + out["RUTAS_MLP_BACKLOG_USADAS"]) * out["SPR_MLP"]
     out["CAP_TOTAL"]    = base_otros.fillna(0) + out["SHIP_RENTALS"].fillna(0) + out["SHIP_CROWD"].fillna(0) + cap_mlp.fillna(0)
     
-    # Rutas faltantes = demanda - capacidad total (solo valores positivos = faltante real)
+    # Paquetes en Riesgo = demanda - capacidad total (solo valores positivos = faltante real)
     # Asegurar que FCST sea numérico y manejar NaN e infinitos
     fcst_numeric = pd.to_numeric(out["FCST"], errors="coerce").fillna(0)
     rutas_falt_calc = (fcst_numeric - out["CAP_TOTAL"]).clip(lower=0)
@@ -5258,7 +5258,7 @@ try:
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("SVCs", svcs_uniques)
                 c2.metric("Demanda ajustada", f"{dem_aj_total:,}")
-                c3.metric("Rutas faltantes", f"{rutas_falt_total:,}")
+                c3.metric("Paquetes en Riesgo", f"{rutas_falt_total:,}")
                 c4.metric("SPR (resultante capacidad)", spr_cap_label)
 
                 # 6) Tabla 1 — “arriba” (reconciliada)
