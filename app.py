@@ -359,7 +359,7 @@ def coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def coerce_date_column(df: pd.DataFrame, candidates: List[str], new_name: str,
-                       source_label: str, required: bool = False) -> Optional[str]:
+            source_label: str, required: bool = False) -> Optional[str]:
     col = find_and_rename(df, candidates, new_name, required=required, source_label=source_label)
     if col:
         df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True, infer_datetime_format=True).dt.date
@@ -740,7 +740,7 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
     spr_glob = _as_str_cols(spr_hist[spr_hist["SVC"] == "__GLOBAL__"].drop(columns=["SVC"]).rename(columns={"SPR_HIST":"SPR_GLOBAL_TIPO"}), ["VEHICULO_TIPO_HOM"])
 
     by_type = by_type.merge(spr_loc,  on=["SVC","VEHICULO_TIPO_HOM"], how="left") \
-                     .merge(spr_glob, on=["VEHICULO_TIPO_HOM"],      how="left")
+            .merge(spr_glob, on=["VEHICULO_TIPO_HOM"],      how="left")
     by_type["SPR_HIST"] = by_type["SPR_HIST"].fillna(by_type["SPR_GLOBAL_TIPO"])
     by_type.drop(columns=["SPR_GLOBAL_TIPO"], inplace=True)
 
@@ -759,7 +759,7 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
     if not rents_fb.empty:
         rents_fb = _as_str_cols(rents_fb, ["SVC"])
         out = out.merge(rents_fb[["SVC","RUTAS_RENTALS"]].rename(columns={"RUTAS_RENTALS":"RUTAS_RENTALS_FB"}),
-                        on="SVC", how="outer")
+            on="SVC", how="outer")
         out["RUTAS_RENTALS"] = out["RUTAS_RENTALS"].fillna(out["RUTAS_RENTALS_FB"]).fillna(0)
         out.drop(columns=["RUTAS_RENTALS_FB"], inplace=True)
 
@@ -1048,14 +1048,14 @@ def load_capacity_caps() -> pd.DataFrame:
 
     is_rentals = dm_norm.str.contains("rent",  regex=False)
     is_crowd_routes = dm_norm.str.contains("crowd", regex=False) & (
-                        tipo_norm.str.contains("route", regex=False) |
-                        tipodm_norm.str.contains("route", case=False, regex=False)
-                      )
+            tipo_norm.str.contains("route", regex=False) |
+            tipodm_norm.str.contains("route", case=False, regex=False)
+            )
     is_mlp_spot = dm_norm.str.contains("mlp", regex=False) & tipodm_norm.str.contains("spot", regex=False)
     is_mlp_sdd  = dm_norm.str.contains("mlp", regex=False) & (~is_mlp_spot) & (
-                        tipodm_norm.str.contains("mlp", regex=False) |
-                        tipodm_norm.str.contains("sdd", regex=False) |
-                        (tipodm_norm == "")
+            tipodm_norm.str.contains("mlp", regex=False) |
+            tipodm_norm.str.contains("sdd", regex=False) |
+            (tipodm_norm == "")
                   )
 
     is_shipments = tipo_norm.str.contains("ship", regex=False)
@@ -1674,8 +1674,8 @@ def _bucket_dm(dm: str) -> str:
     return dm.upper() if dm else "OTHER"
 
 def load_spr_dm_real_peak_for(op_date: date,
-                              real_weeks: int = 4,
-                              peak_weeks: int = 12) -> pd.DataFrame:
+            real_weeks: int = 4,
+            peak_weeks: int = 12) -> pd.DataFrame:
     """
     SPR por Delivery Model usando la pestaña SPR:
       - REAL4W_* : mediana de los últimos 4 (por defecto) del mismo día de semana (<= op_date)
@@ -2449,7 +2449,7 @@ def expand_to_vehicle_level(plan: pd.DataFrame, spr_mode: str) -> pd.DataFrame:
                 spr_v = spr_for(
                     svc, "MLP", veh,
                     fallback=float(pd.to_numeric(r.get("SPR_MLP", np.nan), errors="coerce") or
-                                   pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25)
+            pd.to_numeric(r.get("SPR_USADO", np.nan), errors="coerce") or 25)
                 )
                 ships = int(round(int(rutas_v) * spr_v))
                 rows.append(["MLP BACKLOG", fch, svc, veh, float(spr_v), int(rutas_v), ships])
@@ -2774,15 +2774,15 @@ def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
                 # capacidad
                 cap_col = None
                 for c in ["CAP","Capacidad","Rutas","Qty","Cantidad","Units"]:
-                    if c in x.columns:
-                        cap_col = c; break
+        if c in x.columns:
+            cap_col = c; break
                 if cap_col is None:
                     # busca columna numérica con sum>0
-                    num_cols = [c for c in x.columns if pd.api.types.is_numeric_dtype(x[c])]
-                    if num_cols:
-                        cap_col = max(num_cols, key=lambda c: pd.to_numeric(x[c], errors="coerce").fillna(0).sum())
+        num_cols = [c for c in x.columns if pd.api.types.is_numeric_dtype(x[c])]
+        if num_cols:
+            cap_col = max(num_cols, key=lambda c: pd.to_numeric(x[c], errors="coerce").fillna(0).sum())
                 if cap_col is None:
-                    return pd.DataFrame(columns=out_cols)
+        return pd.DataFrame(columns=out_cols)
 
                 # limpiar y mapear
                 _as_str_cols(x, ["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])
@@ -2790,14 +2790,14 @@ def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
 
                 def _dm_norm(v):
                     t = (v or "").upper()
-                    if "SPOT" in t: return "MLP SPOT"
-                    if "BACK" in t or "BU" in t: return "MLP BACKLOG"
-                    return "MLP SDD"
+        if "SPOT" in t: return "MLP SPOT"
+        if "BACK" in t or "BU" in t: return "MLP BACKLOG"
+        return "MLP SDD"
                 def _veh_norm(v):
                     t = (v or "").lower()
-                    if "small" in t: return "Small Van"
-                    if "car" in t: return "Car"
-                    return "Large Van"
+        if "small" in t: return "Small Van"
+        if "car" in t: return "Car"
+        return "Large Van"
 
                 out = (x
                     .assign(DELIVERY_MOD=lambda d: d["DELIVERY_MOD"].map(_dm_norm),
@@ -3206,11 +3206,11 @@ def _attach_tabla2_spr(df_hist: pd.DataFrame) -> pd.DataFrame:
     key_pool = ["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"]
 
     out = base.merge(t2[key_full + ["SPR"]].rename(columns={"SPR":"SPR_T2"}),
-                     on=key_full, how="left")
+            on=key_full, how="left")
     miss = out["SPR_T2"].isna()
     if miss.any():
         k = base[miss].merge(t2[key_pool+["SPR"]].rename(columns={"SPR":"SPR_T2"}),
-                             on=key_pool, how="left")
+            on=key_pool, how="left")
         out.loc[miss, "SPR_T2"] = k["SPR_T2"].values
     return out
 
@@ -3380,9 +3380,9 @@ def _rolling_shortfall(df: pd.DataFrame) -> pd.DataFrame:
     grp = d.groupby(["SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP"], dropna=False)
     for w in ROLL_WINDOWS:
         d[f"SF_MEAN_{w}d"] = grp["SHORTFALL_PCT"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
-                              .reset_index(level=[0,1,2,3], drop=True)
+            .reset_index(level=[0,1,2,3], drop=True)
         d[f"CONF_{w}d"]    = grp["CONF_EFECTIVO"].apply(lambda s: s.rolling(w, min_periods=5).mean())\
-                              .reset_index(level=[0,1,2,3], drop=True)
+            .reset_index(level=[0,1,2,3], drop=True)
     return d
 
 
@@ -3405,7 +3405,7 @@ SF_LOOKBACK_DAYS = 30 #####Ajustar parametros minimos de lectura
 SF_MIN_CONF_DIA  = 50
 
 def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
-                          prior_p: float = 0.08, prior_strength: int = 100):
+            prior_p: float = 0.08, prior_strength: int = 100):
     """
     Devuelve:
       - by_full:  SF_RECENT_30 (suavizado), CONF_QTY, N_DAYS por (SVC, DM_TRAIN, Veh, MLP)
@@ -3414,9 +3414,9 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
     """
     if arer is None or arer.empty:
         by_full = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP",
-                                        "SF_RECENT_30","CONF_QTY","N_DAYS"])
+            "SF_RECENT_30","CONF_QTY","N_DAYS"])
         by_pool = pd.DataFrame(columns=["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE",
-                                        "SF_RECENT_30_POOL","CONF_QTY_POOL","N_DAYS_POOL"])
+            "SF_RECENT_30_POOL","CONF_QTY_POOL","N_DAYS_POOL"])
         return by_full, by_pool
 
     df = arer.copy()
@@ -3466,8 +3466,8 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
     gcols_full = ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE","MLP"]
     agg_full = (df.groupby(gcols_full, dropna=False)
                   .agg(FAIL_QTY=("FAIL_QTY","sum"),
-                       CONF_QTY=("CONF_EFECTIVO","sum"),
-                       N_DAYS=("FECHA", lambda s: s.dt.date.nunique()))
+            CONF_QTY=("CONF_EFECTIVO","sum"),
+            N_DAYS=("FECHA", lambda s: s.dt.date.nunique()))
                   .reset_index())
     agg_full["SF_RECENT_30"] = (
         (agg_full["FAIL_QTY"] + prior_strength*prior_p) /
@@ -3478,8 +3478,8 @@ def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
     gcols_pool = ["SVC","DM_TRAIN","SHP_LG_VEHICLE_TYPE"]
     agg_pool = (df.groupby(gcols_pool, dropna=False)
                   .agg(FAIL_QTY=("FAIL_QTY","sum"),
-                       CONF_QTY=("CONF_EFECTIVO","sum"),
-                       N_DAYS=("FECHA", lambda s: s.dt.date.nunique()))
+            CONF_QTY=("CONF_EFECTIVO","sum"),
+            N_DAYS=("FECHA", lambda s: s.dt.date.nunique()))
                   .reset_index())
     agg_pool["SF_RECENT_30_POOL"] = (
         (agg_pool["FAIL_QTY"] + prior_strength*prior_p) /
@@ -3511,7 +3511,7 @@ def predict_failure(detalles_df: pd.DataFrame,
     if model is None or getattr(model, "pipeline", None) is None or detalles_df is None or detalles_df.empty:
         empty_res = pd.DataFrame(columns=["SVC","Rutas","Rutas_riesgo","Shipments","Shipments_riesgo","Probabilidad_de_fallar"])
         empty_det = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE","MLP",
-                                          "Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"])
+            "Rutas","Shipments","Prob_Fail","Rutas_riesgo","Shipments_riesgo"])
         return empty_res, empty_det
 
     # --- 1) SPR por (fecha,svc,dm,veh) desde Tabla 2 (detalles) ---
@@ -3532,13 +3532,13 @@ def predict_failure(detalles_df: pd.DataFrame,
 
     # --- 2) RENTALS desde Tabla 2 (deshabilitado: riesgo solo MLP) ---
     rentals = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE",
-                                    "Rutas","Shipments","SPR","MLP"])
+            "Rutas","Shipments","SPR","MLP"])
 
 
     # --- 3) MLP desde Tabla 3 + SPR del mismo día por SVC×DM×Veh ---
     if tabla3_df is None or tabla3_df.empty:
         mlp_rows = pd.DataFrame(columns=["FECHA","SVC","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE",
-                                         "MLP","Rutas","SPR","Shipments"])
+            "MLP","Rutas","SPR","Shipments"])
     else:
         t3 = tabla3_df.copy()
         t3["FECHA"] = pd.to_datetime(t3["FECHA"], errors="coerce")
@@ -4591,9 +4591,9 @@ def _predict_one_torch(pred_df: pd.DataFrame, tfm: "TorchFailureModel") -> np.nd
         # Si algo truena, devolvemos NaN para activar el fallback en el blend
         return np.full(len(pred_df) if pred_df is not None else 0, np.nan, dtype=float)
 def predict_failure_dl(detalles_df: pd.DataFrame,
-                       tabla3_df: pd.DataFrame,
-                       kinds: List[str] = ("mlp","wide_deep","tabtr"),
-                       blend: str = "mean") -> Tuple[pd.DataFrame, pd.DataFrame]:
+            tabla3_df: pd.DataFrame,
+            kinds: List[str] = ("mlp","wide_deep","tabtr"),
+            blend: str = "mean") -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Tabla 4 (única): 3 modelos DL + blend.
     - Si todos los DL dan NaN/0, el blend cae en DP reciente por SVC×DM×Veh×MLP (no se muestra DP en columnas).
@@ -4636,21 +4636,21 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
                 predictions = _predict_one_torch(out, model)
                 if predictions is not None and len(predictions) > 0:
                     valid_preds = predictions[~np.isnan(predictions)]
-                    if len(valid_preds) > 0 and valid_preds.max() > 0:
-                        out[col] = predictions
-                        print(f"✅ DEBUG: {col} - modelo entrenado: min={predictions.min():.3f}, max={predictions.max():.3f}")
-                    else:
-                        # Fallback a valores aleatorios
-                        np.random.seed(hash(k) % 2**32)
-                        random_probs = np.random.uniform(0.08, 0.22, len(out))
-                        out[col] = random_probs
-                        print(f"⚠️ WARNING: {col} - usando valores aleatorios: {random_probs[:3]}")
+        if len(valid_preds) > 0 and valid_preds.max() > 0:
+            out[col] = predictions
+        print(f"✅ DEBUG: {col} - modelo entrenado: min={predictions.min():.3f}, max={predictions.max():.3f}")
+        else:
+            # Fallback a valores aleatorios
+            np.random.seed(hash(k) % 2**32)
+            random_probs = np.random.uniform(0.08, 0.22, len(out))
+            out[col] = random_probs
+        print(f"⚠️ WARNING: {col} - usando valores aleatorios: {random_probs[:3]}")
                 else:
                     # Fallback a valores aleatorios
                     np.random.seed(hash(k) % 2**32)
                     random_probs = np.random.uniform(0.08, 0.22, len(out))
                     out[col] = random_probs
-                    print(f"⚠️ WARNING: {col} - usando valores aleatorios: {random_probs[:3]}")
+        print(f"⚠️ WARNING: {col} - usando valores aleatorios: {random_probs[:3]}")
             else:
                 # Fallback a valores aleatorios
                 np.random.seed(hash(k) % 2**32)
@@ -4711,22 +4711,22 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
             if not eval_data.empty:
                 # Calcular métricas para cada modelo
                 for col in ["Prob_DL_MLP", "Prob_DL_WD", "Prob_DL_TT"]:
-                    if col in out.columns:
-                        # Simular evaluación (en producción usarías datos reales)
-                        y_true = np.random.randint(0, 2, len(out))  # Datos reales simulados
-                        y_pred = out[col].values
+        if col in out.columns:
+            # Simular evaluación (en producción usarías datos reales)
+            y_true = np.random.randint(0, 2, len(out))  # Datos reales simulados
+            y_pred = out[col].values
                         
-                        # Calcular métricas
-                        accuracy = np.mean((y_pred > 0.5) == y_true)
-                        precision = np.mean(y_true[y_pred > 0.5]) if np.sum(y_pred > 0.5) > 0 else 0
-                        recall = np.mean(y_pred[y_true == 1] > 0.5) if np.sum(y_true) > 0 else 0
-                        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            # Calcular métricas
+            accuracy = np.mean((y_pred > 0.5) == y_true)
+        precision = np.mean(y_true[y_pred > 0.5]) if np.sum(y_pred > 0.5) > 0 else 0
+        recall = np.mean(y_pred[y_true == 1] > 0.5) if np.sum(y_true) > 0 else 0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
                         
-                        print(f"📈 {col}:")
-                        print(f"   Accuracy: {accuracy:.3f}")
-                        print(f"   Precision: {precision:.3f}")
-                        print(f"   Recall: {recall:.3f}")
-                        print(f"   F1-Score: {f1:.3f}")
+        print(f"📈 {col}:")
+        print(f"   Accuracy: {accuracy:.3f}")
+        print(f"   Precision: {precision:.3f}")
+        print(f"   Recall: {recall:.3f}")
+        print(f"   F1-Score: {f1:.3f}")
         else:
             print("⚠️ WARNING: No hay datos para evaluación de métricas")
     except Exception as e:
@@ -5513,8 +5513,8 @@ def diagnosticar_datos_mel_ia():
             if hasattr(data, 'shape'):
                 print(f"  - {key}: {data.shape} - Columnas: {list(data.columns)[:5]}...")
                 if not data.empty:
-                    print(f"    Primeras 2 filas:")
-                    print(f"    {data.head(2).to_dict('records')}")
+        print(f"    Primeras 2 filas:")
+        print(f"    {data.head(2).to_dict('records')}")
             else:
                 print(f"  - {key}: {type(data)}")
     
@@ -5753,11 +5753,11 @@ def procesar_what_if(user_q, plan_df):
             if svc:
                 try:
                     svc_data = plan_df[plan_df['SVC'] == svc]
-                    if not svc_data.empty and parametro:
-                        valor_actual = svc_data.iloc[0].get(parametro, 0)
-                        if pd.notna(valor_actual):
-                            valor = valor_actual + valor
-                            print(f"🔍 DEBUG: Ajuste detectado: {valor_actual} + {float(numeros[0])} = {valor}")
+        if not svc_data.empty and parametro:
+            valor_actual = svc_data.iloc[0].get(parametro, 0)
+        if pd.notna(valor_actual):
+            valor = valor_actual + valor
+        print(f"🔍 DEBUG: Ajuste detectado: {valor_actual} + {float(numeros[0])} = {valor}")
                 except:
                     pass
         elif "puntos abajo" in user_q.lower() or "abajo" in user_q.lower():
@@ -5765,11 +5765,11 @@ def procesar_what_if(user_q, plan_df):
             if svc:
                 try:
                     svc_data = plan_df[plan_df['SVC'] == svc]
-                    if not svc_data.empty and parametro:
-                        valor_actual = svc_data.iloc[0].get(parametro, 0)
-                        if pd.notna(valor_actual):
-                            valor = valor_actual - valor
-                            print(f"🔍 DEBUG: Ajuste detectado: {valor_actual} - {float(numeros[0])} = {valor}")
+        if not svc_data.empty and parametro:
+            valor_actual = svc_data.iloc[0].get(parametro, 0)
+        if pd.notna(valor_actual):
+            valor = valor_actual - valor
+        print(f"🔍 DEBUG: Ajuste detectado: {valor_actual} - {float(numeros[0])} = {valor}")
                 except:
                     pass
     
@@ -5799,7 +5799,7 @@ def procesar_what_if(user_q, plan_df):
             deficit_actual = max(0, fcst - cap_actual)
             deficit_nuevo = max(0, fcst - cap_nueva)
             
-                respuesta = f"""
+            respuesta = f"""
 **🔍 Escenario: Aumentar SPR_RENTALS de {valor_actual} a {valor} en {svc}**
 
 **📊 Impacto Calculado:**
@@ -5825,7 +5825,7 @@ def procesar_what_if(user_q, plan_df):
             # Estimar impacto en capacidad (simplificado)
             impacto_estimado = cambio_crowd * svc_row.get('CAP_TOTAL', 0) * 0.1  # 10% del impacto
             
-                respuesta = f"""
+            respuesta = f"""
 **🔍 Escenario: Cambiar CROWD_PCT de {crowd_actual:.1%} a {valor:.1%} en {svc}**
 
 **📊 Impacto Estimado:**
@@ -5838,7 +5838,7 @@ def procesar_what_if(user_q, plan_df):
             """
             
         else:
-                respuesta = f"""
+            respuesta = f"""
 **🔍 Escenario: {parametro} = {valor} en {svc}**
 
 **📊 Datos Actuales:**
@@ -5870,9 +5870,9 @@ def procesar_recomendaciones(plan_df, dl_risk_df):
                 svc_data = plan_df[plan_df['SVC'] == svc]
                 if not svc_data.empty:
                     deficit = svc_data['FCST'].iloc[0] - svc_data['CAP_TOTAL'].iloc[0]
-                    if deficit > 0:
-                        rutas_extra = int(deficit / svc_data['SPR_RENTALS'].iloc[0])
-                        recomendaciones.append(f"   💡 Agregar {rutas_extra} rutas de Rentals")
+        if deficit > 0:
+            rutas_extra = int(deficit / svc_data['SPR_RENTALS'].iloc[0])
+            recomendaciones.append(f"   💡 Agregar {rutas_extra} rutas de Rentals")
     
     if not recomendaciones:
         if dl_risk_df is None or dl_risk_df.empty or 'Prob_DL_BLEND' not in dl_risk_df.columns:
@@ -5972,7 +5972,7 @@ def procesar_shipments_faltantes(user_q, plan_df):
             cap_total = svc_row.get('CAP_TOTAL', 0)
             deficit = max(0, fcst - cap_total)
             
-                respuesta = f"""
+            respuesta = f"""
 **📦 Análisis de Shipments Faltantes - {svc}**
 
 **📊 Datos Actuales:**
