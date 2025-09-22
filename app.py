@@ -5826,11 +5826,38 @@ def procesar_analisis_completo(plan_df, detalles_df, dl_risk_df):
     if plan_df is None or plan_df.empty:
         return "No hay datos del plan disponibles. Ejecuta 'Calcular plan' primero."
     
-    # Análisis del plan con manejo robusto de datos
+    # Debug: mostrar columnas disponibles
+    print(f"🔍 DEBUG: Columnas disponibles en plan_df: {list(plan_df.columns)}")
+    print(f"🔍 DEBUG: Primeras 3 filas del plan_df:")
+    print(plan_df.head(3))
+    
+    # Análisis del plan con detección automática de columnas
     try:
+        # Buscar columnas de demanda y capacidad
+        fcst_col = None
+        cap_col = None
+        
+        # Posibles nombres para demanda
+        for col in ['FCST', 'DEMANDA', 'Demanda', 'fcst', 'demanda']:
+            if col in plan_df.columns:
+                fcst_col = col
+                break
+        
+        # Posibles nombres para capacidad
+        for col in ['CAP_TOTAL', 'CAPACIDAD', 'Capacidad', 'cap_total', 'capacidad']:
+            if col in plan_df.columns:
+                cap_col = col
+                break
+        
+        print(f"🔍 DEBUG: Columna de demanda encontrada: {fcst_col}")
+        print(f"🔍 DEBUG: Columna de capacidad encontrada: {cap_col}")
+        
+        if fcst_col is None or cap_col is None:
+            return f"❌ No se encontraron las columnas necesarias. Columnas disponibles: {list(plan_df.columns)}"
+        
         # Convertir a numérico y manejar errores
-        fcst_numeric = pd.to_numeric(plan_df['FCST'], errors='coerce').fillna(0)
-        cap_numeric = pd.to_numeric(plan_df['CAP_TOTAL'], errors='coerce').fillna(0)
+        fcst_numeric = pd.to_numeric(plan_df[fcst_col], errors='coerce').fillna(0)
+        cap_numeric = pd.to_numeric(plan_df[cap_col], errors='coerce').fillna(0)
         
         total_fcst = fcst_numeric.sum()
         total_cap = cap_numeric.sum()
@@ -5862,9 +5889,11 @@ def procesar_analisis_completo(plan_df, detalles_df, dl_risk_df):
     svc_analysis = "**🔍 Análisis por SVC:**\n"
     try:
         for _, row in plan_df.iterrows():
-            svc_name = row['SVC']
-            fcst = pd.to_numeric(row.get('FCST', 0), errors='coerce')
-            cap = pd.to_numeric(row.get('CAP_TOTAL', 0), errors='coerce')
+            svc_name = row.get('SVC', 'Unknown')
+            
+            # Usar las columnas detectadas
+            fcst = pd.to_numeric(row.get(fcst_col, 0), errors='coerce') if fcst_col else 0
+            cap = pd.to_numeric(row.get(cap_col, 0), errors='coerce') if cap_col else 0
             
             # Manejar NaN
             if pd.isna(fcst):
