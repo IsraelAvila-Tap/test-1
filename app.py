@@ -5488,6 +5488,17 @@ plan = st.session_state.get("plan_df")   # DataFrame de la tabla de arriba
 detalles = st.session_state.get("detalles_df")  # DataFrame de la tabla de abajo
 
 
+
+def reset_mel_ia_data():
+    """Resetea los datos de Mel-IA para debugging"""
+    keys_to_remove = ['mel_ia_plan_data', 'mel_ia_detalles_data']
+    for key in keys_to_remove:
+        if key in st.session_state:
+            del st.session_state[key]
+        if key in globals():
+            del globals()[key]
+    return "🔄 Datos de Mel-IA reseteados. Ejecuta 'Calcular plan' nuevamente."
+
 def diagnosticar_datos_mel_ia():
     """Función de diagnóstico para ver todos los datos disponibles"""
     print("=" * 60)
@@ -5520,6 +5531,28 @@ def diagnosticar_datos_mel_ia():
     
     print("=" * 60)
     return "Diagnóstico completado - revisa la consola"
+
+
+def get_mel_ia_plan_data():
+    """Obtiene los datos del plan para Mel-IA de manera confiable"""
+    print("🔍 DEBUG: === OBTENIENDO DATOS DEL PLAN ===")
+    
+    # Priorizar datos específicos de Mel-IA
+    if 'mel_ia_plan_data' in st.session_state:
+        data = st.session_state['mel_ia_plan_data']
+        print(f"✅ Datos encontrados en mel_ia_plan_data: {data.shape}")
+        return data
+    elif 'plan_df' in st.session_state and st.session_state['plan_df'] is not None:
+        data = st.session_state['plan_df']
+        print(f"✅ Datos encontrados en plan_df: {data.shape}")
+        return data
+    elif 'mel_ia_plan_data' in globals():
+        data = globals()['mel_ia_plan_data']
+        print(f"✅ Datos encontrados en global: {data.shape}")
+        return data
+    else:
+        print("❌ No se encontraron datos del plan")
+        return None
 
 # ===== FUNCIONES DE ANÁLISIS INTELIGENTE PARA EL AGENTE =====
 
@@ -5574,8 +5607,17 @@ def procesar_what_if(user_q, plan_df):
     """Procesa preguntas de escenarios '¿Qué pasa si...?' con cálculos reales"""
     import re
     
+    print(f"🔍 DEBUG: === PROCESANDO WHAT IF: '{user_q}' ===")
+    
+    # Obtener datos confiables
     if plan_df is None or plan_df.empty:
-        return "No hay datos del plan disponibles. Ejecuta 'Calcular plan' primero."
+        plan_df = get_mel_ia_plan_data()
+    
+    if plan_df is None or plan_df.empty:
+        return "❌ No hay datos del plan disponibles. Ejecuta 'Calcular plan' primero."
+    
+    print(f"🔍 DEBUG: Datos del plan obtenidos: {plan_df.shape}")
+    print(f"🔍 DEBUG: SVCs disponibles: {list(plan_df['SVC'].unique()) if 'SVC' in plan_df.columns else 'No SVC column'}")
     
     # Extraer parámetros de la pregunta
     svc = None
@@ -5887,31 +5929,35 @@ def procesar_shipments_faltantes(user_q, plan_df):
 def procesar_analisis_completo(plan_df, detalles_df, dl_risk_df):
     """Procesa análisis completo del plan con todos los datos"""
     
-    # Intentar obtener datos de múltiples fuentes
-    print("🔍 DEBUG: Buscando datos en múltiples fuentes...")
+    print("🔍 DEBUG: === INICIO ANÁLISIS COMPLETO ===")
     
-    # Fuente 1: Parámetros pasados
-    if plan_df is not None and not plan_df.empty:
-        print(f"🔍 DEBUG: Usando plan_df pasado como parámetro: {plan_df.shape}")
+    # Estrategia de búsqueda de datos más agresiva
+    working_df = None
+    
+    # Fuente 1: Datos específicos de Mel-IA
+    if 'mel_ia_plan_data' in st.session_state:
+        working_df = st.session_state['mel_ia_plan_data']
+        print(f"🔍 DEBUG: Usando mel_ia_plan_data: {working_df.shape}")
+    # Fuente 2: Parámetros pasados
+    elif plan_df is not None and not plan_df.empty:
         working_df = plan_df
-    # Fuente 2: Session state
+        print(f"🔍 DEBUG: Usando plan_df parámetro: {working_df.shape}")
+    # Fuente 3: Session state estándar
     elif 'plan_df' in st.session_state and st.session_state['plan_df'] is not None:
-        print("🔍 DEBUG: Usando plan_df de session_state")
         working_df = st.session_state['plan_df']
-    # Fuente 3: Variable global
-    elif 'plan' in globals() and globals()['plan'] is not None:
-        print("🔍 DEBUG: Usando variable global 'plan'")
-        working_df = globals()['plan']
+        print(f"🔍 DEBUG: Usando plan_df session_state: {working_df.shape}")
+    # Fuente 4: Variable global
+    elif 'mel_ia_plan_data' in globals():
+        working_df = globals()['mel_ia_plan_data']
+        print(f"🔍 DEBUG: Usando global mel_ia_plan_data: {working_df.shape}")
     else:
-        return "❌ No se encontraron datos del plan en ninguna fuente. Ejecuta 'Calcular plan' primero."
+        return "❌ No se encontraron datos del plan. Ejecuta 'Calcular plan' primero."
     
-    # Debug: mostrar columnas disponibles
-    print(f"🔍 DEBUG: Columnas disponibles: {list(working_df.columns)}")
-    print(f"🔍 DEBUG: Shape del DataFrame: {working_df.shape}")
-    print(f"🔍 DEBUG: Primeras 3 filas:")
-    print(working_df.head(3))
+    print(f"🔍 DEBUG: Columnas encontradas: {list(working_df.columns)}")
+    print(f"🔍 DEBUG: Datos de muestra:")
+    print(working_df.head(2).to_string())
     
-    # Usar working_df en lugar de plan_df
+    # Usar working_df
     plan_df = working_df
     
     # Análisis del plan con detección automática de columnas
@@ -6089,6 +6135,13 @@ with col_b:
         respuesta = diagnosticar_datos_mel_ia()
         st.session_state.chat_history.append(("Diagnóstico de datos", respuesta))
         st.rerun()
+
+# Botón de reset para debugging
+st.markdown("**🔧 Debugging:**")
+if st.button("🔄 Reset Datos Mel-IA"):
+    respuesta = reset_mel_ia_data()
+    st.session_state.chat_history.append(("Reset datos", respuesta))
+    st.rerun()
 
 if ask:
     if not client:
