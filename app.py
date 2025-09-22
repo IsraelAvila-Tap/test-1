@@ -270,12 +270,13 @@ def _canon_name(s: str) -> str:
 
 def find_and_rename(df: pd.DataFrame, candidates: List[str], new_name: str,
                     required: bool = True, source_label: str = "") -> Optional[str]:
-                        cmap = {_canon_name(c): c for c in df.columns}
+    cmap = {_canon_name(c): c for c in df.columns}
     for cand in candidates:
         key = _canon_name(cand)
         if key in cmap:
             real = cmap[key]
-            if real != new_name: df.rename(columns={real: new_name}, inplace=True)
+            if real != new_name: 
+                df.rename(columns={real: new_name}, inplace=True)
             return new_name
     if required:
         raise ValueError(f"{source_label}: falta columna equivalente a {candidates}. Encabezados: {list(df.columns)}")
