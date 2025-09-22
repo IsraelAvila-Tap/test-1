@@ -5821,6 +5821,62 @@ def procesar_shipments_faltantes(user_q, plan_df):
         respuesta += f"\n- **{svc_name}**: {deficit:.0f} faltantes ({cobertura:.1f}% cobertura)"
     
     return respuesta
+def procesar_analisis_completo(plan_df, detalles_df, dl_risk_df):
+    """Procesa análisis completo del plan con todos los datos"""
+    if plan_df is None or plan_df.empty:
+        return "No hay datos del plan disponibles. Ejecuta 'Calcular plan' primero."
+    
+    # Análisis del plan
+    total_fcst = plan_df['FCST'].sum()
+    total_cap = plan_df['CAP_TOTAL'].sum()
+    total_deficit = max(0, total_fcst - total_cap)
+    cobertura = (total_cap / total_fcst * 100) if total_fcst > 0 else 0
+    
+    # Análisis de riesgo si está disponible
+    riesgo_info = ""
+    if dl_risk_df is not None and not dl_risk_df.empty and 'Prob_DL_BLEND' in dl_risk_df.columns:
+        riesgo_promedio = dl_risk_df['Prob_DL_BLEND'].mean()
+        svc_mas_riesgo = dl_risk_df.loc[dl_risk_df['Prob_DL_BLEND'].idxmax(), 'SVC']
+        riesgo_max = dl_risk_df['Prob_DL_BLEND'].max()
+        
+        riesgo_info = f"""
+**📊 Análisis de Riesgo:**
+- Riesgo promedio: {riesgo_promedio:.1%}
+- SVC con mayor riesgo: {svc_mas_riesgo} ({riesgo_max:.1%})
+- Total de SVCs analizados: {len(dl_risk_df['SVC'].unique())}
+        """
+    else:
+        riesgo_info = "**📊 Análisis de Riesgo:** No disponible (ejecuta 'Calcular plan' primero)"
+    
+    # Análisis por SVC
+    svc_analysis = "**🔍 Análisis por SVC:**\n"
+    for _, row in plan_df.iterrows():
+        svc_name = row['SVC']
+        fcst = row.get('FCST', 0)
+        cap = row.get('CAP_TOTAL', 0)
+        deficit = max(0, fcst - cap)
+        cobertura_svc = (cap / fcst * 100) if fcst > 0 else 0
+        
+        svc_analysis += f"- **{svc_name}**: {deficit:.0f} faltantes ({cobertura_svc:.1f}% cobertura)\n"
+    
+    respuesta = f"""
+**📋 Análisis Completo del Plan**
+
+**📊 Resumen Global:**
+- **Demanda Total (FCST)**: {total_fcst:.0f} shipments
+- **Capacidad Total**: {total_cap:.0f} shipments
+- **Shipments Faltantes**: {total_deficit:.0f} shipments
+- **Cobertura Global**: {cobertura:.1f}%
+
+{riesgo_info}
+
+{svc_analysis}
+
+**💡 Estado General:**
+{'🔴 CRÍTICO - Necesitas aumentar capacidad inmediatamente' if total_deficit > total_fcst * 0.2 else '🟡 ATENCIÓN - Considera aumentar capacidad' if total_deficit > total_fcst * 0.1 else '✅ BIEN - Capacidad adecuada'}
+    """
+    
+    return respuesta
 
 # --- UI DEL CHAT ---
 st.markdown("## 🤖 Pregunta a Mel-IA sobre tus datos")
@@ -5872,6 +5928,13 @@ with col4:
         st.session_state.chat_history.append(("Optimizar plan", respuesta))
         st.rerun()
 
+# Agregar botón de análisis completo
+st.markdown("**📋 Análisis Completo:**")
+if st.button("📊 Ver Análisis Completo del Plan"):
+    respuesta = procesar_analisis_completo(plan, detalles, st.session_state.get('dl_risk_data'))
+    st.session_state.chat_history.append(("Análisis completo del plan", respuesta))
+    st.rerun()
+
 if ask:
     if not client:
         st.error("El chat no está disponible (cliente OpenAI no inicializado o paquete faltante).")
@@ -5885,9 +5948,12 @@ if ask:
             )
             
             # Si es una respuesta inteligente específica, usarla
-            if respuesta_inteligente != "Pregunta general procesada por el Mel-IA inteligente":
+            if respuesta_inteligente != "Pregunta general procesada por Mel-IA":
                 st.session_state.chat_history.append((user_q, respuesta_inteligente))
                 st.rerun()
+            else:
+                # Continuar con el procesamiento normal de OpenAI
+                pass
         except Exception as e:
             st.error(f"Error en procesamiento inteligente de Mel-IA: {e}")
             # Continuar con el procesamiento normal
@@ -5900,11 +5966,17 @@ if ask:
                 return f"{title}: (no disponible)\n"
 
         if plan is not None and hasattr(plan, "empty") and not plan.empty:
+            # Incluir resumen del plan
+            plan_summary = f"Resumen del Plan: {len(plan)} SVCs, Capacidad Total: {plan['CAP_TOTAL'].sum():.0f}, Demanda Total: {plan['FCST'].sum():.0f}"
+            context_parts.append(plan_summary)
             context_parts.append(_df_to_context("Tabla plan (arriba)", plan, 200))
         else:
             context_parts.append("Tabla plan (arriba): (no disponible)\n")
 
         if detalles is not None and hasattr(detalles, "empty") and not detalles.empty:
+            # Incluir resumen de detalles
+            detalles_summary = f"Resumen de Detalles: {len(detalles)} registros, {detalles['SVC'].nunique()} SVCs únicos"
+            context_parts.append(detalles_summary)
             context_parts.append(_df_to_context("Tabla detalle (abajo)", detalles, 250))
         else:
             context_parts.append("Tabla detalle (abajo): (no disponible)\n")
@@ -5920,10 +5992,11 @@ if ask:
             context_parts.append(f"Análisis de Riesgo Deep Learning: (error: {e})\n")
 
         system_msg = (
-            "Eres un analista de planeación táctica especializado en análisis de riesgo. Responde en español, "
+            "Eres Mel-IA, un analista de planeación táctica especializado en análisis de riesgo. Responde en español, "
             "claro y conciso. Si haces cálculos, muéstralos. "
-            "Presta especial atención a los datos de riesgo de Deep Learning (Tabla 4) que incluyen probabilidades de fallo por modelo MLP, Wide&Deep, TabTransformer y Blend. "
-            "Usa solo el contexto provisto; si algo no está en los datos, dilo."
+            "Tienes acceso a: 1) Tabla plan con datos de capacidad y demanda por SVC, 2) Tabla detalle con información granular, "
+            "3) Análisis de riesgo de Deep Learning con probabilidades de fallo por modelo MLP, Wide&Deep, TabTransformer y Blend. "
+            "Usa TODOS los datos disponibles para dar respuestas completas. Si algo no está en los datos, dilo."
         )
         context_block = "\n".join(context_parts)
 
