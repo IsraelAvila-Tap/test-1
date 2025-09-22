@@ -5587,6 +5587,110 @@ def analizar_riesgos_dl(dl_risk_df):
     
     return "\n".join(insights)
 
+
+def procesar_ajuste_plan(instruction, plan_df):
+    """Procesa instrucciones de ajuste del plan"""
+    import re
+    
+    print(f"🔧 DEBUG: Procesando ajuste: '{instruction}'")
+    
+    # Obtener datos confiables
+    if plan_df is None or plan_df.empty:
+        plan_df = get_mel_ia_plan_data()
+    
+    if plan_df is None or plan_df.empty:
+        return "❌ No hay datos del plan. Ejecuta 'Calcular plan' primero."
+    
+    # Detectar SVC
+    svc = None
+    for svc_name in plan_df['SVC'].unique():
+        if svc_name.lower() in instruction.lower():
+            svc = svc_name
+            break
+    
+    if not svc:
+        return f"❌ No se detectó SVC válido. SVCs disponibles: {list(plan_df['SVC'].unique())}"
+    
+    # Detectar parámetro
+    parametro = None
+    if "spr" in instruction.lower():
+        parametro = "SPR_RENTALS"
+    elif "crowd" in instruction.lower():
+        parametro = "CROWD_PCT"
+    elif "rutas" in instruction.lower():
+        parametro = "RUTAS_RENTALS"
+    
+    if not parametro:
+        return "❌ No se detectó parámetro válido (spr, crowd, rutas)"
+    
+    # Detectar valor y tipo de ajuste
+    numeros = re.findall(r'\d+\.?\d*', instruction)
+    if not numeros:
+        return "❌ No se detectó valor numérico en la instrucción"
+    
+    valor = float(numeros[0])
+    
+    # Obtener datos actuales del SVC
+    svc_data = plan_df[plan_df['SVC'] == svc]
+    if svc_data.empty:
+        return f"❌ No se encontró el SVC {svc} en el plan"
+    
+    svc_row = svc_data.iloc[0]
+    valor_actual = svc_row.get(parametro, 0)
+    
+    # Determinar tipo de ajuste
+    if any(word in instruction.lower() for word in ["arriba", "aumenta", "sube", "+"]):
+        nuevo_valor = valor_actual + valor
+        tipo_ajuste = f"aumentar {valor}"
+    elif any(word in instruction.lower() for word in ["abajo", "reduce", "baja", "-"]):
+        nuevo_valor = valor_actual - valor
+        tipo_ajuste = f"reducir {valor}"
+    else:
+        nuevo_valor = valor
+        tipo_ajuste = f"establecer en {valor}"
+    
+    # Calcular impacto
+    if parametro == "SPR_RENTALS":
+        rutas_actuales = svc_row.get('RUTAS_RENTALS', 0)
+        shipments_actuales = rutas_actuales * valor_actual
+        shipments_nuevos = rutas_actuales * nuevo_valor
+        cambio_shipments = shipments_nuevos - shipments_actuales
+        
+        respuesta = f"""
+**🔧 Ajuste Procesado: {svc}**
+
+**📝 Instrucción:** {instruction}
+**🎯 Acción:** {tipo_ajuste} {parametro}
+
+**📊 Cambios:**
+- **Valor actual**: {valor_actual:.1f}
+- **Nuevo valor**: {nuevo_valor:.1f}
+- **Cambio**: {nuevo_valor - valor_actual:+.1f}
+
+**📈 Impacto en Shipments:**
+- **Shipments actuales**: {shipments_actuales:.0f}
+- **Shipments nuevos**: {shipments_nuevos:.0f}
+- **Cambio**: {cambio_shipments:+.0f} shipments
+
+**⚠️ NOTA:** Este es un cálculo de impacto. Para aplicar el cambio realmente, necesitas modificar los datos fuente y recalcular el plan.
+        """
+    else:
+        respuesta = f"""
+**🔧 Ajuste Procesado: {svc}**
+
+**📝 Instrucción:** {instruction}
+**🎯 Acción:** {tipo_ajuste} {parametro}
+
+**📊 Cambios:**
+- **Valor actual**: {valor_actual:.1f}
+- **Nuevo valor**: {nuevo_valor:.1f}
+- **Cambio**: {nuevo_valor - valor_actual:+.1f}
+
+**⚠️ NOTA:** Este es un cálculo de impacto. Para aplicar el cambio realmente, necesitas modificar los datos fuente y recalcular el plan.
+        """
+    
+    return respuesta
+
 def procesar_pregunta_inteligente(user_q, plan_df, detalles_df, dl_risk_df):
     """Procesa preguntas inteligentes y genera respuestas con acciones"""
     import re
@@ -6070,9 +6174,44 @@ def procesar_analisis_completo(plan_df, detalles_df, dl_risk_df):
     
     return respuesta
 
+
+# ===== SECCIÓN DE AJUSTES DEL PLAN =====
+st.markdown("---")
+st.markdown("## 🔧 Ajustes del Plan")
+st.markdown("**Usa esta sección para hacer ajustes específicos a los parámetros del plan**")
+
+# Formulario para ajustes
+with st.form("adjustment_form", clear_on_submit=True):
+    st.markdown("**Ejemplos de instrucciones:**")
+    st.markdown("• `Aumenta SPR de SMT1 en 10 puntos`")
+    st.markdown("• `Reduce CROWD de SGD1 en 5 puntos`")
+    st.markdown("• `Establece SPR de SMX9 en 75`")
+    
+    adjustment_instruction = st.text_input(
+        "Instrucción de ajuste:",
+        placeholder="Ej: Aumenta SPR de SMT1 en 10 puntos",
+        key="adjustment_input"
+    )
+    
+    col_adj1, col_adj2 = st.columns([1, 3])
+    with col_adj1:
+        process_adjustment = st.form_submit_button("🔧 Procesar Ajuste", use_container_width=True)
+    with col_adj2:
+        st.markdown("*Los ajustes calculan el impacto pero no modifican el plan automáticamente*")
+
+# Procesar ajuste si se envió
+if process_adjustment and adjustment_instruction:
+    respuesta_ajuste = procesar_ajuste_plan(adjustment_instruction, plan)
+    st.markdown("### Resultado del Ajuste:")
+    st.markdown(respuesta_ajuste)
+elif process_adjustment and not adjustment_instruction:
+    st.warning("⚠️ Escribe una instrucción de ajuste")
+
+st.markdown("---")
+
 # --- UI DEL CHAT ---
-st.markdown("## 🤖 Pregunta a Mel-IA sobre tus datos")
-st.caption("Puedes preguntarle a Mel-IA sobre los datos del plan, riesgos, spr, mlps, etc.")
+st.markdown("## 🤖 Consultas a Mel-IA")
+st.caption("Haz preguntas sobre los datos del plan, análisis, riesgos, etc. Para ajustes usa la sección de arriba.")
 
 # Si no hay plan persistido, avisa (evita consultas vacías)
 if not st.session_state.get("plan_df") is not None:
