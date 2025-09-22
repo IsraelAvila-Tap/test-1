@@ -5487,6 +5487,40 @@ else:
 plan = st.session_state.get("plan_df")   # DataFrame de la tabla de arriba
 detalles = st.session_state.get("detalles_df")  # DataFrame de la tabla de abajo
 
+
+def diagnosticar_datos_mel_ia():
+    """Función de diagnóstico para ver todos los datos disponibles"""
+    print("=" * 60)
+    print("🔍 DIAGNÓSTICO COMPLETO DE DATOS MEL-IA")
+    print("=" * 60)
+    
+    # Revisar session_state
+    print("\n📊 DATOS EN SESSION_STATE:")
+    for key in st.session_state.keys():
+        if 'df' in key.lower() or 'data' in key.lower() or 'plan' in key.lower():
+            data = st.session_state[key]
+            if hasattr(data, 'shape'):
+                print(f"  - {key}: {data.shape} - Columnas: {list(data.columns)[:5]}...")
+                if not data.empty:
+                    print(f"    Primeras 2 filas:")
+                    print(f"    {data.head(2).to_dict('records')}")
+            else:
+                print(f"  - {key}: {type(data)}")
+    
+    # Revisar variables globales
+    print("\n🌐 VARIABLES GLOBALES:")
+    globals_to_check = ['plan', 'detalles', 'dl_risk_data']
+    for var_name in globals_to_check:
+        if var_name in globals():
+            var_data = globals()[var_name]
+            if hasattr(var_data, 'shape'):
+                print(f"  - {var_name}: {var_data.shape} - Columnas: {list(var_data.columns)[:5]}...")
+            else:
+                print(f"  - {var_name}: {type(var_data)}")
+    
+    print("=" * 60)
+    return "Diagnóstico completado - revisa la consola"
+
 # ===== FUNCIONES DE ANÁLISIS INTELIGENTE PARA EL AGENTE =====
 
 def analizar_riesgos_dl(dl_risk_df):
@@ -5852,13 +5886,33 @@ def procesar_shipments_faltantes(user_q, plan_df):
     return respuesta
 def procesar_analisis_completo(plan_df, detalles_df, dl_risk_df):
     """Procesa análisis completo del plan con todos los datos"""
-    if plan_df is None or plan_df.empty:
-        return "No hay datos del plan disponibles. Ejecuta 'Calcular plan' primero."
+    
+    # Intentar obtener datos de múltiples fuentes
+    print("🔍 DEBUG: Buscando datos en múltiples fuentes...")
+    
+    # Fuente 1: Parámetros pasados
+    if plan_df is not None and not plan_df.empty:
+        print(f"🔍 DEBUG: Usando plan_df pasado como parámetro: {plan_df.shape}")
+        working_df = plan_df
+    # Fuente 2: Session state
+    elif 'plan_df' in st.session_state and st.session_state['plan_df'] is not None:
+        print("🔍 DEBUG: Usando plan_df de session_state")
+        working_df = st.session_state['plan_df']
+    # Fuente 3: Variable global
+    elif 'plan' in globals() and globals()['plan'] is not None:
+        print("🔍 DEBUG: Usando variable global 'plan'")
+        working_df = globals()['plan']
+    else:
+        return "❌ No se encontraron datos del plan en ninguna fuente. Ejecuta 'Calcular plan' primero."
     
     # Debug: mostrar columnas disponibles
-    print(f"🔍 DEBUG: Columnas disponibles en plan_df: {list(plan_df.columns)}")
-    print(f"🔍 DEBUG: Primeras 3 filas del plan_df:")
-    print(plan_df.head(3))
+    print(f"🔍 DEBUG: Columnas disponibles: {list(working_df.columns)}")
+    print(f"🔍 DEBUG: Shape del DataFrame: {working_df.shape}")
+    print(f"🔍 DEBUG: Primeras 3 filas:")
+    print(working_df.head(3))
+    
+    # Usar working_df en lugar de plan_df
+    plan_df = working_df
     
     # Análisis del plan con detección automática de columnas
     try:
@@ -6022,10 +6076,19 @@ with col4:
 
 # Agregar botón de análisis completo
 st.markdown("**📋 Análisis Completo:**")
-if st.button("📊 Ver Análisis Completo del Plan"):
-    respuesta = procesar_analisis_completo(plan, detalles, st.session_state.get('dl_risk_data'))
-    st.session_state.chat_history.append(("Análisis completo del plan", respuesta))
-    st.rerun()
+col_a, col_b = st.columns(2)
+
+with col_a:
+    if st.button("📊 Ver Análisis Completo del Plan"):
+        respuesta = procesar_analisis_completo(plan, detalles, st.session_state.get('dl_risk_data'))
+        st.session_state.chat_history.append(("Análisis completo del plan", respuesta))
+        st.rerun()
+
+with col_b:
+    if st.button("🔍 Diagnóstico de Datos"):
+        respuesta = diagnosticar_datos_mel_ia()
+        st.session_state.chat_history.append(("Diagnóstico de datos", respuesta))
+        st.rerun()
 
 if ask:
     if not client:
