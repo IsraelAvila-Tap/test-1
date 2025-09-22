@@ -361,7 +361,7 @@ def coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def coerce_date_column(df: pd.DataFrame, candidates: List[str], new_name: str,
             source_label: str, required: bool = False) -> Optional[str]:
-                col = find_and_rename(df, candidates, new_name, required=required, source_label=source_label)
+    col = find_and_rename(df, candidates, new_name, required=required, source_label=source_label)
     if col:
         df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True, infer_datetime_format=True).dt.date
         if df[col].notna().sum() == 0:
