@@ -5534,11 +5534,14 @@ def procesar_pregunta_inteligente(user_q, plan_df, detalles_df, dl_risk_df):
     elif "optimizar" in user_q.lower() or "mejorar" in user_q.lower():
         return procesar_optimizacion(plan_df, dl_risk_df)
     else:
-        return "Pregunta general procesada por el agente inteligente"
+        return "Pregunta general procesada por el Mel-IA inteligente"
 
 def procesar_what_if(user_q, plan_df):
-    """Procesa preguntas de escenarios '¿Qué pasa si...?'"""
+    """Procesa preguntas de escenarios '¿Qué pasa si...?' con cálculos reales"""
     import re
+    
+    if plan_df is None or plan_df.empty:
+        return "No hay datos del plan disponibles. Ejecuta 'Calcular plan' primero."
     
     # Extraer parámetros de la pregunta
     svc = None
@@ -5558,6 +5561,8 @@ def procesar_what_if(user_q, plan_df):
         parametro = "CROWD_PCT"
     elif "rutas" in user_q.lower() and "rentals" in user_q.lower():
         parametro = "RUTAS_RENTALS"
+    elif "spr" in user_q.lower():
+        parametro = "SPR_RENTALS"
     
     # Detectar valor
     numeros = re.findall(r'\d+\.?\d*', user_q)
@@ -5565,21 +5570,85 @@ def procesar_what_if(user_q, plan_df):
         valor = float(numeros[0])
     
     if svc and parametro and valor:
-        # Simular cálculo de escenario
-        respuesta = f"""
-**Escenario: {parametro} = {valor} en {svc}**
+        # Obtener datos actuales del SVC
+        svc_data = plan_df[plan_df['SVC'] == svc]
+        if svc_data.empty:
+            return f"No se encontró el SVC {svc} en el plan actual."
+        
+        svc_row = svc_data.iloc[0]
+        valor_actual = svc_row.get(parametro, 0)
+        
+        # Calcular impacto real
+        if parametro == "SPR_RENTALS":
+            # Calcular cuántos shipments adicionales genera el cambio de SPR
+            rutas_actuales = svc_row.get('RUTAS_RENTALS', 0)
+            shipments_actuales = rutas_actuales * valor_actual
+            shipments_nuevos = rutas_actuales * valor
+            cambio_shipments = shipments_nuevos - shipments_actuales
+            
+            # Calcular nueva capacidad total
+            cap_actual = svc_row.get('CAP_TOTAL', 0)
+            cap_nueva = cap_actual + cambio_shipments
+            
+            # Calcular déficit/superávit
+            fcst = svc_row.get('FCST', 0)
+            deficit_actual = max(0, fcst - cap_actual)
+            deficit_nuevo = max(0, fcst - cap_nueva)
+            
+            respuesta = f"""
+**🔍 Escenario: Aumentar SPR_RENTALS de {valor_actual} a {valor} en {svc}**
 
-**Impacto estimado:**
-- Cambio en {svc}: +{valor * 100:.0f} shipments estimados
-- Nueva capacidad total: {plan_df['CAP_TOTAL'].sum() + valor * 100:.0f} shipments
-- Diferencia vs demanda: {plan_df['CAP_TOTAL'].sum() + valor * 100 - plan_df['FCST'].sum():.0f} shipments
+**📊 Impacto Calculado:**
+- **Shipments adicionales**: {cambio_shipments:+.0f} shipments
+- **Capacidad actual**: {cap_actual:.0f} shipments
+- **Nueva capacidad**: {cap_nueva:.0f} shipments
+- **Demanda (FCST)**: {fcst:.0f} shipments
 
-**Recomendación:**
-{'✅ Mejora la capacidad' if valor > 0 else '❌ Reduce la capacidad'}
-        """
+**📈 Resultado:**
+- **Déficit actual**: {deficit_actual:.0f} shipments
+- **Déficit nuevo**: {deficit_nuevo:.0f} shipments
+- **Mejora**: {deficit_actual - deficit_nuevo:+.0f} shipments
+
+**💡 Recomendación:**
+{'✅ Cambio recomendado - reduce el déficit' if cambio_shipments > 0 and deficit_nuevo < deficit_actual else '⚠️ Cambio no recomendado - aumenta el déficit' if cambio_shipments < 0 else 'ℹ️ Cambio neutro - sin impacto significativo'}
+            """
+            
+        elif parametro == "CROWD_PCT":
+            # Calcular impacto del cambio en CROWD_PCT
+            crowd_actual = svc_row.get('CROWD_PCT', 0)
+            cambio_crowd = valor - crowd_actual
+            
+            # Estimar impacto en capacidad (simplificado)
+            impacto_estimado = cambio_crowd * svc_row.get('CAP_TOTAL', 0) * 0.1  # 10% del impacto
+            
+            respuesta = f"""
+**🔍 Escenario: Cambiar CROWD_PCT de {crowd_actual:.1%} a {valor:.1%} en {svc}**
+
+**📊 Impacto Estimado:**
+- **Cambio en CROWD_PCT**: {cambio_crowd:+.1%}
+- **Impacto estimado en capacidad**: {impacto_estimado:+.0f} shipments
+- **Capacidad actual**: {svc_row.get('CAP_TOTAL', 0):.0f} shipments
+
+**💡 Recomendación:**
+{'✅ Cambio recomendado' if cambio_crowd > 0 else '⚠️ Cambio no recomendado' if cambio_crowd < 0 else 'ℹ️ Sin cambio'}
+            """
+            
+        else:
+            respuesta = f"""
+**🔍 Escenario: {parametro} = {valor} en {svc}**
+
+**📊 Datos Actuales:**
+- **Valor actual**: {valor_actual}
+- **Nuevo valor**: {valor}
+- **Cambio**: {valor - valor_actual:+.0f}
+
+**💡 Recomendación:**
+{'✅ Cambio recomendado' if valor > valor_actual else '⚠️ Cambio no recomendado' if valor < valor_actual else 'ℹ️ Sin cambio'}
+            """
+        
         return respuesta
     else:
-        return "No pude interpretar el escenario. Usa formato: '¿Qué pasa si aumento SPR_RENTALS a 100 en SGD1?'"
+        return "No pude interpretar el escenario. Usa formato: '¿Qué pasa si aumento SPR_RENTALS a 100 en SGD1?' o 'sube 10 puntos el SPR de SMT1'"
 
 def procesar_recomendaciones(plan_df, dl_risk_df):
     """Genera recomendaciones inteligentes"""
@@ -5678,6 +5747,80 @@ def procesar_optimizacion(plan_df, dl_risk_df):
         respuesta = "✅ No se requieren optimizaciones urgentes."
     
     return respuesta
+def procesar_shipments_faltantes(user_q, plan_df):
+    """Procesa preguntas sobre shipments faltantes"""
+    if plan_df is None or plan_df.empty:
+        return "No hay datos del plan disponibles. Ejecuta 'Calcular plan' primero."
+    
+    # Detectar SVC específico
+    svc = None
+    for svc_name in plan_df['SVC'].unique():
+        if svc_name.lower() in user_q.lower():
+            svc = svc_name
+            break
+    
+    if svc:
+        # Análisis para SVC específico
+        svc_data = plan_df[plan_df['SVC'] == svc]
+        if not svc_data.empty:
+            svc_row = svc_data.iloc[0]
+            fcst = svc_row.get('FCST', 0)
+            cap_total = svc_row.get('CAP_TOTAL', 0)
+            deficit = max(0, fcst - cap_total)
+            
+            respuesta = f"""
+**📦 Análisis de Shipments Faltantes - {svc}**
+
+**📊 Datos Actuales:**
+- **Demanda (FCST)**: {fcst:.0f} shipments
+- **Capacidad Total**: {cap_total:.0f} shipments
+- **Shipments Faltantes**: {deficit:.0f} shipments
+
+**🔍 Desglose por Fuente:**
+- **Rentals**: {svc_row.get('RUTAS_RENTALS', 0) * svc_row.get('SPR_RENTALS', 0):.0f} shipments
+- **Crowd**: {svc_row.get('CROWD_PCT', 0) * cap_total:.0f} shipments
+- **Otros**: {cap_total - (svc_row.get('RUTAS_RENTALS', 0) * svc_row.get('SPR_RENTALS', 0)) - (svc_row.get('CROWD_PCT', 0) * cap_total):.0f} shipments
+
+**💡 Recomendaciones:**
+{'🔴 CRÍTICO - Necesitas aumentar capacidad inmediatamente' if deficit > fcst * 0.2 else '🟡 ATENCIÓN - Considera aumentar capacidad' if deficit > fcst * 0.1 else '✅ BIEN - Capacidad adecuada'}
+            """
+            
+            if deficit > 0:
+                # Calcular cuántas rutas adicionales necesitas
+                spr_rentals = svc_row.get('SPR_RENTALS', 0)
+                if spr_rentals > 0:
+                    rutas_adicionales = int(deficit / spr_rentals)
+                    respuesta += f"\n\n**🛠️ Solución Práctica:**\n- Agregar {rutas_adicionales} rutas de Rentals para cubrir el déficit"
+            
+            return respuesta
+    
+    # Análisis general si no se especifica SVC
+    total_fcst = plan_df['FCST'].sum()
+    total_cap = plan_df['CAP_TOTAL'].sum()
+    total_deficit = max(0, total_fcst - total_cap)
+    
+    respuesta = f"""
+**📦 Análisis General de Shipments Faltantes**
+
+**📊 Resumen Global:**
+- **Demanda Total (FCST)**: {total_fcst:.0f} shipments
+- **Capacidad Total**: {total_cap:.0f} shipments
+- **Shipments Faltantes**: {total_deficit:.0f} shipments
+- **Cobertura**: {(total_cap / total_fcst * 100):.1f}%
+
+**🔍 Por SVC:**
+"""
+    
+    for _, row in plan_df.iterrows():
+        svc_name = row['SVC']
+        fcst = row.get('FCST', 0)
+        cap = row.get('CAP_TOTAL', 0)
+        deficit = max(0, fcst - cap)
+        cobertura = (cap / fcst * 100) if fcst > 0 else 0
+        
+        respuesta += f"\n- **{svc_name}**: {deficit:.0f} faltantes ({cobertura:.1f}% cobertura)"
+    
+    return respuesta
 
 # --- UI DEL CHAT ---
 st.markdown("## 🤖 Pregunta a Mel-IA sobre tus datos")
@@ -5702,7 +5845,7 @@ with st.form("qa_form", clear_on_submit=False):
     ask = st.form_submit_button("Preguntar")
 
 # Agregar botones de acción rápida del agente
-st.markdown("**🚀 Acciones Rápidas del Agente:**")
+st.markdown("**🚀 Acciones Rápidas de Mel-IA:**")
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
@@ -5735,18 +5878,18 @@ if ask:
     elif not user_q.strip():
         st.warning("Escribe una pregunta.")
     else:
-        # Intentar procesamiento inteligente primero
+        # Intentar procesamiento inteligente de Mel-IA primero
         try:
             respuesta_inteligente = procesar_pregunta_inteligente(
                 user_q, plan, detalles, st.session_state.get('dl_risk_data')
             )
             
             # Si es una respuesta inteligente específica, usarla
-            if respuesta_inteligente != "Pregunta general procesada por el agente inteligente":
+            if respuesta_inteligente != "Pregunta general procesada por el Mel-IA inteligente":
                 st.session_state.chat_history.append((user_q, respuesta_inteligente))
                 st.rerun()
         except Exception as e:
-            st.error(f"Error en procesamiento inteligente: {e}")
+            st.error(f"Error en procesamiento inteligente de Mel-IA: {e}")
             # Continuar con el procesamiento normal
         # Construye contexto desde los dataframes persistidos
         context_parts = []
