@@ -2060,7 +2060,7 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
     cap_mlp = (out["RUTAS_MLP_SDD_USADAS"] + out["RUTAS_MLP_SPOT_USADAS"] + out["RUTAS_MLP_BACKLOG_USADAS"]) * out["SPR_MLP"]
     out["CAP_TOTAL"]    = base_otros.fillna(0) + out["SHIP_RENTALS"].fillna(0) + out["SHIP_CROWD"].fillna(0) + cap_mlp.fillna(0)
     
-    # Paquetes en Riesgo = demanda - capacidad total (solo valores positivos = faltante real)
+    # Rutas faltantes = demanda - capacidad total (solo valores positivos = faltante real)
     # Asegurar que FCST sea numérico y manejar NaN e infinitos
     fcst_numeric = pd.to_numeric(out["FCST"], errors="coerce").fillna(0)
     rutas_falt_calc = (fcst_numeric - out["CAP_TOTAL"]).clip(lower=0)
@@ -5258,7 +5258,7 @@ try:
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("SVCs", svcs_uniques)
                 c2.metric("Demanda ajustada", f"{dem_aj_total:,}")
-                c3.metric("Paquetes en Riesgo", f"{rutas_falt_total:,}")
+                c3.metric("Rutas faltantes", f"{rutas_falt_total:,}")
                 c4.metric("SPR (resultante capacidad)", spr_cap_label)
 
                 # 6) Tabla 1 — “arriba” (reconciliada)
@@ -5487,6 +5487,170 @@ else:
 plan = st.session_state.get("plan_df")   # DataFrame de la tabla de arriba
 detalles = st.session_state.get("detalles_df")  # DataFrame de la tabla de abajo
 
+# ===== FUNCIONES DE ANÁLISIS INTELIGENTE PARA EL AGENTE =====
+
+def analizar_riesgos_dl(dl_risk_df):
+    """Analiza los riesgos de Deep Learning y genera insights"""
+    if dl_risk_df is None or dl_risk_df.empty:
+        return "No hay datos de riesgo disponibles"
+    
+    insights = []
+    for svc in dl_risk_df['SVC'].unique():
+        svc_data = dl_risk_df[dl_risk_df['SVC'] == svc]
+        max_risk = svc_data[['Prob_DL_MLP', 'Prob_DL_WD', 'Prob_DL_TT', 'Prob_Blend']].max().max()
+        
+        if max_risk > 0.8:
+            insights.append(f"🚨 ALTO RIESGO en {svc}: {max_risk:.1%} probabilidad de fallo")
+        elif max_risk > 0.5:
+            insights.append(f"⚠️ RIESGO MEDIO en {svc}: {max_risk:.1%} probabilidad de fallo")
+        else:
+            insights.append(f"✅ BAJO RIESGO en {svc}: {max_risk:.1%} probabilidad de fallo")
+    
+    return "\n".join(insights)
+
+def procesar_pregunta_inteligente(user_q, plan_df, detalles_df, dl_risk_df):
+    """Procesa preguntas inteligentes y genera respuestas con acciones"""
+    import re
+    
+    # Detectar tipo de pregunta
+    if "¿qué pasa si" in user_q.lower() or "what if" in user_q.lower():
+        return procesar_what_if(user_q, plan_df)
+    elif "recomend" in user_q.lower() or "suger" in user_q.lower():
+        return procesar_recomendaciones(plan_df, dl_risk_df)
+    elif "riesgo" in user_q.lower() or "risk" in user_q.lower():
+        return procesar_analisis_riesgo(dl_risk_df)
+    elif "optimizar" in user_q.lower() or "mejorar" in user_q.lower():
+        return procesar_optimizacion(plan_df, dl_risk_df)
+    else:
+        return "Pregunta general procesada por el agente inteligente"
+
+def procesar_what_if(user_q, plan_df):
+    """Procesa preguntas de escenarios '¿Qué pasa si...?'"""
+    import re
+    
+    # Extraer parámetros de la pregunta
+    svc = None
+    parametro = None
+    valor = None
+    
+    # Detectar SVC
+    for svc_name in plan_df['SVC'].unique():
+        if svc_name.lower() in user_q.lower():
+            svc = svc_name
+            break
+    
+    # Detectar parámetro
+    if "spr" in user_q.lower() and "rentals" in user_q.lower():
+        parametro = "SPR_RENTALS"
+    elif "crowd" in user_q.lower() and "pct" in user_q.lower():
+        parametro = "CROWD_PCT"
+    elif "rutas" in user_q.lower() and "rentals" in user_q.lower():
+        parametro = "RUTAS_RENTALS"
+    
+    # Detectar valor
+    numeros = re.findall(r'\d+\.?\d*', user_q)
+    if numeros:
+        valor = float(numeros[0])
+    
+    if svc and parametro and valor:
+        # Simular cálculo de escenario
+        respuesta = f"""
+**Escenario: {parametro} = {valor} en {svc}**
+
+**Impacto estimado:**
+- Cambio en {svc}: +{valor * 100:.0f} shipments estimados
+- Nueva capacidad total: {plan_df['CAP_TOTAL'].sum() + valor * 100:.0f} shipments
+- Diferencia vs demanda: {plan_df['CAP_TOTAL'].sum() + valor * 100 - plan_df['FCST'].sum():.0f} shipments
+
+**Recomendación:**
+{'✅ Mejora la capacidad' if valor > 0 else '❌ Reduce la capacidad'}
+        """
+        return respuesta
+    else:
+        return "No pude interpretar el escenario. Usa formato: '¿Qué pasa si aumento SPR_RENTALS a 100 en SGD1?'"
+
+def procesar_recomendaciones(plan_df, dl_risk_df):
+    """Genera recomendaciones inteligentes"""
+    recomendaciones = []
+    
+    if dl_risk_df is not None and not dl_risk_df.empty:
+        # Analizar SVCs con mayor riesgo
+        svc_riesgo = dl_risk_df.groupby('SVC')[['Prob_Blend']].max().sort_values('Prob_Blend', ascending=False)
+        
+        for svc, riesgo in svc_riesgo.iterrows():
+            if riesgo['Prob_Blend'] > 0.7:
+                recomendaciones.append(f"🎯 {svc}: Aumentar capacidad (riesgo {riesgo['Prob_Blend']:.1%})")
+                
+                # Calcular cuánto aumentar
+                svc_data = plan_df[plan_df['SVC'] == svc]
+                if not svc_data.empty:
+                    deficit = svc_data['FCST'].iloc[0] - svc_data['CAP_TOTAL'].iloc[0]
+                    if deficit > 0:
+                        rutas_extra = int(deficit / svc_data['SPR_RENTALS'].iloc[0])
+                        recomendaciones.append(f"   💡 Agregar {rutas_extra} rutas de Rentals")
+    
+    if not recomendaciones:
+        return "✅ No hay recomendaciones urgentes. El plan actual parece estar bien balanceado."
+    
+    respuesta = "**🎯 Recomendaciones Inteligentes:**\n\n"
+    for i, rec in enumerate(recomendaciones, 1):
+        respuesta += f"{i}. {rec}\n"
+    
+    return respuesta
+
+def procesar_analisis_riesgo(dl_risk_df):
+    """Analiza riesgos de Deep Learning"""
+    if dl_risk_df is None or dl_risk_df.empty:
+        return "No hay datos de riesgo disponibles para analizar."
+    
+    analisis = analizar_riesgos_dl(dl_risk_df)
+    
+    # Estadísticas adicionales
+    riesgo_promedio = dl_risk_df['Prob_Blend'].mean()
+    svc_mas_riesgo = dl_risk_df.loc[dl_risk_df['Prob_Blend'].idxmax(), 'SVC']
+    riesgo_max = dl_risk_df['Prob_Blend'].max()
+    
+    respuesta = f"""
+**📊 Análisis de Riesgo de Deep Learning**
+
+{analisis}
+
+**Estadísticas:**
+- Riesgo promedio: {riesgo_promedio:.1%}
+- SVC con mayor riesgo: {svc_mas_riesgo} ({riesgo_max:.1%})
+- Total de SVCs analizados: {len(dl_risk_df['SVC'].unique())}
+    """
+    
+    return respuesta
+
+def procesar_optimizacion(plan_df, dl_risk_df):
+    """Procesa solicitudes de optimización"""
+    if dl_risk_df is None or dl_risk_df.empty:
+        return "No hay datos de riesgo para optimizar. Ejecuta 'Calcular plan' primero."
+    
+    # Identificar SVCs con mayor riesgo
+    svc_riesgo = dl_risk_df.groupby('SVC')[['Prob_Blend']].max().sort_values('Prob_Blend', ascending=False)
+    svc_critico = svc_riesgo[svc_riesgo['Prob_Blend'] > 0.7]
+    
+    if svc_critico.empty:
+        return "✅ No hay SVCs críticos que requieran optimización inmediata."
+    
+    optimizaciones = []
+    for svc, riesgo in svc_critico.iterrows():
+        svc_data = plan_df[plan_df['SVC'] == svc]
+        if not svc_data.empty:
+            deficit = svc_data['FCST'].iloc[0] - svc_data['CAP_TOTAL'].iloc[0]
+            if deficit > 0:
+                rutas_extra = int(deficit / svc_data['SPR_RENTALS'].iloc[0])
+                optimizaciones.append(f"**{svc}**: Agregar {rutas_extra} rutas de Rentals (déficit: {deficit:.0f} shipments)")
+    
+    if optimizaciones:
+        respuesta = "**🔧 Optimizaciones Sugeridas:**\n\n" + "\n".join(optimizaciones)
+    else:
+        respuesta = "✅ No se requieren optimizaciones urgentes."
+    
+    return respuesta
+
 # --- UI DEL CHAT ---
 st.markdown("## 🤖 Pregunta a Mel-IA sobre tus datos")
 st.caption("Puedes preguntarle a Mel-IA sobre los datos del plan, riesgos, spr, mlps, etc.")
@@ -5509,12 +5673,53 @@ with st.form("qa_form", clear_on_submit=False):
     )
     ask = st.form_submit_button("Preguntar")
 
+# Agregar botones de acción rápida del agente
+st.markdown("**🚀 Acciones Rápidas del Agente:**")
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    if st.button("📊 Analizar Riesgos"):
+        respuesta = procesar_analisis_riesgo(st.session_state.get('dl_risk_data'))
+        st.session_state.chat_history.append(("Analizar riesgos", respuesta))
+        st.rerun()
+
+with col2:
+    if st.button("🎯 Recomendaciones"):
+        respuesta = procesar_recomendaciones(plan, st.session_state.get('dl_risk_data'))
+        st.session_state.chat_history.append(("Generar recomendaciones", respuesta))
+        st.rerun()
+
+with col3:
+    if st.button("🔍 Escenarios"):
+        respuesta = "**Ejemplos de escenarios que puedes preguntar:**\n\n• ¿Qué pasa si aumento SPR_RENTALS a 120 en SGD1?\n• ¿Qué pasa si reduzco CROWD_PCT a 0.3 en SMT1?\n• ¿Qué pasa si agrego 50 rutas de Rentals en SMX9?"
+        st.session_state.chat_history.append(("Mostrar ejemplos de escenarios", respuesta))
+        st.rerun()
+
+with col4:
+    if st.button("🔧 Optimizar Plan"):
+        respuesta = procesar_optimizacion(plan, st.session_state.get('dl_risk_data'))
+        st.session_state.chat_history.append(("Optimizar plan", respuesta))
+        st.rerun()
+
 if ask:
     if not client:
         st.error("El chat no está disponible (cliente OpenAI no inicializado o paquete faltante).")
     elif not user_q.strip():
         st.warning("Escribe una pregunta.")
     else:
+        # Intentar procesamiento inteligente primero
+        try:
+            respuesta_inteligente = procesar_pregunta_inteligente(
+                user_q, plan, detalles, st.session_state.get('dl_risk_data')
+            )
+            
+            # Si es una respuesta inteligente específica, usarla
+            if respuesta_inteligente != "Pregunta general procesada por el agente inteligente":
+                st.session_state.chat_history.append((user_q, respuesta_inteligente))
+                st.rerun()
+        except Exception as e:
+            st.error(f"Error en procesamiento inteligente: {e}")
+            # Continuar con el procesamiento normal
         # Construye contexto desde los dataframes persistidos
         context_parts = []
         def _df_to_context(title, df, n=150):
