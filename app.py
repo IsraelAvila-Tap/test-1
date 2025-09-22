@@ -5494,12 +5494,17 @@ def analizar_riesgos_dl(dl_risk_df):
     if dl_risk_df is None or dl_risk_df.empty:
         return "No hay datos de riesgo disponibles"
     
+    # Debug: mostrar columnas disponibles
+    print(f"🔍 DEBUG: Columnas disponibles en dl_risk_df: {list(dl_risk_df.columns)}")
+    
     # Verificar que las columnas de probabilidades existan
-    prob_columns = ['Prob_DL_MLP', 'Prob_DL_WD', 'Prob_DL_TT', 'Prob_Blend']
+    prob_columns = ['Prob_DL_MLP', 'Prob_DL_WD', 'Prob_DL_TT', 'Prob_DL_BLEND']
     available_columns = [col for col in prob_columns if col in dl_risk_df.columns]
     
+    print(f"🔍 DEBUG: Columnas de probabilidades encontradas: {available_columns}")
+    
     if not available_columns:
-        return "No hay columnas de probabilidades de Deep Learning disponibles"
+        return f"No hay columnas de probabilidades de Deep Learning disponibles. Columnas disponibles: {list(dl_risk_df.columns)}"
     
     insights = []
     for svc in dl_risk_df['SVC'].unique():
@@ -5580,13 +5585,13 @@ def procesar_recomendaciones(plan_df, dl_risk_df):
     """Genera recomendaciones inteligentes"""
     recomendaciones = []
     
-    if dl_risk_df is not None and not dl_risk_df.empty and 'Prob_Blend' in dl_risk_df.columns:
+    if dl_risk_df is not None and not dl_risk_df.empty and 'Prob_DL_BLEND' in dl_risk_df.columns:
         # Analizar SVCs con mayor riesgo
-        svc_riesgo = dl_risk_df.groupby('SVC')[['Prob_Blend']].max().sort_values('Prob_Blend', ascending=False)
+        svc_riesgo = dl_risk_df.groupby('SVC')[['Prob_DL_BLEND']].max().sort_values('Prob_DL_BLEND', ascending=False)
         
         for svc, riesgo in svc_riesgo.iterrows():
-            if riesgo['Prob_Blend'] > 0.7:
-                recomendaciones.append(f"🎯 {svc}: Aumentar capacidad (riesgo {riesgo['Prob_Blend']:.1%})")
+            if riesgo['Prob_DL_BLEND'] > 0.7:
+                recomendaciones.append(f"🎯 {svc}: Aumentar capacidad (riesgo {riesgo['Prob_DL_BLEND']:.1%})")
                 
                 # Calcular cuánto aumentar
                 svc_data = plan_df[plan_df['SVC'] == svc]
@@ -5597,7 +5602,7 @@ def procesar_recomendaciones(plan_df, dl_risk_df):
                         recomendaciones.append(f"   💡 Agregar {rutas_extra} rutas de Rentals")
     
     if not recomendaciones:
-        if dl_risk_df is None or dl_risk_df.empty or 'Prob_Blend' not in dl_risk_df.columns:
+        if dl_risk_df is None or dl_risk_df.empty or 'Prob_DL_BLEND' not in dl_risk_df.columns:
             return "⚠️ No hay datos de riesgo de Deep Learning disponibles. Ejecuta 'Calcular plan' primero para generar recomendaciones basadas en riesgos."
         else:
             return "✅ No hay recomendaciones urgentes. El plan actual parece estar bien balanceado."
@@ -5620,10 +5625,10 @@ def procesar_analisis_riesgo(dl_risk_df):
         return analisis
     
     # Estadísticas adicionales solo si hay columnas de probabilidades
-    if 'Prob_Blend' in dl_risk_df.columns:
-        riesgo_promedio = dl_risk_df['Prob_Blend'].mean()
-        svc_mas_riesgo = dl_risk_df.loc[dl_risk_df['Prob_Blend'].idxmax(), 'SVC']
-        riesgo_max = dl_risk_df['Prob_Blend'].max()
+    if 'Prob_DL_BLEND' in dl_risk_df.columns:
+        riesgo_promedio = dl_risk_df['Prob_DL_BLEND'].mean()
+        svc_mas_riesgo = dl_risk_df.loc[dl_risk_df['Prob_DL_BLEND'].idxmax(), 'SVC']
+        riesgo_max = dl_risk_df['Prob_DL_BLEND'].max()
         
         respuesta = f"""
 **📊 Análisis de Riesgo de Deep Learning**
@@ -5648,12 +5653,12 @@ def procesar_analisis_riesgo(dl_risk_df):
 
 def procesar_optimizacion(plan_df, dl_risk_df):
     """Procesa solicitudes de optimización"""
-    if dl_risk_df is None or dl_risk_df.empty or 'Prob_Blend' not in dl_risk_df.columns:
+    if dl_risk_df is None or dl_risk_df.empty or 'Prob_DL_BLEND' not in dl_risk_df.columns:
         return "⚠️ No hay datos de riesgo de Deep Learning para optimizar. Ejecuta 'Calcular plan' primero para generar los datos de riesgo."
     
     # Identificar SVCs con mayor riesgo
-    svc_riesgo = dl_risk_df.groupby('SVC')[['Prob_Blend']].max().sort_values('Prob_Blend', ascending=False)
-    svc_critico = svc_riesgo[svc_riesgo['Prob_Blend'] > 0.7]
+    svc_riesgo = dl_risk_df.groupby('SVC')[['Prob_DL_BLEND']].max().sort_values('Prob_DL_BLEND', ascending=False)
+    svc_critico = svc_riesgo[svc_riesgo['Prob_DL_BLEND'] > 0.7]
     
     if svc_critico.empty:
         return "✅ No hay SVCs críticos que requieran optimización inmediata."
