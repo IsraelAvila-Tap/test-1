@@ -5563,11 +5563,40 @@ def procesar_what_if(user_q, plan_df):
         parametro = "RUTAS_RENTALS"
     elif "spr" in user_q.lower():
         parametro = "SPR_RENTALS"
+    elif "ajusta" in user_q.lower() and "spr" in user_q.lower():
+        parametro = "SPR_RENTALS"
+    elif "ajustar" in user_q.lower() and "spr" in user_q.lower():
+        parametro = "SPR_RENTALS"
     
     # Detectar valor
     numeros = re.findall(r'\d+\.?\d*', user_q)
     if numeros:
         valor = float(numeros[0])
+        # Si es un ajuste (puntos arriba/abajo), calcular el nuevo valor
+        if "puntos arriba" in user_q.lower() or "arriba" in user_q.lower():
+            # Obtener el valor actual del SVC si es posible
+            if svc:
+                try:
+                    svc_data = plan_df[plan_df['SVC'] == svc]
+                    if not svc_data.empty and parametro:
+                        valor_actual = svc_data.iloc[0].get(parametro, 0)
+                        if pd.notna(valor_actual):
+                            valor = valor_actual + valor
+                            print(f"🔍 DEBUG: Ajuste detectado: {valor_actual} + {float(numeros[0])} = {valor}")
+                except:
+                    pass
+        elif "puntos abajo" in user_q.lower() or "abajo" in user_q.lower():
+            # Obtener el valor actual del SVC si es posible
+            if svc:
+                try:
+                    svc_data = plan_df[plan_df['SVC'] == svc]
+                    if not svc_data.empty and parametro:
+                        valor_actual = svc_data.iloc[0].get(parametro, 0)
+                        if pd.notna(valor_actual):
+                            valor = valor_actual - valor
+                            print(f"🔍 DEBUG: Ajuste detectado: {valor_actual} - {float(numeros[0])} = {valor}")
+                except:
+                    pass
     
     if svc and parametro and valor:
         # Obtener datos actuales del SVC
@@ -5838,13 +5867,13 @@ def procesar_analisis_completo(plan_df, detalles_df, dl_risk_df):
         cap_col = None
         
         # Posibles nombres para demanda
-        for col in ['FCST', 'DEMANDA', 'Demanda', 'fcst', 'demanda']:
+        for col in ['FCST', 'DEMANDA', 'Demanda', 'fcst', 'demanda', 'Demanda ajustada']:
             if col in plan_df.columns:
                 fcst_col = col
                 break
         
         # Posibles nombres para capacidad
-        for col in ['CAP_TOTAL', 'CAPACIDAD', 'Capacidad', 'cap_total', 'capacidad']:
+        for col in ['CAP_TOTAL', 'CAPACIDAD', 'Capacidad', 'cap_total', 'capacidad', 'SPR (resultante capacidad)']:
             if col in plan_df.columns:
                 cap_col = col
                 break
@@ -5853,7 +5882,16 @@ def procesar_analisis_completo(plan_df, detalles_df, dl_risk_df):
         print(f"🔍 DEBUG: Columna de capacidad encontrada: {cap_col}")
         
         if fcst_col is None or cap_col is None:
-            return f"❌ No se encontraron las columnas necesarias. Columnas disponibles: {list(plan_df.columns)}"
+            # Si no encontramos las columnas, intentar usar las primeras columnas numéricas
+            numeric_cols = plan_df.select_dtypes(include=[np.number]).columns.tolist()
+            print(f"🔍 DEBUG: Columnas numéricas disponibles: {numeric_cols}")
+            
+            if len(numeric_cols) >= 2:
+                fcst_col = numeric_cols[0]
+                cap_col = numeric_cols[1]
+                print(f"🔍 DEBUG: Usando columnas numéricas: {fcst_col}, {cap_col}")
+            else:
+                return f"❌ No se encontraron las columnas necesarias. Columnas disponibles: {list(plan_df.columns)}"
         
         # Convertir a numérico y manejar errores
         fcst_numeric = pd.to_numeric(plan_df[fcst_col], errors='coerce').fillna(0)
@@ -5865,6 +5903,10 @@ def procesar_analisis_completo(plan_df, detalles_df, dl_risk_df):
         cobertura = (total_cap / total_fcst * 100) if total_fcst > 0 else 0
         
         print(f"🔍 DEBUG: FCST total: {total_fcst}, CAP total: {total_cap}, Déficit: {total_deficit}")
+        
+        # Si todo está en 0, mostrar un mensaje de advertencia
+        if total_fcst == 0 and total_cap == 0:
+            print("⚠️ WARNING: Todos los valores están en 0. Verificar que el plan se haya calculado correctamente.")
     except Exception as e:
         print(f"❌ ERROR en análisis del plan: {e}")
         return f"Error procesando datos del plan: {e}"
