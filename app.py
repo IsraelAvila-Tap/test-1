@@ -2055,11 +2055,13 @@ def compute_plan(spr_mode: str, sel_svcs: Optional[List[str]] = None) -> pd.Data
 
     out["RUTAS_RESTANTES"] = (need3 - use_back).clip(lower=0).astype(int)
     out["RUTAS_POST_MLP"]  = out["RUTAS_RESTANTES"]
-    out["RUTAS_FALTANTES"] = out["RUTAS_RESTANTES"]
 
     # KPIs finales
     cap_mlp = (out["RUTAS_MLP_SDD_USADAS"] + out["RUTAS_MLP_SPOT_USADAS"] + out["RUTAS_MLP_BACKLOG_USADAS"]) * out["SPR_MLP"]
     out["CAP_TOTAL"]    = base_otros.fillna(0) + out["SHIP_RENTALS"].fillna(0) + out["SHIP_CROWD"].fillna(0) + cap_mlp.fillna(0)
+    
+    # Rutas faltantes = demanda - capacidad total (solo valores positivos = faltante real)
+    out["RUTAS_FALTANTES"] = (out["FCST"] - out["CAP_TOTAL"]).clip(lower=0).astype(int)
     out["CAP_VS_FCST"]  = (out["CAP_TOTAL"] / out["FCST"].replace(0, np.nan)).fillna(0).round(2)
     out["CAP_DIFF_ABS"] = (pd.to_numeric(out["FCST"], errors="coerce").fillna(0) - out["CAP_TOTAL"]).abs().round(2)
     out["RIESGO"]       = np.where(out["CAP_TOTAL"] + 1e-9 >= pd.to_numeric(out["FCST"], errors="coerce").fillna(0), "OK", "RIESGO")
@@ -5285,6 +5287,9 @@ try:
                     blend="mean"
                 )
                 
+                # Guardar datos de riesgo para el chat
+                st.session_state.dl_risk_data = res_svc_dl
+                
                 if res_svc_dl is None or res_svc_dl.empty:
                     st.info("Sin datos para evaluar riesgo (DL).")
                 else:
@@ -5525,9 +5530,20 @@ if ask:
         else:
             context_parts.append("Tabla detalle (abajo): (no disponible)\n")
 
+        # Agregar datos de riesgo de Deep Learning
+        try:
+            if 'dl_risk_data' in st.session_state and st.session_state.dl_risk_data is not None:
+                risk_df = st.session_state.dl_risk_data
+                context_parts.append(_df_to_context("Análisis de Riesgo Deep Learning (Tabla 4)", risk_df, 100))
+            else:
+                context_parts.append("Análisis de Riesgo Deep Learning: (no disponible - ejecuta 'Calcular plan' primero)\n")
+        except Exception as e:
+            context_parts.append(f"Análisis de Riesgo Deep Learning: (error: {e})\n")
+
         system_msg = (
-            "Eres un analista de planeación táctica. Responde en español, "
+            "Eres un analista de planeación táctica especializado en análisis de riesgo. Responde en español, "
             "claro y conciso. Si haces cálculos, muéstralos. "
+            "Presta especial atención a los datos de riesgo de Deep Learning (Tabla 4) que incluyen probabilidades de fallo por modelo MLP, Wide&Deep, TabTransformer y Blend. "
             "Usa solo el contexto provisto; si algo no está en los datos, dilo."
         )
         context_block = "\n".join(context_parts)
