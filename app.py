@@ -149,8 +149,8 @@ def white_to_alpha(img: Image.Image, threshold: int = 245) -> Image.Image:
 
 
 # Después de abrir el logo:
-if LOGO_IMAGE is not None:
-    LOGO_IMAGE = autocrop_whitespace(LOGO_IMAGE)
+    if LOGO_IMAGE is not None:
+        LOGO_IMAGE = autocrop_whitespace(LOGO_IMAGE)
     # ← limpia el fondo blanco; sube/baja el umbral si hace falta
     LOGO_IMAGE = white_to_alpha(LOGO_IMAGE, threshold=245)
 
@@ -270,7 +270,7 @@ def _canon_name(s: str) -> str:
 
 def find_and_rename(df: pd.DataFrame, candidates: List[str], new_name: str,
                     required: bool = True, source_label: str = "") -> Optional[str]:
-    cmap = {_canon_name(c): c for c in df.columns}
+                        cmap = {_canon_name(c): c for c in df.columns}
     for cand in candidates:
         key = _canon_name(cand)
         if key in cmap:
@@ -360,7 +360,7 @@ def coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def coerce_date_column(df: pd.DataFrame, candidates: List[str], new_name: str,
             source_label: str, required: bool = False) -> Optional[str]:
-    col = find_and_rename(df, candidates, new_name, required=required, source_label=source_label)
+                col = find_and_rename(df, candidates, new_name, required=required, source_label=source_label)
     if col:
         df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True, infer_datetime_format=True).dt.date
         if df[col].notna().sum() == 0:
@@ -715,8 +715,8 @@ def load_rentals_caps_from_sheet() -> pd.DataFrame:
     units_col = None
     for keys in [["Unidades","Unidades dispon","Unidades disponibles"],
                  ["Units","Cantidad","Qty","QTY","COUNT"]]:
-        for k in keys:
-            col = find_and_rename(df, [k], "UNIDADES", required=False, source_label="Rentals")
+                     for k in keys:
+                         col = find_and_rename(df, [k], "UNIDADES", required=False, source_label="Rentals")
             if col: units_col = "UNIDADES"; break
         if units_col: break
     if not units_col:
@@ -790,7 +790,7 @@ from datetime import date as _date
 def load_crowd_caps_for(op_date: _date) -> pd.DataFrame:
     """
     Lee 'Crowd' y entrega, por SVC:
-      - BASE_ENTRE_SEM, BASE_SAB, BASE_DOM
+        - BASE_ENTRE_SEM, BASE_SAB, BASE_DOM
       - E1_ENTRE_SEM,  E1_SAB,  E1_DOM  (Holgura - Base, acotado a >=0)
       - RUTAS_CROWD_CAP  (Base del día op_date)
       - CROWD_E1_CAP     (Holgura del día - Base del día, >=0)
@@ -1090,7 +1090,7 @@ def load_capacity_caps() -> pd.DataFrame:
 def load_mlp_caps_from_srm() -> pd.DataFrame:
     """
     Lee la pestaña SRM y arma capacidades MLP por SVC:
-      SDD:  MLP_SDD_LV, MLP_SDD_SV, MLP_SDD_CAR, MLP_SDD_CAP
+        SDD:  MLP_SDD_LV, MLP_SDD_SV, MLP_SDD_CAR, MLP_SDD_CAP
       SPOT: MLP_SPOT_LV, MLP_SPOT_SV, MLP_SPOT_CAR, MLP_SPOT_CAP
       BACK: MLP_BACK_CAP  (Back/Backup/BU/Backlog)
     Ignora columnas 'Total ...' para no contar doble.
@@ -1187,7 +1187,7 @@ def load_mlp_caps_from_srm() -> pd.DataFrame:
     # Asegura numérico en todas las columnas sumables
     for c in set(sdd_lv_cols + sdd_sv_cols + sdd_car_cols +
                  spot_lv_cols + spot_sv_cols + spot_car_cols + back_cols):
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+                     df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
     grp = df.groupby("SVC", dropna=False)
 
@@ -1220,7 +1220,7 @@ def load_mlp_caps_from_srm() -> pd.DataFrame:
     for c in ["MLP_SDD_LV","MLP_SDD_SV","MLP_SDD_CAR",
               "MLP_SPOT_LV","MLP_SPOT_SV","MLP_SPOT_CAR",
               "MLP_SDD_CAP","MLP_SPOT_CAP","MLP_BACK_CAP"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).round(0).astype(int)
+                  out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).round(0).astype(int)
 
     # Adjunta MLP (texto)
     out = out.merge(mlp_ref, on="SVC", how="left")
@@ -1298,7 +1298,7 @@ def load_mlp_caps_by_carrier_from_srm() -> pd.DataFrame:
                 continue
             if all(has(cc, ft) for ft in fam_tokens) and has_any(cc, type_tokens) \
                and not has_any(cc, EXC_TOT) and not has_any(cc, exc_tokens):
-                out.append(col)
+                   out.append(col)
         return out
 
     sdd_lv  = pick_cols(LV,  ["sdd"])
@@ -1362,7 +1362,7 @@ def load_mlp_scores_from_sheet() -> pd.DataFrame:
     """
     Calcula SCORE por MLP (y SVC si viene) desde la historia AR-ER.
     No penaliza cancelados:
-      Aceptación = Aceptados / Solicitados
+        Aceptación = Aceptados / Solicitados
       Ejecución  = Ejecutados / (Aceptados - Cancelados)
       CapEfect   = Ejecutados / (Solicitados - Cancelados)
       SCORE = 0.5*Ejecución + 0.3*Aceptación + 0.2*CapEfect
@@ -1440,7 +1440,7 @@ def load_spr_mlp() -> pd.DataFrame:
 def load_spr_dm_recent_weekday_stats(op_date: date) -> pd.DataFrame:
     """
     Devuelve SPR por SVC y Delivery Model (RENTALS/CROWD/MLP) con:
-      - SPR_PROM4: mediana de los últimos 4 mismos días de la semana previos a op_date
+        - SPR_PROM4: mediana de los últimos 4 mismos días de la semana previos a op_date
       - SPR_P95_4: p95 del mismo set (≈max si son 4 puntos)
       - SPR_TODAY: valor del día op_date (si existe) para 'plan'
     """
@@ -1534,11 +1534,11 @@ def _agg_peak_p95_same_weekday(s: pd.Series) -> float:
 def load_spr_dm_by_mode(op_date: date, mode: str) -> pd.DataFrame:
     """
     Devuelve, por SVC:
-      - SPR_RENTALS_SEL
+        - SPR_RENTALS_SEL
       - SPR_CROWD_SEL
       - SPR_MLP_SEL
     Cálculo:
-      - promedio: mediana de los **últimos 4** del mismo weekday (<= op_date)
+        - promedio: mediana de los **últimos 4** del mismo weekday (<= op_date)
       - peak:     p95 del mismo weekday (<= op_date)
       - plan:     último valor del mismo weekday (<= op_date)
     Fuente: pestaña SPR (col: DELIVERY_MODEL, FECHA, SVC, SPR)
@@ -1611,7 +1611,7 @@ def load_spr_dm_stats_from_sheet() -> pd.DataFrame:
     Lee la pestaña SPR y calcula, por SVC y por Delivery Model (RENTALS, CROWD, MLP),
     el SPR 'prom' (mediana) y 'peak' (p95).
     Devuelve columnas:
-      SVC,
+        SVC,
       SPR_RENTALS_PROM, SPR_RENTALS_PEAK,
       SPR_CROWD_PROM,   SPR_CROWD_PEAK,
       SPR_MLP_PROM,     SPR_MLP_PEAK
@@ -1676,12 +1676,12 @@ def _bucket_dm(dm: str) -> str:
 def load_spr_dm_real_peak_for(op_date: date,
             real_weeks: int = 4,
             peak_weeks: int = 12) -> pd.DataFrame:
-    """
+                """
     SPR por Delivery Model usando la pestaña SPR:
-      - REAL4W_* : mediana de los últimos 4 (por defecto) del mismo día de semana (<= op_date)
+        - REAL4W_* : mediana de los últimos 4 (por defecto) del mismo día de semana (<= op_date)
       - PEAK_*   : p95 de los últimos 12 del mismo día de semana (<= op_date)
     Devuelve columnas por SVC:
-      SPR_RENTALS_REAL4W, SPR_CROWD_REAL4W, SPR_MLP_REAL4W,
+        SPR_RENTALS_REAL4W, SPR_CROWD_REAL4W, SPR_MLP_REAL4W,
       SPR_RENTALS_PEAK,   SPR_CROWD_PEAK,   SPR_MLP_PEAK
     """
     spr = read_sheet(SHEET_ID, SHEET_TABS["spr"])
@@ -2228,7 +2228,7 @@ def load_spr_by_dm_vehicle(op_date: date, mode: str) -> pd.DataFrame:
     """
     SPR seleccionado por SVC × (RENTALS/CROWD/MLP) × Vehículo (LV/SV/Car/Bike/Others),
     usando el mismo criterio que la cabecera:
-      - promedio: mediana de los últimos 4 del mismo weekday (<= op_date)
+        - promedio: mediana de los últimos 4 del mismo weekday (<= op_date)
       - peak:     p95 de los últimos 12 del mismo weekday (<= op_date)
       - plan:     último valor del mismo weekday (<= op_date)
     """
@@ -2509,7 +2509,7 @@ def _to_num_series(s):
 def build_mlp_detail(detalles_df: pd.DataFrame) -> pd.DataFrame:
     """
     Tabla 3 REAL:
-    - Toma el 'detalles' (lo que ya abriste abajo) para saber cuántas rutas MLP hay que levantar por SVC×modo×vehículo.
+        - Toma el 'detalles' (lo que ya abriste abajo) para saber cuántas rutas MLP hay que levantar por SVC×modo×vehículo.
     - Asigna secuencialmente a MLPs reales según su SCORE (AR-ER), respetando topes SRM por MLP.
     Devuelve columnas: FECHA, SVC, DELIVERY_MOD, SHP_LG_VEHICLE_TYPE, MLP, Rutas, Score
     """
@@ -2627,10 +2627,10 @@ def _dm_norm_label(s: str) -> str:
 def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
     """
     Devuelve filas a nivel proveedor MLP con:
-      SVC, MLP, DELIVERY_MOD ('MLP SDD'|'MLP SPOT'|'MLP BACKLOG'),
+        SVC, MLP, DELIVERY_MOD ('MLP SDD'|'MLP SPOT'|'MLP BACKLOG'),
       SHP_LG_VEHICLE_TYPE ('Large Van'|'Small Van'|'Car'), CAP (int)
     Hace:
-      - búsqueda robusta de la pestaña (SRM, SRM ✅, etc.)
+        - búsqueda robusta de la pestaña (SRM, SRM ✅, etc.)
       - autodetección de cabecera
       - ffill del MLP por SVC
       - fallback a loader legacy si no arma filas
@@ -2774,15 +2774,15 @@ def load_srm_caps_by_mlp_detailed() -> pd.DataFrame:
                 # capacidad
                 cap_col = None
                 for c in ["CAP","Capacidad","Rutas","Qty","Cantidad","Units"]:
-        if c in x.columns:
-            cap_col = c; break
-                if cap_col is None:
-                    # busca columna numérica con sum>0
+                    for c in ["SPR_RENTALS", "CROWD_PCT", "RUTAS_RENTALS"]:
+                        if c in x.columns:
+                            if cap_col is None:
+                                # busca columna numérica con sum>0
         num_cols = [c for c in x.columns if pd.api.types.is_numeric_dtype(x[c])]
         if num_cols:
             cap_col = max(num_cols, key=lambda c: pd.to_numeric(x[c], errors="coerce").fillna(0).sum())
                 if cap_col is None:
-        return pd.DataFrame(columns=out_cols)
+                    return pd.DataFrame(columns=out_cols)
 
                 # limpiar y mapear
                 _as_str_cols(x, ["SVC","MLP","DELIVERY_MOD","SHP_LG_VEHICLE_TYPE"])
@@ -2897,7 +2897,7 @@ def build_table3(plan_df: pd.DataFrame) -> pd.DataFrame:
     Construye la Tabla 3 (Detalle por MLP) asignando rutas por SVC y DM
     a los MLPs según su SCORE (AR-ER) y topado por CAP (SRM).
     Columnas salida:
-      FECHA, SVC, DELIVERY_MOD, SHP_LG_VEHICLE_TYPE, MLP, Rutas, Score
+        FECHA, SVC, DELIVERY_MOD, SHP_LG_VEHICLE_TYPE, MLP, Rutas, Score
     """
     try:
         if plan_df is None or plan_df.empty:
@@ -2948,7 +2948,7 @@ def build_table3(plan_df: pd.DataFrame) -> pd.DataFrame:
 
             for dm_label, need_col in [("MLP SDD","RUTAS_MLP_SDD_USADAS"),
                                        ("MLP SPOT","RUTAS_MLP_SPOT_USADAS")]:
-                need = int(pd.to_numeric(r.get(need_col, 0), errors="coerce") or 0)
+                                           need = int(pd.to_numeric(r.get(need_col, 0), errors="coerce") or 0)
                 if need <= 0:
                     continue
 
@@ -3217,7 +3217,7 @@ def _attach_tabla2_spr(df_hist: pd.DataFrame) -> pd.DataFrame:
 def _rolling_stats(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ventanas por (SVC, DM, Vehículo, MLP):
-      - FAIL_RATE_*d: media móvil de FAIL
+        - FAIL_RATE_*d: media móvil de FAIL
       - CONF_*d: media móvil de CONF_NETO (lo comprometido neto)
     Requiere que el dataframe tenga columnas: FAIL y CONF_NETO.
     """
@@ -3246,7 +3246,7 @@ class FailureModel:
 def _ensure_shortfall_cols(df: pd.DataFrame) -> pd.DataFrame:
     """
     Asegura columnas para modelar 'riesgo de capacidad insuficiente':
-      - CANCELACIONES_FORM (normalizada)
+        - CANCELACIONES_FORM (normalizada)
       - CONF_NET = max(CONFIRMADO - CANCELACIONES_FORM, 0)
       - SHORTFALL = max(CONF_NET - EJECUTADO, 0)
       - SHORTFALL_PCT = SHORTFALL / max(CONF_NET, 1)   (en [0,1])
@@ -3406,9 +3406,9 @@ SF_MIN_CONF_DIA  = 50
 
 def _get_recent_shortfall(arer: pd.DataFrame, days: int = 30,
             prior_p: float = 0.08, prior_strength: int = 100):
-    """
+                """
     Devuelve:
-      - by_full:  SF_RECENT_30 (suavizado), CONF_QTY, N_DAYS por (SVC, DM_TRAIN, Veh, MLP)
+        - by_full:  SF_RECENT_30 (suavizado), CONF_QTY, N_DAYS por (SVC, DM_TRAIN, Veh, MLP)
       - by_pool:  SF_RECENT_30_POOL (suavizado), CONF_QTY_POOL, N_DAYS_POOL por (SVC, DM_TRAIN, Veh)
     Ventana: [hoy-days, ayer]. SHORTFALL = max(CONF_EFECTIVO - EJECUTADO, 0).
     """
@@ -3501,7 +3501,7 @@ def _get_trained_model():
 def predict_failure(detalles_df: pd.DataFrame,
                     tabla3_df: pd.DataFrame,
                     model: FailureModel) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
+                        """
     Predice shortfall proporcional esperado (0..1) por (día×SVC×DM×Veh×MLP/Rentals).
     Devuelve:
     
@@ -3759,7 +3759,7 @@ class SFDataset(Dataset):
     - En INFERENCIA:    __getitem__ -> (x_num, x_cats)
 
     Garantiza:
-      • Orden y longitud EXACTOS de `num_cols` y `cat_cols` (como en entrenamiento).
+        • Orden y longitud EXACTOS de `num_cols` y `cat_cols` (como en entrenamiento).
       • Si falta una columna numérica en df -> rellena con 0.0.
       • Si falta una columna categórica en df -> usa "" (se mapea a UNK=0).
       • Mapea categorías con `indexers[col]` (dict token->id con ids 1..N; 0=UNK).
@@ -3772,7 +3772,7 @@ class SFDataset(Dataset):
                  indexers: Dict[str, Dict[str, int]],
                  y_col: Optional[str] = "SHORTFALL_PCT",
                  w_col: Optional[str] = "SF_WEIGHT"):
-        self.num_cols = list(num_cols)   # orden fijo
+                     self.num_cols = list(num_cols)   # orden fijo
         self.cat_cols = list(cat_cols)   # orden fijo
         self.indexers = indexers
 
@@ -3842,7 +3842,7 @@ def _emb_dim(n: int) -> int:
 def _cardinality_from_indexer(idx_val) -> int:
     """
     Acepta:
-      - int (cardinalidad directa)
+        - int (cardinalidad directa)
       - dict (mapeo categoria->id)
       - cualquier otra cosa -> 0
     """
@@ -3982,7 +3982,7 @@ def _cardinality_from_indexer(v: Any) -> int:
         return 0  # fallback seguro
 
 # Nota: Se asume que ya tienes definidos:
-#   - EmbeddingBlock(indexers, cat_cols, emb_dim=16)  -> usa _cardinality_from_indexer internamente
+    #   - EmbeddingBlock(indexers, cat_cols, emb_dim=16)  -> usa _cardinality_from_indexer internamente
 #   - MLP(in_dim, hidden=(...), p=0.2, out_dim=1)     -> devuelve LOGITS (sin sigmoid)
 # Si tu EmbeddingBlock aún usa int(indexers[c]), cámbialo por _cardinality_from_indexer(indexers[c]) + 1.
 # padding_idx=0, y recuerda desplazar tus códigos categóricos a [1..N] dejando 0 para UNK.
@@ -4033,7 +4033,7 @@ class DL_WideDeep(nn.Module):
 class DL_TabTransformer(nn.Module):
     def __init__(self, indexers: Dict[str, Any], cat_cols: List[str], num_dim: int,
                  d_model: int = 32, nhead: int = 4, nlayers: int = 2, p: float = 0.1):
-        super().__init__()
+                     super().__init__()
         assert d_model % nhead == 0
         self.cat_cols = list(cat_cols)
         self.per_token_dim = int(d_model)
@@ -4084,7 +4084,7 @@ from torch.utils.data import Dataset, DataLoader
 def _cardinality_from_indexer(ix_val: Any) -> int:
     """
     Soporta indexers como:
-      - int (cardinalidad)
+        - int (cardinalidad)
       - dict token->id (ids comienzan en 1, 0 reservado a UNK/padding)
     """
     if isinstance(ix_val, dict):
@@ -4111,7 +4111,7 @@ def _build_indexers(df: pd.DataFrame, cat_cols: List[str]) -> Dict[str, Dict[str
 def build_training_table_for_dl(window_days: int = 730) -> Tuple[pd.DataFrame, List[str], List[str]]:
     """
     Crea el dataframe de entrenamiento para DL:
-      - y = SHORTFALL_PCT (0..1)
+        - y = SHORTFALL_PCT (0..1)
       - w = SF_WEIGHT
       - NUM_COLS = ['SPR_T2','CONF_EFECTIVO','DOW','IS_WE','MES','SEM'] si existen
       - CAT_COLS = ['SVC','DELIVERY_MOD','SHP_LG_VEHICLE_TYPE','MLP'] si existen
@@ -4528,7 +4528,7 @@ except Exception:
 def _prep_pred_table(detalles_df: pd.DataFrame, tabla3_df: pd.DataFrame) -> pd.DataFrame:
     """
     Replica tu preparación de features para predicción (solo MLPs):
-    usa Tabla 3 (rutas por MLP) + SPR diario desde Tabla 2 (detalles).
+        usa Tabla 3 (rutas por MLP) + SPR diario desde Tabla 2 (detalles).
     """
     if tabla3_df is None or tabla3_df.empty:
         return pd.DataFrame()
@@ -4594,11 +4594,11 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
             tabla3_df: pd.DataFrame,
             kinds: List[str] = ("mlp","wide_deep","tabtr"),
             blend: str = "mean") -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
+                """
     Tabla 4 (única): 3 modelos DL + blend.
     - Si todos los DL dan NaN/0, el blend cae en DP reciente por SVC×DM×Veh×MLP (no se muestra DP en columnas).
     Devuelve:
-      (resumen_por_SVC, detalle_por_día×DM×vehículo×MLP)
+        (resumen_por_SVC, detalle_por_día×DM×vehículo×MLP)
     """
     base = _prep_pred_table(detalles_df, tabla3_df)
     if base is None or base.empty:
@@ -4711,8 +4711,8 @@ def predict_failure_dl(detalles_df: pd.DataFrame,
             if not eval_data.empty:
                 # Calcular métricas para cada modelo
                 for col in ["Prob_DL_MLP", "Prob_DL_WD", "Prob_DL_TT"]:
-        if col in out.columns:
-            # Simular evaluación (en producción usarías datos reales)
+                    if col in out.columns:
+                        # Simular evaluación (en producción usarías datos reales)
             y_true = np.random.randint(0, 2, len(out))  # Datos reales simulados
             y_pred = out[col].values
                         
@@ -5513,7 +5513,7 @@ def diagnosticar_datos_mel_ia():
             if hasattr(data, 'shape'):
                 print(f"  - {key}: {data.shape} - Columnas: {list(data.columns)[:5]}...")
                 if not data.empty:
-        print(f"    Primeras 2 filas:")
+                    print(f"    Primeras 2 filas:")
         print(f"    {data.head(2).to_dict('records')}")
             else:
                 print(f"  - {key}: {type(data)}")
@@ -5914,7 +5914,7 @@ def procesar_analisis_riesgo(dl_risk_df):
 - Total de SVCs analizados: {len(dl_risk_df['SVC'].unique())}
         """
     else:
-            respuesta = f"""
+        respuesta = f"""
 **📊 Análisis de Riesgo de Deep Learning**
 
 {analisis}
@@ -6345,7 +6345,7 @@ if ask:
         # OJO: nada de backslashes dentro de { } en f-strings
         user_prompt = textwrap.dedent(
             f"""CONTEXTO:
-{context_block}
+                {context_block}
 """
         )
 
